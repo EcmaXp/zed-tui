@@ -232,6 +232,24 @@ enum PenColor {
     Color(Rgb),
 }
 
+impl PenColor {
+    fn background(cell: &Cell) -> Self {
+        if cell.attrs.contains(CellAttrs::DEFAULT_BACKGROUND) {
+            Self::Default
+        } else {
+            Self::Color(cell.bg)
+        }
+    }
+
+    fn foreground(cell: &Cell) -> Self {
+        if cell.attrs.contains(CellAttrs::DEFAULT_FOREGROUND) {
+            Self::Default
+        } else {
+            Self::Color(cell.fg)
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Pen {
     style: Option<Style>,
@@ -257,9 +275,12 @@ impl Style {
 
     fn of_cell(cell: &Cell, styled_underlines: bool) -> Self {
         if cell.is_plain_blank() {
-            return Self::blank(PenColor::Color(cell.bg));
+            return Self::blank(PenColor::background(cell));
         }
-        let mut attrs = cell.attrs - CellAttrs::WIDE_CONTINUATION;
+        let mut attrs = cell.attrs
+            - (CellAttrs::WIDE_CONTINUATION
+                | CellAttrs::DEFAULT_BACKGROUND
+                | CellAttrs::DEFAULT_FOREGROUND);
         if !styled_underlines {
             attrs.remove(CellAttrs::CURLY_UNDERLINE);
         }
@@ -270,8 +291,8 @@ impl Style {
             }
         });
         Self {
-            fg: Some(PenColor::Color(cell.fg)),
-            bg: PenColor::Color(cell.bg),
+            fg: Some(PenColor::foreground(cell)),
+            bg: PenColor::background(cell),
             underline,
             attrs,
         }
@@ -924,7 +945,12 @@ mod tests {
                         expected.glyph.push_to(&mut expected_text);
                     }
                     assert_eq!(shown_text, expected_text, "{at}");
-                    assert_eq!(shown.bg, spec(expected.bg), "{at}");
+                    let background = if expected.attrs.contains(CellAttrs::DEFAULT_BACKGROUND) {
+                        ansi::Color::Named(ansi::NamedColor::Background)
+                    } else {
+                        spec(expected.bg)
+                    };
+                    assert_eq!(shown.bg, background, "{at}");
                     let underline = expected.attrs.contains(CellAttrs::UNDERLINE);
                     let curly = underline
                         && self.styled_underlines
@@ -943,7 +969,12 @@ mod tests {
                         assert_eq!(shown.underline_color(), color.map(spec), "{at}");
                     }
                     if !expected.is_plain_blank() {
-                        assert_eq!(shown.fg, spec(expected.fg), "{at}");
+                        let foreground = if expected.attrs.contains(CellAttrs::DEFAULT_FOREGROUND) {
+                            ansi::Color::Named(ansi::NamedColor::Foreground)
+                        } else {
+                            spec(expected.fg)
+                        };
+                        assert_eq!(shown.fg, foreground, "{at}");
                         let bold = expected.attrs.contains(CellAttrs::BOLD);
                         assert_eq!(shown.flags.contains(Flags::BOLD), bold, "{at}");
                         let italic = expected.attrs.contains(CellAttrs::ITALIC);
@@ -1020,6 +1051,7 @@ mod tests {
                 }
             }
         }
+        grid.mark_default_colors(&[Rgb::new(40, 44, 52)], &[Rgb::new(200, 120, 60)]);
     }
 
     fn shift_within_rows(grid: &mut CellGrid, random: &mut Random) {
@@ -1461,6 +1493,40 @@ mod tests {
         emulator.feed(&mut renderer);
         let shown = |col: usize| emulator.term.grid()[Line(0)][Column(col)].c;
         assert_eq!((shown(2), shown(3)), ('X', 'Y'));
+    }
+
+    #[test]
+    fn default_background_cells_use_sgr_49() {
+        let editor = Rgb::new(40, 44, 52);
+        let mut grid = CellGrid::new(20, 2, editor);
+        if let Some(cell) = grid.cell_mut(3, 0) {
+            cell.glyph = 'x'.into();
+        }
+        if let Some(cell) = grid.cell_mut(0, 1) {
+            cell.bg = Rgb::new(200, 120, 60);
+        }
+        grid.mark_default_colors(&[editor], &[]);
+        let mut renderer = Renderer::new(Vec::new(), 20, 2);
+        let mut emulator = Emulator::new(20, 2);
+        renderer.grid = Some(grid.clone());
+        renderer.render().unwrap();
+        let output = output_text(&renderer);
+        assert!(!output.contains("48;2;40;44;52"), "{output:?}");
+        assert!(output.contains("48;2;200;120;60"), "{output:?}");
+        emulator.feed(&mut renderer);
+        emulator.assert_shows(&grid, 20);
+
+        if let Some(cell) = grid.cell_mut(0, 1) {
+            cell.bg = editor;
+        }
+        grid.mark_default_colors(&[editor], &[]);
+        renderer.grid = Some(grid.clone());
+        renderer.render().unwrap();
+        let output = output_text(&renderer);
+        assert!(output.contains("\x1b[0m"), "{output:?}");
+        assert!(!output.contains("48;2;40;44;52"), "{output:?}");
+        emulator.feed(&mut renderer);
+        emulator.assert_shows(&grid, 20);
     }
 
     #[test]

@@ -56,17 +56,18 @@ mod stubs {
 
 #[cfg(unix)]
 mod unix {
-    use std::{ffi::OsString, io::Write as _, path::PathBuf, rc::Rc};
+    use std::{cell::RefCell, ffi::OsString, io::Write as _, path::PathBuf, rc::Rc};
 
     use anyhow::{Context as _, Result};
     use clap::{Parser, Subcommand};
     use command_palette_hooks::CommandPaletteFilter;
     use gpui::{App, AppContext as _, Application, UpdateGlobal as _};
-    use gpui_tui::TuiPlatform;
+    use gpui_tui::{CellGrid, Rgb, TuiPlatform};
     use settings::{
         ActiveSettingsProfileName, MergeFromTrait as _, RootUserSettings as _, SettingsAssets,
         SettingsContent, SettingsStore,
     };
+    use theme::{ActiveTheme as _, GlobalTheme, ThemeRegistry};
     use util::{ResultExt as _, asset_str};
     use workspace::Workspace;
 
@@ -206,6 +207,39 @@ mod unix {
         cx.set_global(ActiveSettingsProfileName(SETTINGS_PROFILE.into()));
     }
 
+    #[derive(Default)]
+    struct DefaultColors {
+        canvas: Rgb,
+        backgrounds: [Rgb; 2],
+        foregrounds: [Rgb; 2],
+    }
+
+    impl DefaultColors {
+        fn of_theme(cx: &App) -> Self {
+            let theme = cx.theme();
+            let canvas = ThemeRegistry::global(cx)
+                .get(&theme.name)
+                .log_err()
+                .map_or(Rgb::default(), |original| {
+                    Rgb::default().blend(original.colors().editor_background)
+                });
+            let colors = theme.colors();
+            let painted = |color: gpui::Hsla| {
+                if color.a > 0. {
+                    canvas.blend(color)
+                } else {
+                    Rgb::default()
+                }
+            };
+            Self {
+                canvas,
+                backgrounds: [colors.editor_background, colors.panel_background].map(painted),
+                foregrounds: [colors.editor_foreground, colors.text]
+                    .map(|color| Rgb::default().blend(color)),
+            }
+        }
+    }
+
     impl Startup {
         pub fn application(&self) -> Application {
             Application::with_platform(self.platform.clone())
@@ -225,7 +259,7 @@ mod unix {
                 platform,
                 started:
                     server::Started {
-                        on_frame,
+                        mut on_frame,
                         after_start,
                     },
             } = self;
@@ -234,7 +268,26 @@ mod unix {
                 filter.hide_action_types(&crate::zed::font_size_actions());
             });
 
-            platform.set_frame_sink(on_frame);
+            let default_colors: Rc<RefCell<DefaultColors>> = Rc::default();
+            platform.set_frame_sink({
+                let default_colors = default_colors.clone();
+                move |mut grid: CellGrid| {
+                    let default_colors = default_colors.borrow();
+                    grid.mark_default_colors(
+                        &default_colors.backgrounds,
+                        &default_colors.foregrounds,
+                    );
+                    on_frame(grid)
+                }
+            });
+            let update_default_colors = move |cx: &mut App| {
+                let colors = DefaultColors::of_theme(cx);
+                platform.set_canvas(colors.canvas);
+                *default_colors.borrow_mut() = colors;
+            };
+            update_default_colors(cx);
+            cx.observe_global::<GlobalTheme>(update_default_colors)
+                .detach();
 
             cx.observe_new(|workspace: &mut Workspace, window, cx| {
                 let Some(window) = window else {
@@ -253,7 +306,9 @@ mod unix {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use settings::{FontSize, ReduceMotionMode, SaturatingBool, ThemeName, ThemeSelection};
+        use settings::{
+            FontSize, ReduceMotionMode, SaturatingBool, ThemeColor, ThemeName, ThemeSelection,
+        };
 
         #[gpui::test]
         fn user_settings_override_defaults_but_not_constraints(cx: &mut gpui::TestAppContext) {
@@ -340,6 +395,46 @@ mod unix {
                     Some(FontSize(10.))
                 );
                 assert_eq!(merged.editor.mouse_wheel_zoom, Some(false));
+            });
+        }
+
+        #[gpui::test]
+        fn base_backgrounds_are_transparent_by_default_and_overridable(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            cx.update(|cx| {
+                let mut store = SettingsStore::test(cx);
+                apply_terminal_settings(&mut store, cx).unwrap();
+                let transparent = Some(ThemeColor::from("#00000000"));
+                let colors = |store: &SettingsStore| {
+                    store
+                        .merged_settings()
+                        .theme
+                        .experimental_theme_overrides
+                        .clone()
+                        .unwrap()
+                        .colors
+                };
+
+                let defaults = colors(&store);
+                assert_eq!(defaults.background, transparent);
+                assert_eq!(defaults.editor_background, transparent);
+                assert_eq!(defaults.surface_background, transparent);
+                assert_eq!(defaults.tab_active_background, None);
+
+                store
+                    .set_user_settings(
+                        r##"{ "experimental.theme_overrides": { "editor.background": "#282c33ff" } }"##,
+                        cx,
+                    )
+                    .result()
+                    .unwrap();
+                let overridden = colors(&store);
+                assert_eq!(
+                    overridden.editor_background,
+                    Some(ThemeColor::from("#282c33ff"))
+                );
+                assert_eq!(overridden.background, transparent);
             });
         }
 

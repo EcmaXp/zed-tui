@@ -23,5 +23,19 @@
   "telemetry": {
     "diagnostics": false,
     "metrics": false
+  },
+  "experimental.theme_overrides": {
+    "background": "#00000000",
+    "editor.background": "#00000000",
+    "editor.gutter.background": "#00000000",
+    "panel.background": "#00000000",
+    "status_bar.background": "#00000000",
+    "surface.background": "#00000000",
+    "tab.inactive_background": "#00000000",
+    "tab_bar.background": "#00000000",
+    "terminal.background": "#00000000",
+    "title_bar.background": "#00000000",
+    "title_bar.inactive_background": "#00000000",
+    "toolbar.background": "#00000000"
   }
 }
