@@ -612,7 +612,13 @@ impl Rasterizer<'_> {
         };
         let is_side_strip = clipped.size.width < CELL_WIDTH / 2.;
 
-        for row in rows {
+        let side_cols = [first_col, last_col];
+        let side_cols = side_cols
+            .get(..if first_col == last_col { 1 } else { 2 })
+            .unwrap_or_default();
+        let visible_cols = intersect(cols, &(0..self.grid.cols.into()));
+        let visible_rows = intersect(rows, &(0..self.grid.rows.into()));
+        for row in visible_rows {
             let top = has_top && row == first_row;
             let bottom = has_bottom && row == last_row;
             let is_edge_row = top || bottom;
@@ -624,8 +630,14 @@ impl Rasterizer<'_> {
             let covers_frame_row = is_blank_frame_row
                 && clipped.top() < cell_top + CELL_HEIGHT
                 && clipped.bottom() > cell_top;
-            let draws_row = covers_center || covers_frame_row;
-            for col in cols.clone().filter(|_| draws_row) {
+            let (row_cols, row_side_cols) = if !covers_center && !covers_frame_row {
+                (0..0, &[][..])
+            } else if row == first_row || row == last_row {
+                (visible_cols.clone(), &[][..])
+            } else {
+                (0..0, side_cols)
+            };
+            for col in row_cols.chain(row_side_cols.iter().copied()) {
                 let cell_left = col as f32 * CELL_WIDTH;
                 let overlaps_column =
                     clipped.left() < cell_left + CELL_WIDTH && clipped.right() > cell_left;
@@ -1552,6 +1564,23 @@ mod tests {
                 .iter()
                 .all(|cell| cell.bg == rgb(0x2f, 0x34, 0x3e))
         );
+    }
+
+    #[test]
+    fn huge_borders_only_visit_visible_cells() {
+        let atlas = TuiAtlas::default();
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            bounds: scaled_bounds(0., 0., 32., 1e9),
+            content_mask: full_mask(),
+            border_color: Hsla::white(),
+            border_widths: gpui::Edges::all(ScaledPixels(1.)),
+            ..Default::default()
+        });
+        scene.finish();
+        let grid = rasterize(&scene, &atlas, 4, 2).0;
+        assert_eq!(grid.row_text(0), "┌──┐");
+        assert_eq!(grid.row_text(1), "│  │");
     }
 
     #[test]
