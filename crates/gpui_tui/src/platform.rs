@@ -24,11 +24,82 @@ use crate::{
     grid::{CellGrid, Rgb},
     size_for_cells,
     text_system::TuiTextSystem,
-    window::{TuiWindow, TuiWindowHandle},
+    window::{FrameOutcome, TuiWindow, TuiWindowHandle},
     with_taken,
 };
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+const BACKGROUND_FRAME_INTERVAL: Duration = Duration::from_millis(66);
+const UNCHANGED_FRAME_INTERVAL: Duration = Duration::from_millis(100);
+const UNCHANGED_FRAMES_BEFORE_SLOWDOWN: u32 = 2;
+const INPUT_SETTLE: Duration = Duration::from_millis(6);
+const INPUT_ACTIVITY: Duration = Duration::from_millis(250);
+
+#[derive(Default)]
+struct FramePacer {
+    last_frame: Option<Instant>,
+    last_input: Option<Instant>,
+    settle_until: Option<Instant>,
+    unchanged_frames: u32,
+}
+
+impl FramePacer {
+    fn next_frame(&self) -> Option<Instant> {
+        if let Some(settle_until) = self.settle_until {
+            return Some(settle_until);
+        }
+        let last_frame = self.last_frame?;
+        let follows_input = self
+            .last_input
+            .is_some_and(|input| last_frame.saturating_duration_since(input) < INPUT_ACTIVITY);
+        let interval = if self.unchanged_frames >= UNCHANGED_FRAMES_BEFORE_SLOWDOWN {
+            UNCHANGED_FRAME_INTERVAL
+        } else if follows_input {
+            FRAME_INTERVAL
+        } else {
+            BACKGROUND_FRAME_INTERVAL
+        };
+        Some(last_frame + interval)
+    }
+
+    fn is_due(&self, now: Instant) -> bool {
+        self.next_frame().is_none_or(|next_frame| now >= next_frame)
+    }
+
+    fn frame_presented(&mut self, now: Instant, outcome: FrameOutcome) {
+        self.unchanged_frames = match outcome {
+            FrameOutcome::NotDrawn | FrameOutcome::Unchanged => {
+                self.unchanged_frames.saturating_add(1)
+            }
+            FrameOutcome::Changed => 0,
+        };
+        self.last_frame = Some(now);
+        self.settle_until = None;
+    }
+
+    fn input_received(&mut self, now: Instant, input: &PlatformInput) {
+        self.unchanged_frames = 0;
+        self.last_input = Some(now);
+        if matches!(
+            input,
+            PlatformInput::KeyDown(_) | PlatformInput::MouseDown(_) | PlatformInput::MouseUp(_)
+        ) {
+            self.settle_until.get_or_insert(now + INPUT_SETTLE);
+        }
+    }
+
+    fn settle_after_input(&mut self, now: Instant) {
+        self.unchanged_frames = 0;
+        self.last_input = Some(now);
+        self.settle_until.get_or_insert(now + INPUT_SETTLE);
+    }
+
+    fn present_next_frame_immediately(&mut self) {
+        self.unchanged_frames = 0;
+        self.settle_until = None;
+        self.last_frame = None;
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct FrameOutput {
@@ -176,7 +247,7 @@ pub struct TuiPlatform {
     #[cfg(target_os = "macos")]
     find_pasteboard: RefCell<Option<ClipboardItem>>,
     should_quit: Cell<bool>,
-    next_frame: Cell<Instant>,
+    pacer: RefCell<FramePacer>,
 }
 
 impl TuiPlatform {
@@ -207,7 +278,7 @@ impl TuiPlatform {
             #[cfg(target_os = "macos")]
             find_pasteboard: RefCell::default(),
             should_quit: Cell::new(false),
-            next_frame: Cell::new(Instant::now()),
+            pacer: RefCell::default(),
         })
     }
 
@@ -251,18 +322,23 @@ impl TuiPlatform {
     }
 
     pub fn handle_input(&self, input: PlatformInput) {
+        self.pacer
+            .borrow_mut()
+            .input_received(Instant::now(), &input);
         if let Some(window) = self.focused_window() {
             window.handle_input(input);
         }
     }
 
     pub fn insert_text(&self, text: &str) {
+        self.pacer.borrow_mut().settle_after_input(Instant::now());
         if let Some(window) = self.focused_window() {
             window.insert_text(text);
         }
     }
 
     pub fn resize(&self, cols: u16, rows: u16) {
+        self.pacer.borrow_mut().present_next_frame_immediately();
         self.display
             .bounds
             .set(Bounds::new(Point::default(), size_for_cells(cols, rows)));
@@ -271,7 +347,7 @@ impl TuiPlatform {
         }
     }
 
-    fn present_frame(&self) {
+    fn present_frame(&self, now: Instant) {
         if let Some(underneath) = self.windows.window_under_floating()
             && let Some(underlay) = underneath.draw_underlay()
             && let Some(window) = self.focused_window()
@@ -279,14 +355,18 @@ impl TuiPlatform {
             window.set_underlay(underlay);
         }
         if let Some(window) = self.focused_window() {
-            window.request_frame();
+            let outcome = window.request_frame();
+            self.pacer.borrow_mut().frame_presented(now, outcome);
         }
     }
 
     fn frame_wait(&self) -> Duration {
-        self.next_frame
-            .get()
-            .saturating_duration_since(Instant::now())
+        self.pacer
+            .borrow()
+            .next_frame()
+            .map_or(Duration::ZERO, |next_frame| {
+                next_frame.saturating_duration_since(Instant::now())
+            })
     }
 }
 
@@ -319,9 +399,8 @@ impl Platform for TuiPlatform {
             }
 
             let now = Instant::now();
-            if now >= self.next_frame.get() {
-                self.next_frame.set(now + FRAME_INTERVAL);
-                self.present_frame();
+            if self.pacer.borrow().is_due(now) {
+                self.present_frame(now);
             }
         }
 
@@ -562,6 +641,80 @@ impl Platform for TuiPlatform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unchanged_frames_slow_down_until_input_arrives() {
+        let (start, mut pacer) = pacer_after_frame();
+        for _ in 0..UNCHANGED_FRAMES_BEFORE_SLOWDOWN {
+            pacer.frame_presented(start, FrameOutcome::Unchanged);
+        }
+        assert_eq!(pacer.next_frame(), Some(start + UNCHANGED_FRAME_INTERVAL));
+
+        pacer.input_received(start, &PlatformInput::MouseMove(Default::default()));
+        assert_eq!(pacer.next_frame(), Some(start + FRAME_INTERVAL));
+
+        pacer.frame_presented(start, FrameOutcome::Unchanged);
+        pacer.frame_presented(start, FrameOutcome::Changed);
+        assert_eq!(pacer.next_frame(), Some(start + FRAME_INTERVAL));
+    }
+
+    fn pacer_after_frame() -> (Instant, FramePacer) {
+        let start = Instant::now();
+        let mut pacer = FramePacer::default();
+        pacer.frame_presented(start, FrameOutcome::Changed);
+        (start, pacer)
+    }
+
+    fn key_down() -> PlatformInput {
+        PlatformInput::KeyDown(gpui::KeyDownEvent {
+            keystroke: gpui::Keystroke::parse("a").unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        })
+    }
+
+    #[test]
+    fn key_presses_are_drawn_after_a_short_settle_window() {
+        let (start, mut pacer) = pacer_after_frame();
+        let typed = start + Duration::from_millis(5);
+        pacer.input_received(typed, &key_down());
+        assert!(!pacer.is_due(typed));
+        assert!(pacer.is_due(typed + INPUT_SETTLE));
+
+        pacer.input_received(typed + INPUT_SETTLE, &key_down());
+        assert_eq!(pacer.next_frame(), Some(typed + INPUT_SETTLE));
+
+        let drawn = typed + INPUT_SETTLE;
+        pacer.frame_presented(drawn, FrameOutcome::Changed);
+        pacer.settle_after_input(drawn);
+        assert_eq!(pacer.next_frame(), Some(drawn + INPUT_SETTLE));
+    }
+
+    #[test]
+    fn frames_long_after_input_use_the_background_interval() {
+        let (start, mut pacer) = pacer_after_frame();
+        assert_eq!(pacer.next_frame(), Some(start + BACKGROUND_FRAME_INTERVAL));
+
+        let typed = start + Duration::from_secs(1);
+        pacer.input_received(typed, &key_down());
+        pacer.frame_presented(typed + INPUT_SETTLE, FrameOutcome::Changed);
+        assert_eq!(
+            pacer.next_frame(),
+            Some(typed + INPUT_SETTLE + FRAME_INTERVAL)
+        );
+
+        let later = typed + INPUT_ACTIVITY;
+        pacer.frame_presented(later, FrameOutcome::Changed);
+        assert_eq!(pacer.next_frame(), Some(later + BACKGROUND_FRAME_INTERVAL));
+    }
+
+    #[test]
+    fn resizes_are_drawn_immediately() {
+        let (start, mut pacer) = pacer_after_frame();
+        pacer.input_received(start, &key_down());
+        pacer.present_next_frame_immediately();
+        assert!(pacer.is_due(start));
+    }
 
     #[test]
     fn cursor_styles_reach_the_callback_once_per_change() {

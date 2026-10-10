@@ -105,6 +105,13 @@ fn floating_bar_color(background: Rgb) -> Rgb {
     background.blend(toward.opacity(FLOATING_BAR_CONTRAST))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FrameOutcome {
+    NotDrawn,
+    Unchanged,
+    Changed,
+}
+
 #[derive(Clone)]
 pub(crate) struct TuiWindowHandle {
     handle: AnyWindowHandle,
@@ -286,9 +293,9 @@ impl TuiWindowHandle {
         );
     }
 
-    pub(crate) fn request_frame(&self) {
+    pub(crate) fn request_frame(&self) -> FrameOutcome {
         self.draw_frame();
-        self.deliver_pending_frame();
+        self.deliver_pending_frame()
     }
 
     fn draw_frame(&self) {
@@ -321,7 +328,7 @@ impl TuiWindowHandle {
         }
     }
 
-    fn deliver_pending_frame(&self) {
+    fn deliver_pending_frame(&self) -> FrameOutcome {
         let pending_frame = self.state.borrow_mut().pending_frame.take();
         let fresh = pending_frame
             .map(|(grid, carets)| self.resolve_caret(grid, carets, CaretMode::TerminalCursor));
@@ -330,11 +337,11 @@ impl TuiWindowHandle {
         let grid = match &mut state.floating {
             None => match fresh {
                 Some(grid) => grid,
-                None => return,
+                None => return FrameOutcome::NotDrawn,
             },
             Some(floating) => {
                 let Some(content) = fresh else {
-                    return;
+                    return FrameOutcome::NotDrawn;
                 };
                 let origin = CursorPosition {
                     col: (state.bounds.origin.x.as_f32() / CELL_WIDTH) as u16,
@@ -347,7 +354,7 @@ impl TuiWindowHandle {
             }
         };
         let outputs = state.outputs.clone();
-        deliver_frame(&outputs.frame, grid);
+        deliver_frame(&outputs.frame, grid)
     }
 
     fn resolve_caret(
@@ -588,16 +595,17 @@ impl Drop for TuiWindow {
     }
 }
 
-fn deliver_frame(frame_sink: &RefCell<FrameOutput>, grid: CellGrid) {
+fn deliver_frame(frame_sink: &RefCell<FrameOutput>, grid: CellGrid) -> FrameOutcome {
     {
         let mut output = frame_sink.borrow_mut();
         match &mut output.last_delivered {
-            Some(last) if *last == grid => return,
+            Some(last) if *last == grid => return FrameOutcome::Unchanged,
             Some(last) => last.clone_from(&grid),
             None => output.last_delivered = Some(grid.clone()),
         }
     }
     with_taken(frame_sink, |output| &mut output.sink, |sink| sink(grid));
+    FrameOutcome::Changed
 }
 
 #[cfg(test)]
