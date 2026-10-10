@@ -15,8 +15,8 @@ use gpui_tui::{Cell, CellAttrs, CellGrid, Glyph, Rgb};
 use parking_lot::Mutex;
 
 use crate::tui::protocol::{
-    ClientMessage, FrameDecoder, KeyCode, PROTOCOL_VERSION, ServerMessage, TermEvent, read_message,
-    write_message,
+    ClientMessage, FrameDecoder, KeyCode, MouseAction, MouseButtonKind, PROTOCOL_VERSION,
+    ServerMessage, TermEvent, read_message, write_message,
 };
 const RESIZE_FRAME_WAIT: Duration = Duration::from_millis(100);
 const ATTRIBUTE_CODES: [(CellAttrs, &str); 2] = [(CellAttrs::BOLD, "1"), (CellAttrs::ITALIC, "3")];
@@ -36,7 +36,12 @@ struct TerminalSetup {
 impl TerminalSetup {
     fn run(&mut self, output: &mut impl Write) -> io::Result<()> {
         self.entered = true;
-        crossterm::execute!(output, terminal::EnterAlternateScreen, cursor::Hide,)?;
+        crossterm::execute!(
+            output,
+            terminal::EnterAlternateScreen,
+            cursor::Hide,
+            event::EnableMouseCapture,
+        )?;
         Ok(())
     }
 
@@ -45,6 +50,7 @@ impl TerminalSetup {
             crossterm::execute!(
                 output,
                 style::ResetColor,
+                event::DisableMouseCapture,
                 cursor::Show,
                 terminal::LeaveAlternateScreen,
             )
@@ -470,11 +476,9 @@ pub fn attach(socket: &Path) -> Result<Exit> {
                     }
                     inputs.extend(term_key(&key));
                 }
+                event::Event::Mouse(mouse) => inputs.push(term_mouse(&mouse)),
                 event::Event::Resize(cols, rows) => resize = Some((cols, rows)),
-                event::Event::Mouse(_)
-                | event::Event::FocusGained
-                | event::Event::FocusLost
-                | event::Event::Paste(_) => {}
+                event::Event::FocusGained | event::Event::FocusLost | event::Event::Paste(_) => {}
             }
         }
         let mut messages: Vec<ClientMessage> =
@@ -580,6 +584,33 @@ fn term_key(key: &event::KeyEvent) -> Option<TermEvent> {
         code,
         modifiers: term_modifiers(key.modifiers),
     })
+}
+
+fn term_button(button: event::MouseButton) -> MouseButtonKind {
+    match button {
+        event::MouseButton::Left => MouseButtonKind::Left,
+        event::MouseButton::Right => MouseButtonKind::Right,
+        event::MouseButton::Middle => MouseButtonKind::Middle,
+    }
+}
+
+fn term_mouse(mouse: &event::MouseEvent) -> TermEvent {
+    let action = match mouse.kind {
+        event::MouseEventKind::Down(button) => MouseAction::Down(term_button(button)),
+        event::MouseEventKind::Up(button) => MouseAction::Up(term_button(button)),
+        event::MouseEventKind::Drag(button) => MouseAction::Drag(term_button(button)),
+        event::MouseEventKind::Moved => MouseAction::Moved,
+        event::MouseEventKind::ScrollUp => MouseAction::ScrollUp,
+        event::MouseEventKind::ScrollDown => MouseAction::ScrollDown,
+        event::MouseEventKind::ScrollLeft => MouseAction::ScrollLeft,
+        event::MouseEventKind::ScrollRight => MouseAction::ScrollRight,
+    };
+    TermEvent::Mouse {
+        action,
+        col: mouse.column,
+        row: mouse.row,
+        modifiers: term_modifiers(mouse.modifiers),
+    }
 }
 
 #[cfg(test)]

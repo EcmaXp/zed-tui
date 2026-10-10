@@ -29,7 +29,7 @@ use parking_lot::Mutex;
 use util::ResultExt as _;
 
 use crate::tui::{
-    input::translate,
+    input::InputTranslator,
     protocol::{
         ClientMessage, FrameEncoder, PROTOCOL_VERSION, ServerMessage, TermEvent, read_message,
         write_message,
@@ -235,9 +235,10 @@ async fn handle_events(
     mut events: UnboundedReceiver<ServerEvent>,
 ) {
     let mut sizes: HashMap<u64, (u16, u16)> = HashMap::default();
+    let mut translator = InputTranslator::default();
 
     while let Some(event) = events.next().await {
-        handle_event(event, &platform, &hub, &mut sizes);
+        handle_event(event, &platform, &hub, &mut sizes, &mut translator);
     }
 }
 
@@ -246,6 +247,7 @@ fn handle_event(
     platform: &TuiPlatform,
     hub: &Arc<ClientHub>,
     sizes: &mut HashMap<u64, (u16, u16)>,
+    translator: &mut InputTranslator,
 ) {
     match event {
         ServerEvent::Resized { id, cols, rows } => {
@@ -261,7 +263,7 @@ fn handle_event(
             apply_shared_size(platform, sizes);
         }
         ServerEvent::Input(event) => {
-            if let Some(input) = translate(event) {
+            for input in translator.translate(event) {
                 platform.handle_input(input);
             }
         }

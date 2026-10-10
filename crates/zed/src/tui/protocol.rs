@@ -31,9 +31,37 @@ pub enum KeyCode {
     Function(u8),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MouseButtonKind {
+    Left,
+    Right,
+    Middle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MouseAction {
+    Down(MouseButtonKind),
+    Up(MouseButtonKind),
+    Drag(MouseButtonKind),
+    Moved,
+    ScrollUp,
+    ScrollDown,
+    ScrollLeft,
+    ScrollRight,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TermEvent {
-    Key { code: KeyCode, modifiers: Modifiers },
+    Key {
+        code: KeyCode,
+        modifiers: Modifiers,
+    },
+    Mouse {
+        action: MouseAction,
+        col: u16,
+        row: u16,
+        modifiers: Modifiers,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
