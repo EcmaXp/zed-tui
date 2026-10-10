@@ -126,6 +126,39 @@ pub enum ClientMessage {
     },
 }
 
+pub fn drop_superseded_moves<T>(events: &mut Vec<T>, input: impl Fn(&T) -> Option<&TermEvent>) {
+    events.dedup_by(|next, kept| {
+        let is_superseded = matches!(
+            (input(kept), input(next)),
+            (Some(kept), Some(next)) if is_superseded_by(kept, next)
+        );
+        if is_superseded {
+            std::mem::swap(kept, next);
+        }
+        is_superseded
+    });
+}
+
+fn is_superseded_by(event: &TermEvent, next: &TermEvent) -> bool {
+    match (event, next) {
+        (
+            TermEvent::Mouse {
+                action, modifiers, ..
+            },
+            TermEvent::Mouse {
+                action: next_action,
+                modifiers: next_modifiers,
+                ..
+            },
+        ) => {
+            matches!(action, MouseAction::Moved | MouseAction::Drag(_))
+                && action == next_action
+                && modifiers == next_modifiers
+        }
+        _ => false,
+    }
+}
+
 mod wire_modifiers {
     use gpui::Modifiers;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -549,6 +582,40 @@ mod tests {
     use super::*;
     use crate::tui::test_support::{Random, source_lines, text_row};
     use gpui_tui::Rgb;
+
+    #[test]
+    fn only_the_last_of_consecutive_moves_is_kept() {
+        let mouse = |action: MouseAction, col: u16| TermEvent::Mouse {
+            action,
+            col,
+            row: 0,
+            modifiers: Modifiers::default(),
+        };
+        let drag = MouseAction::Drag(MouseButtonKind::Left);
+        let mut events = vec![
+            mouse(MouseAction::Moved, 1),
+            mouse(MouseAction::Moved, 2),
+            TermEvent::Key {
+                code: KeyCode::Char('a'),
+                modifiers: Modifiers::default(),
+            },
+            mouse(MouseAction::Moved, 3),
+            mouse(drag, 4),
+            mouse(drag, 5),
+            mouse(drag, 6),
+            mouse(MouseAction::Down(MouseButtonKind::Left), 7),
+            mouse(MouseAction::Down(MouseButtonKind::Left), 8),
+        ];
+        drop_superseded_moves(&mut events, |event| Some(event));
+        let columns: Vec<Option<u16>> = events
+            .iter()
+            .map(|event| match event {
+                TermEvent::Mouse { col, .. } => Some(*col),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(columns, [Some(2), None, Some(3), Some(6), Some(7), Some(8)]);
+    }
 
     #[test]
     fn messages_round_trip() {

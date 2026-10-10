@@ -37,7 +37,7 @@ use crate::tui::{
     input::{InputTranslator, Translated},
     protocol::{
         ClientMessage, FrameEncoder, MessageReader, MessageWriter, PROTOCOL_VERSION, ServerMessage,
-        TermEvent, WAIT_ONLY_SIZE, read_message, write_message,
+        TermEvent, WAIT_ONLY_SIZE, drop_superseded_moves, read_message, write_message,
     },
 };
 
@@ -536,8 +536,19 @@ async fn handle_events(
     let mut sizes: HashMap<u64, (u16, u16)> = HashMap::default();
     let mut translator = InputTranslator::default();
 
+    let mut queued = Vec::new();
     while let Some(event) = events.next().await {
-        handle_event(event, &platform, &hub, &mut sizes, &mut translator, cx);
+        queued.push(event);
+        while let Ok(event) = events.try_recv() {
+            queued.push(event);
+        }
+        drop_superseded_moves(&mut queued, |event| match event {
+            ServerEvent::Input(input) => Some(input),
+            _ => None,
+        });
+        for event in queued.drain(..) {
+            handle_event(event, &platform, &hub, &mut sizes, &mut translator, cx);
+        }
     }
 }
 
