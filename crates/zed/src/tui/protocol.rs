@@ -255,24 +255,39 @@ fn underline_color(cell: &Cell) -> Option<u32> {
 }
 
 fn encode_cells(cells: &[Cell]) -> Vec<Span> {
-    cells
-        .iter()
-        .map(|cell| {
-            let mut text = String::new();
-            if cell.is_wide_continuation() {
+    let mut spans: Vec<Span> = Vec::new();
+    for cell in cells {
+        let is_continuation = cell.is_wide_continuation();
+        if let Some(Span(fg, bg, attrs, text, underline)) = spans.last_mut() {
+            if is_continuation {
                 text.push(CONTINUATION);
-            } else {
-                push_glyph(&mut text, cell.glyph);
+                continue;
             }
-            Span(
-                u32::from(cell.fg),
-                u32::from(cell.bg),
-                (cell.attrs - CellAttrs::WIDE_CONTINUATION).bits(),
-                text,
-                underline_color(cell),
-            )
-        })
-        .collect()
+            if *fg == u32::from(cell.fg)
+                && *bg == u32::from(cell.bg)
+                && *attrs == cell.attrs.bits()
+                && *underline == underline_color(cell)
+            {
+                push_glyph(text, cell.glyph);
+                continue;
+            }
+        }
+        let attrs = cell.attrs - CellAttrs::WIDE_CONTINUATION;
+        let mut text = String::new();
+        if is_continuation {
+            text.push(CONTINUATION);
+        } else {
+            push_glyph(&mut text, cell.glyph);
+        }
+        spans.push(Span(
+            u32::from(cell.fg),
+            u32::from(cell.bg),
+            attrs.bits(),
+            text,
+            underline_color(cell),
+        ));
+    }
+    spans
 }
 
 fn push_glyph(text: &mut String, glyph: Glyph) {
@@ -513,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn underline_colors_survive_the_wire() {
+    fn underline_colors_survive_the_wire_and_split_spans() {
         let (red, blue) = (Rgb::new(224, 108, 117), Rgb::new(97, 175, 239));
         let mut grid = CellGrid::new(6, 1, Rgb::new(40, 44, 52));
         for (col, cell) in grid.row_mut(0).iter_mut().enumerate() {
@@ -521,10 +536,17 @@ mod tests {
             cell.attrs = CellAttrs::UNDERLINE | CellAttrs::CURLY_UNDERLINE;
             cell.underline = UnderlineColor::of(if col < 3 { red } else { blue });
         }
+        assert_eq!(encode_cells(grid.row(0)).len(), 2);
         let mut decoded = None;
         let message = FrameEncoder::default().update(None, &grid).unwrap();
         FrameDecoder::default().apply(&mut decoded, &message);
         assert_eq!(decoded.as_ref(), Some(&grid));
+
+        let mut plain = grid.clone();
+        for cell in plain.row_mut(0) {
+            cell.attrs = CellAttrs::empty();
+        }
+        assert_eq!(encode_cells(plain.row(0)).len(), 1);
     }
 
     fn assert_looks_like(actual: &CellGrid, expected: &CellGrid) {
