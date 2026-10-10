@@ -18,6 +18,8 @@ use crate::tui::protocol::{
     ClientMessage, FrameDecoder, KeyCode, MouseAction, MouseButtonKind, PROTOCOL_VERSION,
     ServerMessage, TermEvent, read_message, write_message,
 };
+const PUSH_TITLE: &str = "\x1b[22;0t";
+const POP_TITLE: &str = "\x1b[23;0t";
 const RESIZE_FRAME_WAIT: Duration = Duration::from_millis(100);
 const ATTRIBUTE_CODES: [(CellAttrs, &str); 2] = [(CellAttrs::BOLD, "1"), (CellAttrs::ITALIC, "3")];
 
@@ -35,6 +37,7 @@ struct TerminalSetup {
 
 impl TerminalSetup {
     fn run(&mut self, output: &mut impl Write) -> io::Result<()> {
+        write!(output, "{PUSH_TITLE}")?;
         self.entered = true;
         crossterm::execute!(
             output,
@@ -57,6 +60,7 @@ impl TerminalSetup {
                 terminal::LeaveAlternateScreen,
             )
             .ok();
+            write!(output, "{POP_TITLE}").ok();
         }
         output.flush().ok();
     }
@@ -325,6 +329,7 @@ impl<W: Write> Renderer<W> {
                 self.decoder.apply(&mut self.grid, message);
                 return Ok(true);
             }
+            ServerMessage::Title(title) => self.set_title(title)?,
             ServerMessage::Shutdown | ServerMessage::Error(_) => {}
         }
         Ok(false)
@@ -378,6 +383,12 @@ impl<W: Write> Renderer<W> {
         }
         terminal.flush_frame()
     }
+
+    fn set_title(&mut self, title: &str) -> io::Result<()> {
+        let title: String = title.chars().filter(|ch| !ch.is_control()).collect();
+        write!(self.terminal.output, "\x1b]2;{title}\x07")?;
+        self.terminal.output.flush()
+    }
 }
 
 enum ClientEvent {
@@ -403,7 +414,7 @@ fn exit_of(message: &ServerMessage) -> Option<Exit> {
     match message {
         ServerMessage::Shutdown => Some(Exit::ServerShutdown),
         ServerMessage::Error(error) => Some(Exit::Rejected(error.clone())),
-        ServerMessage::FullFrame(..) => None,
+        ServerMessage::FullFrame(..) | ServerMessage::Title(_) => None,
     }
 }
 
@@ -831,14 +842,14 @@ mod tests {
     fn a_failed_startup_undoes_only_the_steps_it_started() {
         let (result, undo) = undo_after_setup(1);
         assert!(result.is_err());
-        assert!(undo.contains(LEAVE_ALTERNATE_SCREEN));
+        assert!(undo.contains(LEAVE_ALTERNATE_SCREEN) && undo.ends_with(POP_TITLE));
     }
 
     #[test]
     fn a_completed_startup_restores_every_step() {
         let (result, undo) = undo_after_setup(0);
         assert!(result.is_ok());
-        assert!(undo.contains(LEAVE_ALTERNATE_SCREEN));
+        assert!(undo.contains(LEAVE_ALTERNATE_SCREEN) && undo.ends_with(POP_TITLE));
     }
 
     #[test]

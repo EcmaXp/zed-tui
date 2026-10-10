@@ -95,6 +95,7 @@ pub fn is_running(paths: &SessionPaths) -> bool {
 
 enum Outgoing {
     Frame(Arc<CellGrid>),
+    Message(ServerMessage),
 }
 
 struct ClientHandle {
@@ -106,6 +107,7 @@ struct ClientHandle {
 struct HubState {
     clients: Vec<ClientHandle>,
     last_frame: Option<Arc<CellGrid>>,
+    last_title: Option<String>,
 }
 
 impl HubState {
@@ -127,6 +129,15 @@ impl ClientHub {
         state
             .clients
             .retain(|client| client.sender.send(Outgoing::Frame(grid.clone())).is_ok());
+    }
+
+    fn broadcast_message(&self, message: ServerMessage) {
+        self.state.lock().clients.retain(|client| {
+            client
+                .sender
+                .send(Outgoing::Message(message.clone()))
+                .is_ok()
+        });
     }
 
     fn send_last_frame_to(&self, id: u64, size: (u16, u16)) {
@@ -211,6 +222,14 @@ pub fn start_session(
         let hub = hub.clone();
         move || accept_clients(listener, hub, event_sender)
     })?;
+
+    platform.on_title_change({
+        let hub = hub.clone();
+        move |title| {
+            hub.state.lock().last_title = Some(title.to_string());
+            hub.broadcast_message(ServerMessage::Title(title.to_string()));
+        }
+    });
 
     let started = Started {
         on_frame: Box::new({
@@ -349,7 +368,15 @@ fn serve_client(
     thread::Builder::new()
         .name(format!("ClientWriter-{id}"))
         .spawn(move || write_to_client(write_stream, receiver))?;
-    hub.state.lock().clients.push(ClientHandle { id, sender });
+    {
+        let mut state = hub.state.lock();
+        if let Some(title) = state.last_title.clone() {
+            sender
+                .send(Outgoing::Message(ServerMessage::Title(title)))
+                .log_err();
+        }
+        state.clients.push(ClientHandle { id, sender });
+    }
 
     events
         .unbounded_send(ServerEvent::Resized { id, cols, rows })
@@ -407,8 +434,11 @@ fn write_to_client(mut stream: UnixStream, receiver: mpsc::Receiver<Outgoing>) {
 fn send_to_client(stream: &mut UnixStream, receiver: mpsc::Receiver<Outgoing>) {
     let encoder = FrameEncoder;
     while let Ok(outgoing) = receiver.recv() {
-        let Outgoing::Frame(grid) = outgoing;
-        if write_message(stream, &encoder.full_frame(&grid)).is_err() {
+        let message = match outgoing {
+            Outgoing::Frame(grid) => encoder.full_frame(&grid),
+            Outgoing::Message(message) => message,
+        };
+        if write_message(stream, &message).is_err() {
             return;
         }
     }

@@ -89,6 +89,7 @@ pub enum ServerMessage {
         Vec<RowPatch>,
         #[serde(with = "wire_cursor")] FrameCursor,
     ),
+    Title(String),
     Shutdown,
     Error(String),
 }
@@ -244,7 +245,7 @@ impl FrameDecoder {
                 frame.cursor = *cursor;
                 *grid = Some(frame);
             }
-            ServerMessage::Shutdown | ServerMessage::Error(_) => {}
+            ServerMessage::Title(_) | ServerMessage::Shutdown | ServerMessage::Error(_) => {}
         }
     }
 }
