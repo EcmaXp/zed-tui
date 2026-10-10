@@ -4,6 +4,7 @@ use crate::{
     size, util::round_half_toward_zero,
 };
 use collections::FxHashMap;
+use smallvec::SmallVec;
 use taffy::{TaffyTree, TraversePartialTree as _};
 
 pub(super) struct CellSnapper {
@@ -81,9 +82,9 @@ enum Spacing {
 
 struct Snapped {
     node: CellNode,
-    nested_rule_spacing_owners: Vec<(Side, LayoutId)>,
-    dropped_spacings: Vec<(LayoutId, Side, Spacing)>,
-    gap_closers: Vec<(LayoutId, Side)>,
+    nested_rule_spacing_owners: SmallVec<[(Side, LayoutId); 2]>,
+    dropped_spacings: SmallVec<[(LayoutId, Side, Spacing); 2]>,
+    gap_closers: SmallVec<[(LayoutId, Side); 2]>,
 }
 
 impl CellSnapper {
@@ -177,7 +178,7 @@ impl CellSnapper {
         snap_to_cells(taffy_style, style, self.cell_size, self.viewport_width);
         let mut nests_rule_spacing = false;
         let mut rounds_up_a_margin = false;
-        let content: Vec<LayoutId> = children
+        let content: SmallVec<[LayoutId; 8]> = children
             .iter()
             .copied()
             .filter(|child| {
@@ -207,7 +208,7 @@ impl CellSnapper {
         let mut dropped_spacings = if nests_rule_spacing {
             self.redundant_rule_spacings(taffy_style, &content)
         } else {
-            Vec::new()
+            SmallVec::new()
         };
         if rounds_up_a_margin {
             dropped_spacings.extend(self.redundant_margins(taffy_style, &content));
@@ -392,8 +393,8 @@ impl CellSnapper {
         &self,
         style: &taffy::style::Style,
         content: &[LayoutId],
-    ) -> Vec<(LayoutId, Side, Spacing)> {
-        let mut redundant = Vec::new();
+    ) -> SmallVec<[(LayoutId, Side, Spacing); 2]> {
+        let mut redundant = SmallVec::new();
         let Some(flow) = Flow::of(style, content) else {
             return redundant;
         };
@@ -435,8 +436,8 @@ impl CellSnapper {
         &self,
         style: &taffy::style::Style,
         content: &[LayoutId],
-    ) -> Vec<(LayoutId, Side, Spacing)> {
-        let mut redundant = Vec::new();
+    ) -> SmallVec<[(LayoutId, Side, Spacing); 2]> {
+        let mut redundant = SmallVec::new();
         let Some(flow) = Flow::of(style, content).filter(|flow| flow.is_row) else {
             return redundant;
         };
@@ -460,8 +461,8 @@ impl CellSnapper {
         style: &taffy::style::Style,
         unsnapped: HorizontalSpacing,
         content: &[LayoutId],
-    ) -> Vec<(LayoutId, Side)> {
-        let mut closers = Vec::new();
+    ) -> SmallVec<[(LayoutId, Side); 2]> {
+        let mut closers = SmallVec::new();
         let rounds_up_gap = positive_length(unsnapped.gap_width)
             .is_some_and(|gap| gap < self.cell_size.width)
             && positive_length(style.gap.width).is_some();
