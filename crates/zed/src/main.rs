@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod reliability;
+mod tui;
 mod watcher_debug;
 mod zed;
 
@@ -210,7 +211,10 @@ fn main() {
     #[cfg(unix)]
     util::prevent_root_execution();
 
-    let args = Args::parse();
+    let (tui_server, tui_startup) = tui::start().unzip();
+    let args = tui_server.as_ref().map_or_else(Args::parse, |tui_server| {
+        Args::parse_from(tui_server.zed_args())
+    });
 
     // `zed --askpass` Makes zed operate in nc/netcat mode for use with askpass
     #[cfg(not(target_os = "windows"))]
@@ -288,7 +292,9 @@ fn main() {
 
     zlog::init();
 
-    if stdout_is_a_pty() {
+    if tui_server.is_some() {
+        zlog::init_output_stderr();
+    } else if stdout_is_a_pty() {
         zlog::init_output_stdout();
     } else {
         let result = zlog::init_output_file(paths::log_file(), Some(paths::old_log_file()));
@@ -339,11 +345,15 @@ fn main() {
     #[cfg(windows)]
     check_for_conpty_dll();
 
-    let app = build_application()
+    let app = tui_startup
+        .as_ref()
+        .map_or_else(build_application, tui::Startup::application)
         .with_assets(Assets)
         .with_restart_arguments(restart_arguments);
 
-    let app_db = db::AppDatabase::new();
+    let app_db = tui_startup
+        .as_ref()
+        .map_or_else(db::AppDatabase::new, tui::Startup::database);
     let system_id = app.background_executor().spawn(system_id());
     let installation_id = app
         .background_executor()
@@ -359,6 +369,7 @@ fn main() {
 
     let failed_single_instance_check = if *zed_env_vars::ZED_STATELESS
         || *release_channel::RELEASE_CHANNEL == ReleaseChannel::Dev
+        || tui_startup.is_some()
     {
         false
     } else {
@@ -441,7 +452,7 @@ fn main() {
     );
 
     let (shell_env_loaded_tx, shell_env_loaded_rx) = oneshot::channel();
-    if !stdout_is_a_pty() {
+    if !stdout_is_a_pty() && tui_startup.is_none() {
         app.background_executor()
             .spawn(async {
                 #[cfg(unix)]
@@ -495,6 +506,9 @@ fn main() {
             AppCommitSha::set_global(app_commit_sha, cx);
         }
         settings::init(cx);
+        if let Some(tui_startup) = &tui_startup {
+            tui_startup.init_settings(cx);
+        }
         zlog_settings::init(cx);
         zed::watch_settings_files(fs.clone(), cx);
         handle_keymap_file_changes(user_keymap_file_rx, user_keymap_watcher, cx);
@@ -789,6 +803,9 @@ fn main() {
         json_schema_store::init(cx);
         miniprofiler_ui::init(*STARTUP_TIME.get().unwrap(), cx);
         which_key::init(cx);
+        if let Some(tui_startup) = tui_startup {
+            tui_startup.init(cx);
+        }
         #[cfg(target_os = "windows")]
         etw_tracing::init(cx);
 
