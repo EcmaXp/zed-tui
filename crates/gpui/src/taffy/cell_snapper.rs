@@ -972,10 +972,12 @@ impl Window {
     }
 }
 
+#[inline]
 fn round_to_cell(value: f32, cell: f32) -> f32 {
     round_half_toward_zero(value / cell) * cell
 }
 
+#[inline]
 fn round_extent_to_cells(value: f32, cell: f32) -> f32 {
     if value < cell / 2.0 {
         value
@@ -984,6 +986,7 @@ fn round_extent_to_cells(value: f32, cell: f32) -> f32 {
     }
 }
 
+#[inline]
 fn round_spacing_to_cells(value: f32, cell: f32) -> f32 {
     if value > 0.0 && value < cell {
         cell
@@ -992,6 +995,7 @@ fn round_spacing_to_cells(value: f32, cell: f32) -> f32 {
     }
 }
 
+#[inline]
 fn round_width_to_cells(value: f32, cell: f32) -> f32 {
     if value <= 0.0 {
         value
@@ -1000,6 +1004,7 @@ fn round_width_to_cells(value: f32, cell: f32) -> f32 {
     }
 }
 
+#[inline]
 fn ceil_to_cell(value: f32, cell: f32) -> f32 {
     (value / cell).ceil() * cell
 }
