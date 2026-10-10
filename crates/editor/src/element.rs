@@ -11,10 +11,10 @@ use crate::{
     ConflictsOurs, ConflictsOursMarker, ConflictsOuter, ConflictsTheirs, ConflictsTheirsMarker,
     ContextMenuPlacement, CursorShape, CustomBlockId, DisplayDiffHunk, DisplayPoint, DisplayRow,
     EditDisplayMode, EditPrediction, Editor, EditorMode, EditorSettings, EditorSnapshot,
-    EditorStyle, FILE_HEADER_HEIGHT, FocusedBlock, GutterDimensions, HalfPageDown, HalfPageUp,
-    HandleInput, HoveredCursor, InlayHintRefreshReason, LineDown, LineHighlight, LineUp,
-    MAX_LINE_LEN, MINIMAP_FONT_SIZE, PageDown, PageUp, Point, RowExt, RowRangeExt, Selection,
-    SelectionDragState, SizingBehavior, SoftWrap, ToPoint,
+    EditorStyle, FocusedBlock, GutterDimensions, HalfPageDown, HalfPageUp, HandleInput,
+    HoveredCursor, InlayHintRefreshReason, LineDown, LineHighlight, LineUp, MAX_LINE_LEN,
+    MINIMAP_FONT_SIZE, PageDown, PageUp, Point, RowExt, RowRangeExt, Selection, SelectionDragState,
+    SizingBehavior, SoftWrap, ToPoint,
     code_context_menus::{CodeActionsMenu, MENU_ASIDE_MAX_WIDTH, MENU_ASIDE_MIN_WIDTH, MENU_GAP},
     column_pixels,
     cursor_animation::{CursorViewport, LogicalCursorPosition, animated_corners_overlap_target},
@@ -3415,8 +3415,7 @@ impl EditorElement {
                         cx,
                     ));
                 } else {
-                    result =
-                        result.child(div().h(FILE_HEADER_HEIGHT as f32 * window.line_height()));
+                    result = result.child(div().h(*height as f32 * window.line_height()));
                 }
 
                 result.into_any_element()
@@ -3468,12 +3467,10 @@ impl EditorElement {
                             ),
                         ));
                     } else {
-                        result =
-                            result.child(div().h(FILE_HEADER_HEIGHT as f32 * window.line_height()));
+                        result = result.child(div().h(*height as f32 * window.line_height()));
                     }
                 } else {
-                    result =
-                        result.child(div().h(FILE_HEADER_HEIGHT as f32 * window.line_height()));
+                    result = result.child(div().h(*height as f32 * window.line_height()));
                 }
 
                 result.into_any()
@@ -9891,7 +9888,7 @@ impl Element for EditorElement {
                     let has_sticky_buffer_header =
                         sticky_buffer_header.is_some() || sticky_header_excerpt_id.is_some();
                     let sticky_header_height = if has_sticky_buffer_header {
-                        let full_height = FILE_HEADER_HEIGHT as f32 * line_height;
+                        let full_height = snapshot.buffer_header_height() as f32 * line_height;
                         let display_row = blocks
                             .iter()
                             .filter(|block| block.is_buffer_header)
@@ -9900,7 +9897,9 @@ impl Element for EditorElement {
                             });
                         let offset = match display_row {
                             Some(display_row) => {
-                                let max_row = display_row.0.saturating_sub(FILE_HEADER_HEIGHT);
+                                let max_row = display_row
+                                    .0
+                                    .saturating_sub(snapshot.buffer_header_height());
                                 let offset = (scroll_position.y - max_row as f64).max(0.0);
                                 let slide_up =
                                     Pixels::from(offset * ScrollPixelOffset::from(line_height));

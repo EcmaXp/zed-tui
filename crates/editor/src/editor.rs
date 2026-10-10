@@ -11069,8 +11069,8 @@ impl Editor {
         })
     }
 
-    pub fn file_header_size(&self) -> u32 {
-        FILE_HEADER_HEIGHT
+    pub fn file_header_size(&self, cx: &App) -> u32 {
+        self.display_map.read(cx).buffer_header_height()
     }
 
     pub fn restore(
