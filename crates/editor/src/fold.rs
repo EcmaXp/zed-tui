@@ -792,19 +792,21 @@ impl Editor {
         self.fold_creases(to_fold, true, window, cx);
     }
 
-    pub(super) fn unfold_buffers_with_selections(&mut self, cx: &mut Context<Self>) {
-        if self.buffer().read(cx).is_singleton() {
-            return;
+    pub(super) fn unfold_buffers_with_selections(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.buffer().read(cx).is_singleton() || self.folded_buffers(cx).is_empty() {
+            return false;
         }
         let snapshot = self.buffer.read(cx).snapshot(cx);
-        let buffer_ids: HashSet<BufferId> = self
+        let folded_buffer_ids: HashSet<BufferId> = self
             .selections
             .disjoint_anchor_ranges()
             .flat_map(|range| snapshot.buffer_ids_for_range(range))
+            .filter(|buffer_id| self.is_buffer_folded(*buffer_id, cx))
             .collect();
-        for buffer_id in buffer_ids {
-            self.unfold_buffer(buffer_id, cx);
+        for buffer_id in &folded_buffer_ids {
+            self.unfold_buffer(*buffer_id, cx);
         }
+        !folded_buffer_ids.is_empty()
     }
 
     pub(super) fn folds_did_change(&mut self, cx: &mut Context<Self>) {

@@ -8733,6 +8733,7 @@ impl Editor {
         update: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>),
     ) -> Option<TransactionId> {
         self.with_selection_effects_deferred(window, cx, |this, window, cx| {
+            this.unfold_buffers_with_selections(cx);
             this.start_transaction_at(Instant::now(), window, cx);
             update(this, window, cx);
             this.end_transaction_at(Instant::now(), cx)

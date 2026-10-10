@@ -703,6 +703,17 @@ impl EditorElement {
         register_action(editor, window, Editor::reload_file);
 
         if !editor.read(cx).read_only(cx) {
+            fn register_action<T: Action>(
+                editor: &Entity<Editor>,
+                window: &mut Window,
+                listener: impl Fn(&mut Editor, &T, &mut Window, &mut Context<Editor>) + 'static,
+            ) {
+                self::register_action(editor, window, move |editor, action, window, cx| {
+                    if !editor.unfold_buffers_with_selections(cx) {
+                        listener(editor, action, window, cx);
+                    }
+                });
+            }
             register_action(editor, window, Editor::newline);
             register_action(editor, window, Editor::newline_above);
             register_action(editor, window, Editor::newline_below);
@@ -780,7 +791,7 @@ impl EditorElement {
             if editor.read(cx).enable_wrap_selections_in_tag(cx) {
                 register_action(editor, window, Editor::wrap_selections_in_tag);
             }
-            register_action(
+            self::register_action(
                 editor,
                 window,
                 |editor, HandleInput(text): &HandleInput, window, cx| {
