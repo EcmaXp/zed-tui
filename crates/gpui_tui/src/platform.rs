@@ -25,6 +25,7 @@ use crate::{
     size_for_cells,
     text_system::TuiTextSystem,
     window::{TuiWindow, TuiWindowHandle},
+    with_taken,
 };
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
@@ -32,6 +33,7 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 #[derive(Default)]
 pub(crate) struct PlatformOutputs {
     pub(crate) frame_sink: RefCell<Option<Box<dyn FnMut(CellGrid)>>>,
+    pub(crate) title: RefCell<Option<Box<dyn FnMut(&str)>>>,
     pub(crate) icon_glyphs: RefCell<Option<Box<dyn Fn(&str) -> Option<char>>>>,
     pub(crate) canvas: Cell<Rgb>,
 }
@@ -134,6 +136,9 @@ impl WindowRegistry {
 #[derive(Default)]
 struct PlatformCallbacks {
     quit: Option<Box<dyn FnMut() -> bool>>,
+    open_urls: Option<Box<dyn FnMut(Vec<String>)>>,
+    clipboard_write: Option<Box<dyn FnMut(String)>>,
+    cursor_style_change: Option<Box<dyn FnMut(CursorStyle)>>,
 }
 
 pub struct TuiPlatform {
@@ -145,6 +150,7 @@ pub struct TuiPlatform {
     windows: Rc<WindowRegistry>,
     outputs: Rc<PlatformOutputs>,
     callbacks: RefCell<PlatformCallbacks>,
+    cursor_style: Cell<CursorStyle>,
     clipboard: RefCell<Option<ClipboardItem>>,
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     primary: RefCell<Option<ClipboardItem>>,
@@ -175,6 +181,7 @@ impl TuiPlatform {
             }),
             outputs: Rc::default(),
             callbacks: RefCell::default(),
+            cursor_style: Cell::new(CursorStyle::default()),
             clipboard: RefCell::default(),
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             primary: RefCell::default(),
@@ -197,13 +204,39 @@ impl TuiPlatform {
         self.outputs.canvas.set(canvas);
     }
 
+    pub fn on_title_change(&self, callback: impl FnMut(&str) + 'static) {
+        *self.outputs.title.borrow_mut() = Some(Box::new(callback));
+    }
+
+    pub fn on_clipboard_write(&self, callback: impl FnMut(String) + 'static) {
+        self.callbacks.borrow_mut().clipboard_write = Some(Box::new(callback));
+    }
+
+    pub fn on_cursor_style_change(&self, callback: impl FnMut(CursorStyle) + 'static) {
+        self.callbacks.borrow_mut().cursor_style_change = Some(Box::new(callback));
+    }
+
     pub(crate) fn focused_window(&self) -> Option<TuiWindowHandle> {
         self.windows.focused_window()
+    }
+
+    pub fn open_urls(&self, urls: Vec<String>) {
+        with_taken(
+            &self.callbacks,
+            |callbacks| &mut callbacks.open_urls,
+            |callback| callback(urls),
+        );
     }
 
     pub fn handle_input(&self, input: PlatformInput) {
         if let Some(window) = self.focused_window() {
             window.handle_input(input);
+        }
+    }
+
+    pub fn insert_text(&self, text: &str) {
+        if let Some(window) = self.focused_window() {
+            window.insert_text(text);
         }
     }
 
@@ -325,7 +358,9 @@ impl Platform for TuiPlatform {
         open::that_detached(url).log_err();
     }
 
-    fn on_open_urls(&self, _callback: Box<dyn FnMut(Vec<String>)>) {}
+    fn on_open_urls(&self, callback: Box<dyn FnMut(Vec<String>)>) {
+        self.callbacks.borrow_mut().open_urls = Some(callback);
+    }
 
     fn register_url_scheme(&self, _url: &str) -> Task<Result<()>> {
         Task::ready(Err(anyhow!(
@@ -411,7 +446,16 @@ impl Platform for TuiPlatform {
         ))
     }
 
-    fn set_cursor_style(&self, _style: CursorStyle) {}
+    fn set_cursor_style(&self, style: CursorStyle) {
+        if self.cursor_style.replace(style) == style {
+            return;
+        }
+        with_taken(
+            &self.callbacks,
+            |callbacks| &mut callbacks.cursor_style_change,
+            |callback| callback(style),
+        );
+    }
 
     fn hide_cursor_until_mouse_moves(&self) {}
 
@@ -428,7 +472,15 @@ impl Platform for TuiPlatform {
     }
 
     fn write_to_clipboard(&self, item: ClipboardItem) {
+        let text = item.text();
         *self.clipboard.borrow_mut() = Some(item);
+        if let Some(text) = text {
+            with_taken(
+                &self.callbacks,
+                |callbacks| &mut callbacks.clipboard_write,
+                |callback| callback(text),
+            );
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -474,4 +526,37 @@ impl Platform for TuiPlatform {
     }
 
     fn on_keyboard_layout_change(&self, _callback: Box<dyn FnMut()>) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_styles_reach_the_callback_once_per_change() {
+        let platform = TuiPlatform::new(10, 2);
+        let reported: Rc<RefCell<Vec<CursorStyle>>> = Rc::default();
+        platform.on_cursor_style_change({
+            let reported = reported.clone();
+            move |style| reported.borrow_mut().push(style)
+        });
+        for style in [
+            CursorStyle::Arrow,
+            CursorStyle::IBeam,
+            CursorStyle::IBeam,
+            CursorStyle::PointingHand,
+            CursorStyle::PointingHand,
+            CursorStyle::Arrow,
+        ] {
+            platform.set_cursor_style(style);
+        }
+        assert_eq!(
+            *reported.borrow(),
+            [
+                CursorStyle::IBeam,
+                CursorStyle::PointingHand,
+                CursorStyle::Arrow
+            ]
+        );
+    }
 }

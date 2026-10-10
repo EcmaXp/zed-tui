@@ -493,3 +493,40 @@ fn combining_and_zwj_text_reach_the_frame() {
     );
     assert_eq!(grid.cell(8, 0).expect("cell").glyph, 'x');
 }
+
+struct PointerTarget;
+
+impl Render for PointerTarget {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .child(div().id("link").w(px(80.)).h(px(16.)).cursor_pointer())
+    }
+}
+
+#[test]
+fn hovering_a_pointer_element_requests_a_hand() {
+    let platform = TuiPlatform::new(20, 4);
+    let requested: Rc<RefCell<Vec<gpui::CursorStyle>>> = Rc::default();
+    platform.on_cursor_style_change({
+        let requested = requested.clone();
+        move |style| requested.borrow_mut().push(style)
+    });
+    Application::with_platform(platform.clone()).run(move |cx: &mut App| {
+        cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| PointerTarget))
+            .expect("failed to open window");
+        cx.spawn(async move |cx| {
+            let settle = Duration::from_millis(30);
+            cx.background_executor().timer(settle).await;
+            platform.handle_input(PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                position: gpui_tui::cell_center(4, 0),
+                pressed_button: None,
+                modifiers: Modifiers::default(),
+            }));
+            cx.background_executor().timer(settle).await;
+            cx.update(|cx| cx.quit());
+        })
+        .detach();
+    });
+    assert_eq!(*requested.borrow(), [gpui::CursorStyle::PointingHand]);
+}
