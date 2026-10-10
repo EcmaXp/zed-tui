@@ -1,6 +1,9 @@
 use std::{
     fmt, io,
-    sync::{Arc, LazyLock},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use collections::HashMap;
@@ -71,6 +74,7 @@ bitflags::bitflags! {
 }
 
 const FIRST_CLUSTER_ID: u32 = 0x11_0000;
+const MAX_UNDERLINE_COLORS: usize = u8::MAX as usize;
 
 #[derive(Default)]
 struct ClusterTable {
@@ -79,6 +83,8 @@ struct ClusterTable {
 }
 
 static CLUSTERS: LazyLock<RwLock<ClusterTable>> = LazyLock::new(RwLock::default);
+static UNDERLINE_COLORS: LazyLock<RwLock<Vec<Rgb>>> = LazyLock::new(RwLock::default);
+static UNDERLINE_COLORS_FULL: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Glyph(u32);
@@ -192,15 +198,35 @@ impl fmt::Debug for Glyph {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct UnderlineColor(Option<Rgb>);
+pub struct UnderlineColor(u8);
 
 impl UnderlineColor {
     pub fn of(color: Rgb) -> Self {
-        Self(Some(color))
+        let position = |colors: &[Rgb]| colors.iter().position(|known| *known == color);
+        if let Some(index) = position(&UNDERLINE_COLORS.read()) {
+            return Self::from_index(index);
+        }
+        let mut colors = UNDERLINE_COLORS.write();
+        if let Some(index) = position(&colors) {
+            return Self::from_index(index);
+        }
+        if colors.len() >= MAX_UNDERLINE_COLORS {
+            if !UNDERLINE_COLORS_FULL.swap(true, Ordering::Relaxed) {
+                log::warn!("underline colors are full; new ones take the text color");
+            }
+            return Self::default();
+        }
+        colors.push(color);
+        Self::from_index(colors.len() - 1)
     }
 
     pub fn rgb(self) -> Option<Rgb> {
-        self.0
+        let index = usize::from(self.0).checked_sub(1)?;
+        UNDERLINE_COLORS.read().get(index).copied()
+    }
+
+    fn from_index(index: usize) -> Self {
+        u8::try_from(index + 1).map_or(Self::default(), Self)
     }
 }
 
@@ -406,7 +432,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn underline_colors_round_trip() {
+    fn cells_keep_their_size_with_an_underline_color() {
+        assert_eq!(std::mem::size_of::<Cell>(), 12);
+    }
+
+    #[test]
+    fn underline_colors_round_trip_through_the_table() {
         let color = Rgb::new(224, 108, 117);
         let underline = UnderlineColor::of(color);
         assert_ne!(underline, UnderlineColor::default());
