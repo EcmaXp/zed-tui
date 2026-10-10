@@ -61,6 +61,46 @@ fn doc_test(row: u32, name: &str) -> FoundRunnable {
 }
 
 #[gpui::test]
+fn test_rust_runnables_skip_patterns_missing_required_text(cx: &mut TestAppContext) {
+    let language = rust_language_with_runnables();
+    let config = language
+        .grammar()
+        .and_then(|grammar| grammar.runnable_config.as_ref())
+        .expect("rust runnable config");
+    assert!(
+        std::ptr::eq(config.query_for_text(|_| true), &config.query),
+        "a buffer with every required text should use the full runnables query"
+    );
+    assert!(
+        !std::ptr::eq(config.query_for_text(|text| text != "main"), &config.query),
+        "a buffer without `main` should skip the main function pattern"
+    );
+
+    let doc = "/".repeat(3);
+    let source = format!(
+        "{doc} Adds numbers.\nfn add() {{}}\n\n#[cfg(test)]\nmod tests {{\n    #[test]\n    fn it_works() {{}}\n}}\n"
+    );
+    let runnables = rust_runnables(cx, &source);
+    assert_eq!(
+        runnables
+            .iter()
+            .map(|runnable| (runnable.row, runnable.tag.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(4, "rust-mod-test"), (6, "rust-test")],
+    );
+
+    let source_with_main = format!("{source}\nfn main() {{}}\n");
+    let runnables = rust_runnables(cx, &source_with_main);
+    assert_eq!(
+        runnables
+            .iter()
+            .map(|runnable| (runnable.row, runnable.tag.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(4, "rust-mod-test"), (6, "rust-test"), (9, "rust-main")],
+    );
+}
+
+#[gpui::test]
 fn test_rust_doc_test_runnables(cx: &mut TestAppContext) {
     let doc = "/".repeat(3);
     let inner_doc = format!("//{}", "!");

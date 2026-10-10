@@ -2,7 +2,7 @@ use std::{cmp::Reverse, iter, ops::Range, sync::Arc};
 
 use collections::HashMap;
 use smallvec::SmallVec;
-use text::BufferId;
+use text::{BufferId, Rope};
 use tree_sitter::QueryCapture;
 use util::RangeExt;
 
@@ -68,6 +68,11 @@ pub(crate) fn runnable_ranges(
     buffer: &BufferSnapshot,
     offset_range: Range<usize>,
 ) -> impl Iterator<Item = RunnableRange> + '_ {
+    let gate_on_buffer_text = offset_range
+        .len()
+        .saturating_mul(TEXT_GATING_MIN_RANGE_FRACTION)
+        >= buffer.len();
+    let mut text_presence = HashMap::<String, bool>::default();
     let mut syntax_matches = buffer.syntax.matches_with_options(
         offset_range.clone(),
         buffer,
@@ -75,7 +80,17 @@ pub(crate) fn runnable_ranges(
             match_limit: Some(RUNNABLES_MATCH_LIMIT),
             ..TreeSitterOptions::default()
         },
-        |grammar| grammar.runnable_config.as_ref().map(|config| &config.query),
+        |grammar| {
+            let config = grammar.runnable_config.as_ref()?;
+            if !gate_on_buffer_text {
+                return Some(&config.query);
+            }
+            Some(config.query_for_text(|text| {
+                *text_presence
+                    .entry(text.to_string())
+                    .or_insert_with(|| rope_contains(buffer.as_rope(), text))
+            }))
+        },
     );
 
     let runnable_configs = syntax_matches
@@ -126,7 +141,38 @@ pub(crate) fn runnable_ranges(
     .flatten()
 }
 
+const TEXT_GATING_MIN_RANGE_FRACTION: usize = 16;
+
 const RUNNABLES_MATCH_LIMIT: u32 = 256;
+
+fn rope_contains(rope: &Rope, needle: &str) -> bool {
+    let needle_bytes = needle.as_bytes();
+    let Some(overlap) = needle_bytes.len().checked_sub(1) else {
+        return true;
+    };
+    let mut tail = Vec::<u8>::with_capacity(overlap);
+    for chunk in rope.chunks() {
+        if chunk.contains(needle) {
+            return true;
+        }
+        let chunk_bytes = chunk.as_bytes();
+        let tail_len = tail.len();
+        if tail_len > 0 {
+            tail.extend_from_slice(&chunk_bytes[..overlap.min(chunk_bytes.len())]);
+            if tail
+                .windows(needle_bytes.len())
+                .any(|window| window == needle_bytes)
+            {
+                return true;
+            }
+            tail.truncate(tail_len);
+        }
+        tail.extend_from_slice(chunk_bytes);
+        let keep_from = tail.len().saturating_sub(overlap);
+        tail.drain(..keep_from);
+    }
+    false
+}
 
 type RunnableMatchCaptures = SmallVec<[RunnableMatchCapture; 4]>;
 

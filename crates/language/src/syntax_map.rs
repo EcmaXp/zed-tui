@@ -1102,7 +1102,7 @@ impl SyntaxSnapshot {
         range: Range<usize>,
         buffer: &'a BufferSnapshot,
         options: TreeSitterOptions,
-        query: fn(&Grammar) -> Option<&Query>,
+        query: impl FnMut(&'a Grammar) -> Option<&'a Query>,
     ) -> SyntaxMapMatches<'a> {
         SyntaxMapMatches::new(
             range.clone(),
@@ -1349,7 +1349,7 @@ impl<'a> SyntaxMapMatches<'a> {
         range: Range<usize>,
         text: &'a Rope,
         layers: impl Iterator<Item = SyntaxLayer<'a>>,
-        query: fn(&Grammar) -> Option<&Query>,
+        mut query: impl FnMut(&'a Grammar) -> Option<&'a Query>,
         options: TreeSitterOptions,
     ) -> Self {
         let mut result = Self::default();
