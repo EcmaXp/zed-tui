@@ -72,10 +72,10 @@ use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
 use rope::Rope;
 use search::project_search::ProjectSearchBar;
 use settings::{
-    BaseKeymap, DEFAULT_KEYMAP_PATH, DefaultOpenBehavior, InvalidSettingsError, KeybindSource,
-    KeymapFile, KeymapFileLoadResult, MigrationStatus, SPECIFIC_OVERRIDES_KEYMAP_PATH, Settings,
-    SettingsFile, SettingsStore, VIM_KEYMAP_PATH, initial_local_debug_tasks_content,
-    initial_project_settings_content, initial_tasks_content, update_settings_file,
+    BaseKeymap, DefaultOpenBehavior, InvalidSettingsError, KeybindSource, KeymapFile,
+    KeymapFileLoadResult, MigrationStatus, Settings, SettingsFile, SettingsStore, VIM_KEYMAP_PATH,
+    default_keymap_path, initial_local_debug_tasks_content, initial_project_settings_content,
+    initial_tasks_content, specific_overrides_keymap_path, update_settings_file,
 };
 use sidebar::Sidebar;
 #[cfg(debug_assertions)]
@@ -2351,7 +2351,7 @@ pub fn load_default_keymap(cx: &mut App) {
     }
 
     cx.bind_keys(filter_disabled_ai_bindings(
-        KeymapFile::load_asset(DEFAULT_KEYMAP_PATH, Some(KeybindSource::Default), cx).unwrap(),
+        KeymapFile::load_asset(default_keymap_path(), Some(KeybindSource::Default), cx).unwrap(),
         cx,
     ));
 
@@ -2371,7 +2371,7 @@ pub fn load_default_keymap(cx: &mut App) {
 
     cx.bind_keys(
         KeymapFile::load_asset(
-            SPECIFIC_OVERRIDES_KEYMAP_PATH,
+            specific_overrides_keymap_path(),
             Some(KeybindSource::Default),
             cx,
         )
