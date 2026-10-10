@@ -250,6 +250,7 @@ pub struct TuiPlatform {
     #[cfg(target_os = "macos")]
     find_pasteboard: RefCell<Option<ClipboardItem>>,
     should_quit: Cell<bool>,
+    presenting: Cell<bool>,
     pacer: RefCell<FramePacer>,
 }
 
@@ -281,8 +282,16 @@ impl TuiPlatform {
             #[cfg(target_os = "macos")]
             find_pasteboard: RefCell::default(),
             should_quit: Cell::new(false),
+            presenting: Cell::new(true),
             pacer: RefCell::default(),
         })
+    }
+
+    pub fn set_presenting(&self, presenting: bool) {
+        self.presenting.set(presenting);
+        if presenting && let Some(window) = self.focused_window() {
+            window.schedule_frame();
+        }
     }
 
     pub fn set_frame_sink(&self, sink: impl FnMut(CellGrid) + 'static) {
@@ -367,13 +376,14 @@ impl TuiPlatform {
     }
 
     fn frame_wait(&self) -> Option<Duration> {
-        let wants_frame = self
-            .focused_window()
-            .is_some_and(|window| window.has_frame_request())
-            || self
-                .windows
-                .window_under_floating()
-                .is_some_and(|window| window.has_frame_request());
+        let wants_frame = self.presenting.get()
+            && (self
+                .focused_window()
+                .is_some_and(|window| window.has_frame_request())
+                || self
+                    .windows
+                    .window_under_floating()
+                    .is_some_and(|window| window.has_frame_request()));
         wants_frame.then(|| {
             self.pacer
                 .borrow()
@@ -430,7 +440,7 @@ impl Platform for TuiPlatform {
             }
 
             let now = Instant::now();
-            if self.pacer.borrow().is_due(now) {
+            if self.presenting.get() && self.pacer.borrow().is_due(now) {
                 self.present_frame(now);
             }
         }

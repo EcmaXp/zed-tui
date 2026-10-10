@@ -557,10 +557,13 @@ fn handle_event(
             {
                 hub.send_last_frame_to(id, shared);
             }
+            platform.set_presenting(true);
         }
         ServerEvent::Disconnected { id } => {
             sizes.remove(&id);
-            apply_shared_size(platform, sizes);
+            if apply_shared_size(platform, sizes).is_none() {
+                platform.set_presenting(false);
+            }
         }
         ServerEvent::Input(event) => {
             for translated in translator.translate(event) {
