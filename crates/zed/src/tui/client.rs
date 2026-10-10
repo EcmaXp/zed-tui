@@ -11,7 +11,7 @@ use std::{
 use anyhow::{Context as _, Result};
 use crossterm::{cursor, event, style, terminal};
 use gpui::Modifiers;
-use gpui_tui::{Cell, CellAttrs, CellGrid, Glyph, Rgb};
+use gpui_tui::{Cell, CellAttrs, CellGrid, CursorShape, Glyph, Rgb};
 use parking_lot::Mutex;
 
 use crate::tui::protocol::{
@@ -20,6 +20,7 @@ use crate::tui::protocol::{
 };
 const PUSH_TITLE: &str = "\x1b[22;0t";
 const POP_TITLE: &str = "\x1b[23;0t";
+const CURSOR_SHAPE_RESET: &[u8] = b"\x1b[0 q";
 const RESIZE_FRAME_WAIT: Duration = Duration::from_millis(100);
 const ATTRIBUTE_CODES: [(CellAttrs, &str); 2] = [(CellAttrs::BOLD, "1"), (CellAttrs::ITALIC, "3")];
 
@@ -51,6 +52,7 @@ impl TerminalSetup {
 
     fn undo(&self, output: &mut impl Write) {
         if self.entered {
+            output.write_all(CURSOR_SHAPE_RESET).ok();
             crossterm::execute!(
                 output,
                 style::ResetColor,
@@ -172,6 +174,7 @@ struct Terminal<W: Write> {
     pen: Pen,
     cursor: Option<(usize, u16)>,
     cursor_visible: bool,
+    cursor_shape: Option<CursorShape>,
 }
 
 impl<W: Write> Terminal<W> {
@@ -316,6 +319,7 @@ impl<W: Write> Renderer<W> {
                 pen: Pen::default(),
                 cursor: None,
                 cursor_visible: false,
+                cursor_shape: None,
             },
             grid: None,
             drawn_size: None,
@@ -371,6 +375,12 @@ impl<W: Write> Renderer<W> {
                 if terminal.cursor != Some(target) || !terminal.cursor_visible {
                     terminal.move_to(target.0, target.1)?;
                 }
+                if terminal.cursor_shape != Some(grid.cursor_shape) {
+                    terminal
+                        .body
+                        .write_all(cursor_shape_sequence(grid.cursor_shape))?;
+                    terminal.cursor_shape = Some(grid.cursor_shape);
+                }
                 if !terminal.cursor_visible {
                     crossterm::queue!(terminal.body, cursor::Show)?;
                     terminal.cursor_visible = true;
@@ -397,6 +407,14 @@ impl<W: Write> Renderer<W> {
             crossterm::clipboard::CopyToClipboard::to_clipboard_from(text)
         )?;
         self.terminal.output.flush()
+    }
+}
+
+fn cursor_shape_sequence(shape: CursorShape) -> &'static [u8] {
+    match shape {
+        CursorShape::Block => b"\x1b[2 q",
+        CursorShape::Underline => b"\x1b[4 q",
+        CursorShape::Bar => b"\x1b[6 q",
     }
 }
 
@@ -984,6 +1002,44 @@ mod tests {
         renderer.grid = Some(grid.clone());
         emulator.feed(&mut renderer);
         assert_eq!(shown_at(&emulator), None);
+    }
+
+    #[test]
+    fn the_terminal_cursor_takes_the_frame_cursor_shape() {
+        let mut grid = CellGrid::new(20, 4, Rgb::new(40, 44, 52));
+        text_row(&mut grid, 1, 0, "some text");
+        grid.cursor = Some(CursorPosition { col: 4, row: 1 });
+        let mut renderer = Renderer::new(Vec::new(), 20, 4);
+        let mut emulator = Emulator::new(20, 4);
+        for (shape, expected) in [
+            (CursorShape::Underline, ansi::CursorShape::Underline),
+            (CursorShape::Block, ansi::CursorShape::Block),
+            (CursorShape::Bar, ansi::CursorShape::Beam),
+        ] {
+            grid.cursor_shape = shape;
+            renderer.grid = Some(grid.clone());
+            emulator.feed(&mut renderer);
+            let style = emulator.term.cursor_style();
+            assert_eq!(
+                (style.shape, style.blinking),
+                (expected, false),
+                "{shape:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cursor_shape_is_reset_on_exit() {
+        let contains_reset = |bytes: &[u8]| {
+            bytes
+                .windows(CURSOR_SHAPE_RESET.len())
+                .any(|window| window == CURSOR_SHAPE_RESET)
+        };
+        let mut setup = TerminalSetup::default();
+        setup.run(&mut FailingWriter::failing_on_flush(0)).unwrap();
+        let mut undo = Vec::new();
+        setup.undo(&mut undo);
+        assert!(contains_reset(&undo), "{undo:?}");
     }
 
     #[derive(Clone, Default)]

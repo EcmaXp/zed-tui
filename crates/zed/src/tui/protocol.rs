@@ -2,7 +2,9 @@ use std::io::{Read, Write};
 
 use anyhow::{Context as _, Result, bail};
 use gpui::Modifiers;
-use gpui_tui::{Cell, CellAttrs, CellGrid, CursorPosition, Glyph, Rgb, UnderlineColor};
+use gpui_tui::{
+    Cell, CellAttrs, CellGrid, CursorPosition, CursorShape, Glyph, Rgb, UnderlineColor,
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 pub const PROTOCOL_VERSION: u32 = 15;
@@ -79,7 +81,16 @@ pub struct Span(u32, u32, u8, String);
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RowPatch(u16, u16, Vec<Span>);
 
-pub type FrameCursor = Option<CursorPosition>;
+pub type FrameCursor = Option<(CursorPosition, CursorShape)>;
+
+fn frame_cursor(grid: &CellGrid) -> FrameCursor {
+    grid.cursor.map(|cursor| (cursor, grid.cursor_shape))
+}
+
+fn set_frame_cursor(grid: &mut CellGrid, cursor: FrameCursor) {
+    grid.cursor = cursor.map(|(position, _)| position);
+    grid.cursor_shape = cursor.map_or(CursorShape::default(), |(_, shape)| shape);
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ServerMessage {
@@ -96,8 +107,8 @@ pub enum ServerMessage {
 }
 
 mod wire_cursor {
-    use gpui_tui::CursorPosition;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use gpui_tui::{CursorPosition, CursorShape};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
     use super::FrameCursor;
 
@@ -106,15 +117,33 @@ mod wire_cursor {
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         cursor
-            .map(|cursor| (cursor.col, cursor.row))
+            .map(|(cursor, shape)| {
+                let shape: u8 = match shape {
+                    CursorShape::Bar => 0,
+                    CursorShape::Block => 1,
+                    CursorShape::Underline => 2,
+                };
+                (cursor.col, cursor.row, shape)
+            })
             .serialize(serializer)
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<FrameCursor, D::Error> {
-        Ok(Option::<(u16, u16)>::deserialize(deserializer)?
-            .map(|(col, row)| CursorPosition { col, row }))
+        Option::<(u16, u16, u8)>::deserialize(deserializer)?
+            .map(|(col, row, shape)| {
+                let shape = match shape {
+                    0 => CursorShape::Bar,
+                    1 => CursorShape::Block,
+                    2 => CursorShape::Underline,
+                    unknown => {
+                        return Err(D::Error::custom(format!("unknown cursor shape {unknown}")));
+                    }
+                };
+                Ok((CursorPosition { col, row }, shape))
+            })
+            .transpose()
     }
 }
 
@@ -219,7 +248,7 @@ impl FrameEncoder {
         let patches = (0..grid.rows)
             .map(|row| RowPatch(row, 0, encode_cells(grid.row(row))))
             .collect();
-        ServerMessage::FullFrame(grid.cols, grid.rows, patches, grid.cursor)
+        ServerMessage::FullFrame(grid.cols, grid.rows, patches, frame_cursor(grid))
     }
 }
 
@@ -243,7 +272,7 @@ impl FrameDecoder {
             ServerMessage::FullFrame(cols, rows, patches, cursor) => {
                 let mut frame = CellGrid::new(*cols, *rows, Rgb::default());
                 self.apply_patches(&mut frame, patches);
-                frame.cursor = *cursor;
+                set_frame_cursor(&mut frame, *cursor);
                 *grid = Some(frame);
             }
             ServerMessage::Clipboard(_)
@@ -296,7 +325,7 @@ mod tests {
 
     fn assert_same_cells(actual: &CellGrid, expected: &CellGrid) {
         assert_eq!((actual.cols, actual.rows), (expected.cols, expected.rows));
-        assert_eq!(actual.cursor, expected.cursor);
+        assert_eq!(frame_cursor(actual), frame_cursor(expected));
         for (index, (actual, expected)) in actual.cells.iter().zip(&expected.cells).enumerate() {
             assert_eq!(actual, expected, "cell {index}");
         }
@@ -328,6 +357,31 @@ mod tests {
             cell.attrs = CellAttrs::DEFAULT_BACKGROUND;
         }
         grid
+    }
+
+    #[test]
+    fn cursor_shapes_reach_the_client_in_full_frames() {
+        let mut first = sample_grid();
+        first.cursor = Some(CursorPosition { col: 2, row: 0 });
+        first.cursor_shape = CursorShape::Underline;
+        let mut second = first.clone();
+        second.cursor_shape = CursorShape::Block;
+
+        let encoder = FrameEncoder;
+        let mut decoder = FrameDecoder;
+        let mut client = None;
+        for grid in [&first, &second] {
+            let message = encoder.full_frame(grid);
+            let mut buffer = Vec::new();
+            write_message(&mut buffer, &message).unwrap();
+            let decoded: ServerMessage = read_message(&mut buffer.as_slice()).unwrap();
+            decoder.apply(&mut client, &decoded);
+            let shown = client.as_ref().unwrap();
+            assert_eq!(
+                (shown.cursor, shown.cursor_shape),
+                (grid.cursor, grid.cursor_shape)
+            );
+        }
     }
 
     #[test]
@@ -416,6 +470,8 @@ mod tests {
                 col: next_random(60) as u16,
                 row: next_random(14) as u16,
             });
+            next.cursor_shape =
+                [CursorShape::Bar, CursorShape::Block, CursorShape::Underline][next_random(3)];
             let mut buffer = Vec::new();
             write_message(&mut buffer, &encoder.full_frame(&next)).unwrap();
             let update: ServerMessage = read_message(&mut buffer.as_slice()).unwrap();
@@ -423,6 +479,7 @@ mod tests {
             let mirrored = client.as_ref().unwrap();
             assert_same_cells(mirrored, &next);
             assert_eq!(mirrored.cursor, next.cursor);
+            assert_eq!(mirrored.cursor_shape, next.cursor_shape);
         }
     }
 }
