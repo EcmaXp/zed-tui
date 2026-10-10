@@ -645,6 +645,57 @@ fn ruled_edges_drop_their_margin_when_the_neighbor_is_already_blank() {
 }
 
 #[test]
+fn margins_rounded_up_to_a_cell_drop_beside_an_already_blank_neighbor() {
+    let row = spaced_row_text(|| {
+        div()
+            .flex()
+            .child(square_button("x"))
+            .child(div().ml(px(5.)).child("1/1"))
+            .into_any_element()
+    });
+    assert_eq!(row, "x 1/1");
+
+    let row = spaced_row_text(|| {
+        div()
+            .flex()
+            .child(div().mr(px(5.)).child("a"))
+            .child(div().pl(px(5.)).child("b"))
+            .into_any_element()
+    });
+    assert_eq!(row, "a b");
+}
+
+#[test]
+fn margins_stay_beside_text_covered_padding_and_whole_cell_margins() {
+    let row = spaced_row_text(|| {
+        div()
+            .flex()
+            .child("x")
+            .child(div().ml(px(5.)).child("y"))
+            .into_any_element()
+    });
+    assert_eq!(row, "x y");
+
+    let row = spaced_row_text(|| {
+        div()
+            .flex()
+            .child(div().mr(px(5.)).child("a"))
+            .child(square_button("b"))
+            .into_any_element()
+    });
+    assert_eq!(row, "a b");
+
+    let row = spaced_row_text(|| {
+        div()
+            .flex()
+            .child(square_button("x"))
+            .child(div().ml(px(10.)).child("y"))
+            .into_any_element()
+    });
+    assert_eq!(row, "x  y");
+}
+
+#[test]
 fn rule_padding_drops_beside_an_already_blank_neighbor_in_block_and_column_flows() {
     fn ruled_on_the_right(label: &'static str) -> gpui::Div {
         div()

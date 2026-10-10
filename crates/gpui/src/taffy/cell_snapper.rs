@@ -18,6 +18,8 @@ struct CellNode {
     is_empty: bool,
     left: Edge,
     right: Edge,
+    rounds_up_left_margin: bool,
+    rounds_up_right_margin: bool,
     hairline_width: Option<f32>,
 }
 
@@ -26,6 +28,13 @@ impl CellNode {
         match side {
             Side::Left => self.left,
             Side::Right => self.right,
+        }
+    }
+
+    fn rounds_up_margin(&self, side: Side) -> bool {
+        match side {
+            Side::Left => self.rounds_up_left_margin,
+            Side::Right => self.rounds_up_right_margin,
         }
     }
 }
@@ -173,8 +182,9 @@ impl CellSnapper {
         if is_framed {
             keep_left_frame_edge_only(taffy_style, self.cell_size.width);
         }
-        let dropped_spacings = self.redundant_rule_spacings(taffy_style, &content);
-        let node = self.cell_node(taffy_style, &content, false);
+        let mut dropped_spacings = self.redundant_rule_spacings(taffy_style, &content);
+        dropped_spacings.extend(self.redundant_margins(taffy_style, &content));
+        let node = self.cell_node(taffy_style, unsnapped, &content, false);
         let is_in_flow = taffy_style.position != taffy::style::Position::Absolute;
         let is_rule_margin = |margin: taffy::style::LengthPercentageAuto| {
             is_in_flow
@@ -235,11 +245,12 @@ impl CellSnapper {
     }
 
     fn snap_measured(&self, taffy_style: &mut taffy::style::Style, style: &Style) -> CellNode {
+        let unsnapped = HorizontalSpacing::of(taffy_style);
         snap_to_cells(taffy_style, style, self.cell_size, self.viewport_width);
         if style.is_framed_surface() {
             keep_left_frame_edge_only(taffy_style, self.cell_size.width);
         }
-        self.cell_node(taffy_style, &[], true)
+        self.cell_node(taffy_style, unsnapped, &[], true)
     }
 
     pub(super) fn snap_measured_size(&self, measured: Size<f32>) -> Size<f32> {
@@ -390,9 +401,34 @@ impl CellSnapper {
         redundant
     }
 
+    fn redundant_margins(
+        &self,
+        style: &taffy::style::Style,
+        content: &[LayoutId],
+    ) -> Vec<(LayoutId, Side, Spacing)> {
+        let mut redundant = Vec::new();
+        let Some(flow) = Flow::of(style, content).filter(|flow| flow.is_row) else {
+            return redundant;
+        };
+        for (before, after) in flow.pairs() {
+            if self.rounds_up_margin(after, Side::Left)
+                && self.edge(before, Side::Right).is_visible_blank()
+            {
+                redundant.push((after, Side::Left, Spacing::Margin));
+            }
+            if self.rounds_up_margin(before, Side::Right)
+                && self.edge(after, Side::Left).is_visible_blank()
+            {
+                redundant.push((before, Side::Right, Spacing::Margin));
+            }
+        }
+        redundant
+    }
+
     fn cell_node(
         &self,
         style: &taffy::style::Style,
+        unsnapped: HorizontalSpacing,
         content: &[LayoutId],
         is_measured: bool,
     ) -> CellNode {
@@ -417,10 +453,17 @@ impl CellSnapper {
         } else {
             edge(style.padding.left, content.first(), Side::Left)
         };
+        let is_in_flow = style.position != taffy::style::Position::Absolute;
+        let rounds_up = |margin: taffy::style::LengthPercentageAuto| {
+            is_in_flow
+                && positive_length(margin).is_some_and(|margin| margin < self.cell_size.width)
+        };
         CellNode {
             is_empty,
             left,
             right: edge(style.padding.right, content.last(), Side::Right),
+            rounds_up_left_margin: rounds_up(unsnapped.margin_left),
+            rounds_up_right_margin: rounds_up(unsnapped.margin_right),
             hairline_width: None,
         }
     }
@@ -444,6 +487,12 @@ impl CellSnapper {
             && is_row(style)
             && pads_at_most_one_cell()
             && leaves_no_room_inside_padding()
+    }
+
+    fn rounds_up_margin(&self, id: LayoutId, side: Side) -> bool {
+        self.cell_nodes
+            .get(&id)
+            .is_some_and(|node| node.rounds_up_margin(side))
     }
 
     fn edge(&self, id: LayoutId, side: Side) -> Edge {
@@ -635,6 +684,8 @@ fn horizontal_edges(edges: &taffy::geometry::Rect<taffy::style::LengthPercentage
 struct HorizontalSpacing {
     padding_left: taffy::style::LengthPercentage,
     padding_right: taffy::style::LengthPercentage,
+    margin_left: taffy::style::LengthPercentageAuto,
+    margin_right: taffy::style::LengthPercentageAuto,
     gap_width: taffy::style::LengthPercentage,
 }
 
@@ -643,6 +694,8 @@ impl HorizontalSpacing {
         Self {
             padding_left: style.padding.left,
             padding_right: style.padding.right,
+            margin_left: style.margin.left,
+            margin_right: style.margin.right,
             gap_width: style.gap.width,
         }
     }
@@ -988,6 +1041,8 @@ mod tests {
                 is_empty: false,
                 left: Edge::Content,
                 right: Edge::Blank,
+                rounds_up_left_margin: false,
+                rounds_up_right_margin: false,
                 hairline_width: None,
             },
         );
@@ -1323,6 +1378,8 @@ mod tests {
                 is_empty: false,
                 left: Edge::Blank,
                 right: Edge::Blank,
+                rounds_up_left_margin: false,
+                rounds_up_right_margin: false,
                 hairline_width: None,
             },
         );
