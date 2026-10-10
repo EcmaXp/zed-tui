@@ -305,18 +305,6 @@ fn runnable_ranges_from_grouped_matches(
         shared_captures,
     } = group_runnable_matches(captures, runnable_config, offset_range);
 
-    let shared_extras: SmallVec<[(String, String); 4]> = shared_captures
-        .iter()
-        .filter_map(|capture| {
-            capture.name().map(|name| {
-                (
-                    name.to_string(),
-                    buffer.text_for_range(capture.range()).collect::<String>(),
-                )
-            })
-        })
-        .collect();
-
     let Some(resolver) = language
         .context_provider()
         .and_then(|provider| provider.runnable_resolver())
@@ -324,6 +312,7 @@ fn runnable_ranges_from_grouped_matches(
         return SmallVec::new();
     };
     let mut runnable_ranges = SmallVec::with_capacity(groups.len());
+    let mut shared_extras: Option<SmallVec<[(String, String); 4]>> = None;
 
     let tags = runnable_tags_from_pattern(&runnable_config.query, pattern_index);
     let buffer_id = buffer.remote_id();
@@ -337,6 +326,19 @@ fn runnable_ranges_from_grouped_matches(
             continue;
         };
 
+        let shared_extras = shared_extras.get_or_insert_with(|| {
+            shared_captures
+                .iter()
+                .filter_map(|capture| {
+                    capture.name().map(|name| {
+                        (
+                            name.to_string(),
+                            buffer.text_for_range(capture.range()).collect::<String>(),
+                        )
+                    })
+                })
+                .collect()
+        });
         let extra_captures = shared_extras.iter().cloned().chain(local_extras).collect();
 
         runnable_ranges.push(RunnableRange {
