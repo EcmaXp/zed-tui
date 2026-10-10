@@ -18,7 +18,7 @@ use gpui::{CursorStyle, Modifiers};
 use gpui_tui::{Cell, CellAttrs, CellGrid, CursorShape, Glyph, Rgb};
 use parking_lot::Mutex;
 
-use crate::tui::frame_diff::changed_ranges;
+use crate::tui::frame_diff::{GridScroll, changed_ranges, find_moves};
 use crate::tui::protocol::{
     ClientMessage, FrameDecoder, KeyCode, MessageReader, MessageWriter, MouseAction,
     MouseButtonKind, PROTOCOL_VERSION, ServerMessage, TermEvent, WAIT_ONLY_SIZE,
@@ -823,6 +823,22 @@ impl<W: Write> Terminal<W> {
         Ok(())
     }
 
+    fn scroll(&mut self, scroll: &GridScroll) -> io::Result<()> {
+        self.pen
+            .write_style(&mut self.body, Style::blank(PenColor::Default))?;
+        let whole_screen = scroll.top == 0 && scroll.bottom == self.rows as usize;
+        if !whole_screen {
+            write!(self.body, "\x1b[{};{}r", scroll.top + 1, scroll.bottom)?;
+        }
+        let final_byte = if scroll.shift > 0 { 'S' } else { 'T' };
+        CursorStep::Relative(final_byte, scroll.shift.unsigned_abs()).write(&mut self.body)?;
+        if !whole_screen {
+            self.body.write_all(b"\x1b[r")?;
+            self.cursor = Some((0, 0));
+        }
+        Ok(())
+    }
+
     fn flush_frame(&mut self, force_synchronize: bool) -> io::Result<()> {
         if self.body.is_empty() {
             return Ok(());
@@ -1291,6 +1307,7 @@ struct Renderer<W: Write> {
     grid: Option<CellGrid>,
     screen: Option<CellGrid>,
     decoder: FrameDecoder,
+    moved: Option<CellGrid>,
 }
 
 impl<W: Write> Renderer<W> {
@@ -1312,6 +1329,7 @@ impl<W: Write> Renderer<W> {
             grid: None,
             screen: None,
             decoder: FrameDecoder::default(),
+            moved: None,
         }
     }
 
@@ -1361,6 +1379,29 @@ impl<W: Write> Renderer<W> {
         let force_synchronize = !was_in_sync;
         let visible_cols = (grid.cols.min(terminal.cols)) as usize;
         let visible_rows = grid.rows.min(terminal.rows) as usize;
+        let move_screen = |scroll: &GridScroll, screen: &mut CellGrid| {
+            scroll.apply(screen, unknown_cell());
+            for row in scroll.exposed_rows() {
+                let row = row as u16;
+                assume_erased(screen.row_mut(row), grid.row(row));
+            }
+        };
+        let moves = find_moves(
+            &screen,
+            grid,
+            visible_rows,
+            visible_cols,
+            &mut self.moved,
+            move_screen,
+        );
+        if !moves.is_empty()
+            && let Some(moved) = &mut self.moved
+        {
+            std::mem::swap(&mut screen, moved);
+        }
+        for scroll in &moves {
+            terminal.scroll(scroll)?;
+        }
         for row in 0..visible_rows as u16 {
             let cells = grid.row(row);
             let visible = cells.get(..visible_cols).unwrap_or(cells);
@@ -2083,6 +2124,40 @@ mod tests {
         grid.mark_default_colors(&[Rgb::new(40, 44, 52)], &[Rgb::new(200, 120, 60)]);
     }
 
+    fn shift_rows(grid: &mut CellGrid, random: &mut Random) {
+        const SIDEBAR_COLS: usize = 8;
+        let rows = grid.rows as usize;
+        let cols = grid.cols as usize;
+        let top = random.next(rows / 2);
+        let bottom = top + 2 + random.next(rows - top - 1);
+        let distance = (1 + random.next(bottom - top - 1)) as isize;
+        let shift = if random.next(2) == 0 {
+            distance
+        } else {
+            -distance
+        };
+        let before = grid.clone();
+        let scroll = GridScroll { top, bottom, shift };
+        scroll.apply(grid, Cell::blank(Rgb::new(40, 44, 52)));
+        for row in scroll.exposed_rows() {
+            for col in 0..cols {
+                if let Some(cell) = grid.cell_mut(col as i32, row as i32) {
+                    *cell = Cell::blank(Rgb::new(40, 44, 52));
+                }
+            }
+        }
+        for row in top..bottom {
+            for col in cols - SIDEBAR_COLS..cols {
+                if let (Some(cell), Some(original)) = (
+                    grid.cell_mut(col as i32, row as i32),
+                    before.cell(col as i32, row as i32),
+                ) {
+                    *cell = *original;
+                }
+            }
+        }
+    }
+
     fn shift_within_rows(grid: &mut CellGrid, random: &mut Random) {
         let cols = grid.cols as usize;
         for _ in 0..3 {
@@ -2119,6 +2194,37 @@ mod tests {
         emulator.feed(renderer);
         emulator.assert_shows(grid, grid.cols);
         output
+    }
+
+    fn editor_frame(first_line: usize) -> CellGrid {
+        let editor_lines = source_lines(40, 11);
+        let mut grid = CellGrid::new(60, 14, Rgb::new(40, 44, 52));
+        text_row(&mut grid, 0, 0, "title bar");
+        for row in 1..13 {
+            text_row(&mut grid, row, 0, &editor_lines[first_line + row as usize]);
+            text_row(&mut grid, row, 48, &format!("file_{row}.rs"));
+        }
+        text_row(&mut grid, 13, 0, "status bar");
+        grid
+    }
+
+    #[test]
+    fn scrolling_reuses_lines_already_on_screen() {
+        let mut renderer = Renderer::new(Vec::new(), 60, 14);
+        let mut emulator = Emulator::new(60, 14);
+        renderer.grid = Some(editor_frame(0));
+        let full = emulator.feed(&mut renderer);
+
+        renderer.grid = Some(editor_frame(3));
+        renderer.render().unwrap();
+        let output = output_text(&renderer);
+        assert!(output.contains("\x1b[2;13r\x1b[3S"), "{output:?}");
+        let scrolled = emulator.feed(&mut renderer);
+        emulator.assert_shows(&editor_frame(3), 60);
+        assert!(
+            scrolled * 2 < full,
+            "scrolling took {scrolled} bytes, a full frame took {full}"
+        );
     }
 
     #[test]
@@ -2872,6 +2978,27 @@ mod tests {
     }
 
     #[test]
+    fn whole_screen_scrolls_skip_the_scroll_region() {
+        let mut terminal = Renderer::new(Vec::new(), 20, 6).terminal;
+        terminal.cursor = Some((3, 4));
+        let scroll = |top, bottom| GridScroll {
+            top,
+            bottom,
+            shift: 1,
+        };
+        terminal.scroll(&scroll(0, 6)).unwrap();
+        assert_eq!(String::from_utf8(terminal.body.clone()).unwrap(), "\x1b[S");
+        assert_eq!(terminal.cursor, Some((3, 4)));
+        terminal.body.clear();
+        terminal.scroll(&scroll(1, 6)).unwrap();
+        assert_eq!(
+            String::from_utf8(terminal.body.clone()).unwrap(),
+            "\x1b[2;6r\x1b[S\x1b[r"
+        );
+        assert_eq!(terminal.cursor, Some((0, 0)));
+    }
+
+    #[test]
     fn rendered_frames_match_an_emulated_terminal() {
         let mut repeated = false;
         let mut curled = false;
@@ -2893,8 +3020,10 @@ mod tests {
             emulator.feed(&mut renderer);
             emulator.assert_shows(&grid, terminal_cols);
             for step in 0..20 {
-                if step % 3 == 1 {
-                    shift_within_rows(&mut grid, &mut random);
+                match step % 3 {
+                    0 => shift_rows(&mut grid, &mut random),
+                    1 => shift_within_rows(&mut grid, &mut random),
+                    _ => {}
                 }
                 paint_run(&mut grid, &mut random);
                 mutate(&mut grid, &mut random, 3);
