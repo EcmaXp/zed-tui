@@ -206,7 +206,7 @@ impl LineWrapper {
         match truncate_from {
             TruncateFrom::Start => {
                 for (ix, c) in line.char_indices().rev() {
-                    if width + suffix_width < truncate_width {
+                    if width + suffix_width <= truncate_width {
                         truncate_ix = ix;
                     }
 
@@ -220,7 +220,7 @@ impl LineWrapper {
             }
             TruncateFrom::End => {
                 for (ix, c) in line.char_indices() {
-                    if width + suffix_width < truncate_width {
+                    if width + suffix_width <= truncate_width {
                         truncate_ix = ix;
                     }
 
