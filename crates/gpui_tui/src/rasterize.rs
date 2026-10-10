@@ -80,6 +80,7 @@ struct RasterScratch {
     candidates: Vec<TextCandidate>,
     placements: Vec<Option<Placement>>,
     line_cursors: Vec<LineCursor>,
+    rules_by_row: Vec<Vec<Range<i32>>>,
 }
 
 pub(crate) fn rasterize_scene(
@@ -92,6 +93,7 @@ pub(crate) fn rasterize_scene(
 ) -> CellGrid {
     let scratch = &mut RasterScratch::default();
     layout_text(scene, atlas, icon_glyph, scratch);
+    scratch.rules_by_row.resize_with(rows as usize, Vec::new);
     let mut rasterizer = Rasterizer {
         grid: CellGrid::new(cols, rows, Rgb::default()),
         canvas,
@@ -348,8 +350,36 @@ impl Rasterizer<'_> {
     fn horizontal_rule(&mut self, rect: &Bounds<f32>, color: Hsla) {
         let row = (rect.center().y / CELL_HEIGHT).floor() as i32;
         let rgba = color.to_rgb();
-        for col in covered_cols(rect) {
-            self.line_char(col, row, '─', rgba);
+        let cols = covered_cols(rect);
+        let mut drew = false;
+        for col in cols.clone() {
+            drew |= self.line_char(col, row, '─', rgba);
+        }
+        if drew && let Some(rules) = self.rules_in_row(row) {
+            rules.push(cols);
+        }
+    }
+
+    fn rules_in_row(&mut self, row: i32) -> Option<&mut Vec<Range<i32>>> {
+        usize::try_from(row)
+            .ok()
+            .and_then(|row| self.scratch.rules_by_row.get_mut(row))
+    }
+
+    fn remove_rule_under_text(&mut self, col: i32, row: i32) {
+        let Some(rules) = self.rules_in_row(row) else {
+            return;
+        };
+        let Some(index) = rules.iter().position(|cols| cols.contains(&col)) else {
+            return;
+        };
+        let cols = rules.swap_remove(index);
+        for col in cols {
+            if let Some(cell) = self.grid.cell_mut(col, row)
+                && cell.glyph == '─'
+            {
+                cell.glyph = ' '.into();
+            }
         }
     }
 
@@ -425,6 +455,9 @@ impl Rasterizer<'_> {
                 };
                 self.line_char(col, row, ch, color);
             }
+            if is_edge_row && let Some(rules) = self.rules_in_row(row) {
+                rules.push(first_col + 1..last_col);
+            }
         }
     }
 
@@ -471,6 +504,7 @@ impl Rasterizer<'_> {
     }
 
     fn put_char(&mut self, col: i32, row: i32, glyph: Glyph, color: Rgba, attrs: CellAttrs) {
+        self.remove_rule_under_text(col, row);
         let wide = glyph.cells() == 2;
         let Some(&Cell {
             attrs: shown_attrs,
@@ -865,6 +899,45 @@ mod tests {
         scene.finish();
         let grid = rasterize(&scene, &atlas, 6, 1);
         assert_eq!(grid.row_text(0), " abcd ");
+    }
+
+    #[test]
+    fn box_edges_that_share_a_row_with_text_keep_only_their_corners() {
+        let atlas = TuiAtlas::default();
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            bounds: scaled_bounds(0., 0., 48., 32.),
+            content_mask: full_mask(),
+            border_color: Hsla::white(),
+            border_widths: gpui::Edges::all(ScaledPixels(1.)),
+            ..Default::default()
+        });
+        scene.push_layer(scaled_bounds(0., 0., 48., 32.));
+        scene.insert_primitive(glyph_sprite(&atlas, 'a', 16.));
+        scene.pop_layer();
+        scene.finish();
+        let grid = rasterize(&scene, &atlas, 6, 2);
+        assert_eq!(grid.row_text(0), "┌ a  ┐");
+        assert_eq!(grid.row_text(1), "└────┘");
+    }
+
+    #[test]
+    fn rules_that_share_a_row_with_text_are_removed() {
+        let atlas = TuiAtlas::default();
+        let mut scene = Scene::default();
+        scene.insert_primitive(fill_quad(0., 7., 48., 1., Hsla::white()));
+        scene.push_layer(scaled_bounds(0., 0., 48., 16.));
+        scene.insert_primitive(glyph_sprite(&atlas, 'a', 0.));
+        scene.pop_layer();
+        scene.finish();
+        let grid = rasterize(&scene, &atlas, 6, 1);
+        assert_eq!(grid.row_text(0), "a     ");
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(fill_quad(0., 7., 48., 1., Hsla::white()));
+        scene.finish();
+        let grid = rasterize(&scene, &atlas, 6, 1);
+        assert_eq!(grid.row_text(0), "──────");
     }
 
     #[test]
