@@ -1,7 +1,11 @@
 use crate::{
-    self as gpui, BoxShadow, Context, IntoElement, IsZero as _, ParentElement as _, Render,
-    Styled as _, TestAppContext, TestDispatcher, Window, black, div, point, px, red,
+    self as gpui, App, BoxShadow, Context, DispatchPhase, FocusHandle, InteractiveElement as _,
+    IntoElement, IsZero as _, ParentElement as _, Render, Styled as _, TestAppContext,
+    TestDispatcher, Window, black, div, point, px, red,
 };
+use std::{cell::RefCell, rc::Rc};
+
+crate::actions!(fork_test, [TestAction]);
 
 struct FramedSurface;
 
@@ -36,6 +40,56 @@ fn framed_surfaces_paint_all_four_borders_outside_a_cell_grid(cx: &mut crate::Te
     assert!(
         !border_widths.any(|width| width.is_zero()),
         "{border_widths:?}"
+    );
+}
+
+struct SharedActionTestView {
+    focus_handle: FocusHandle,
+    listener: crate::SharedActionListener,
+}
+
+impl Render for SharedActionTestView {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .track_focus(&self.focus_handle)
+            .size_full()
+            .on_shared_action(std::any::TypeId::of::<TestAction>(), self.listener.clone())
+    }
+}
+
+#[gpui::test]
+fn test_shared_action_listener_dispatches_in_every_frame(cx: &mut TestAppContext) {
+    let phases = Rc::new(RefCell::new(Vec::new()));
+    let listener: crate::SharedActionListener = Rc::new({
+        let phases = phases.clone();
+        move |_: &dyn std::any::Any, phase: DispatchPhase, _: &mut Window, _: &mut App| {
+            phases.borrow_mut().push(phase)
+        }
+    });
+    let (view, cx) = cx.add_window_view(|_, cx| SharedActionTestView {
+        focus_handle: cx.focus_handle(),
+        listener: listener.clone(),
+    });
+    let focus_handle = cx.update(|_, cx| view.read(cx).focus_handle.clone());
+    cx.update(|window, cx| {
+        window.focus(&focus_handle, cx);
+        window.activate_window();
+    });
+
+    for _ in 0..2 {
+        view.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        cx.dispatch_action(TestAction);
+    }
+
+    assert_eq!(
+        *phases.borrow(),
+        vec![
+            DispatchPhase::Capture,
+            DispatchPhase::Bubble,
+            DispatchPhase::Capture,
+            DispatchPhase::Bubble,
+        ]
     );
 }
 
