@@ -1,8 +1,10 @@
 use std::{
+    ffi::OsString,
     fs,
     io::{BufReader, ErrorKind, Write as _},
     net::Shutdown,
     os::unix::{
+        ffi::{OsStrExt as _, OsStringExt as _},
         fs::{DirBuilderExt as _, PermissionsExt as _},
         net::{UnixListener, UnixStream},
     },
@@ -38,6 +40,7 @@ use crate::tui::{
 
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(30);
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_SESSION_BASENAME: usize = 32;
 
 pub struct SessionPaths {
     pub name: String,
@@ -45,6 +48,7 @@ pub struct SessionPaths {
     pub socket: PathBuf,
     pub pid: PathBuf,
     pub log: PathBuf,
+    pub root: PathBuf,
 }
 
 fn is_session_name_char(ch: char) -> bool {
@@ -68,9 +72,97 @@ impl SessionPaths {
             socket: directory.join("server.sock"),
             pid: directory.join("server.pid"),
             log: directory.join("server.log"),
+            root: directory.join("root"),
             directory,
         }
     }
+}
+
+pub struct RunningSession {
+    pub name: String,
+    pub root: Option<PathBuf>,
+}
+
+pub fn canonical_target(path: &Path, current_dir: &Path) -> PathBuf {
+    let path = current_dir.join(path);
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => match parent.canonicalize() {
+            Ok(parent) => parent.join(name),
+            Err(_) => path,
+        },
+        _ => path,
+    }
+}
+
+pub fn session_root_for(target: &Path) -> PathBuf {
+    let start = if target.is_dir() {
+        target
+    } else {
+        target.parent().unwrap_or(target)
+    };
+    start
+        .ancestors()
+        .find(|directory| directory.join(".git").symlink_metadata().is_ok())
+        .unwrap_or(start)
+        .to_path_buf()
+}
+
+pub fn session_name_for_root(root: &Path) -> String {
+    let basename = root
+        .file_name()
+        .map(|name| {
+            name.to_string_lossy()
+                .chars()
+                .map(|ch| if is_session_name_char(ch) { ch } else { '_' })
+                .skip_while(|ch| *ch == '.')
+                .take(MAX_SESSION_BASENAME)
+                .collect::<String>()
+        })
+        .unwrap_or_default();
+    let basename = if basename.is_empty() {
+        "root"
+    } else {
+        &basename
+    };
+    format!(
+        "{basename}-{:08x}",
+        fnv1a(root.as_os_str().as_bytes()) as u32
+    )
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
+fn write_root(session_paths: &SessionPaths, root: &Path) -> Result<()> {
+    fs::write(&session_paths.root, root.as_os_str().as_bytes())
+        .with_context(|| format!("writing {}", session_paths.root.display()))
+}
+
+pub fn read_root(session_paths: &SessionPaths) -> Option<PathBuf> {
+    let bytes = fs::read(&session_paths.root).ok()?;
+    Some(PathBuf::from(OsString::from_vec(bytes)))
+}
+
+pub fn deepest_covering<'a>(
+    sessions: &'a [RunningSession],
+    target: &Path,
+) -> Option<&'a RunningSession> {
+    sessions
+        .iter()
+        .filter_map(|session| {
+            let root = session.root.as_deref()?;
+            target
+                .starts_with(root)
+                .then(|| (root.components().count(), session))
+        })
+        .max_by_key(|(depth, _)| *depth)
+        .map(|(_, session)| session)
 }
 
 fn sessions_dir() -> PathBuf {
@@ -232,9 +324,13 @@ fn lock_session(session_paths: &SessionPaths) -> Result<fs::File> {
 
 pub fn start_session(
     session_paths: SessionPaths,
+    root: Option<&Path>,
     platform: Rc<TuiPlatform>,
 ) -> Result<(SessionGuard, Started)> {
     let pid_lock = lock_session(&session_paths)?;
+    if let Some(root) = root {
+        write_root(&session_paths, root)?;
+    }
     match fs::remove_file(&session_paths.socket) {
         Ok(()) => {}
         Err(error) if error.kind() == ErrorKind::NotFound => {}
@@ -500,12 +596,28 @@ fn send_to_client(stream: &mut UnixStream, receiver: mpsc::Receiver<Outgoing>) {
     }
 }
 
-pub fn spawn_daemon(session_paths: &SessionPaths, paths: &[PathBuf]) -> Result<()> {
+pub fn spawn_daemon(
+    session_paths: &SessionPaths,
+    root: &Path,
+    paths_to_open: &[PathBuf],
+    user_data_dir: Option<&Path>,
+) -> Result<()> {
     create_private_dir(&session_paths.directory)?;
     let log = fs::File::create(&session_paths.log)
         .with_context(|| format!("creating {}", session_paths.log.display()))?;
     let mut command = util::command::new_std_command(std::env::current_exe()?);
-    command.arg("--tui").arg("server").args(paths);
+    command.arg("--tui");
+    if let Some(user_data_dir) = user_data_dir {
+        command.arg("--user-data-dir").arg(user_data_dir);
+    }
+    command
+        .arg("--session")
+        .arg(&session_paths.name)
+        .arg("server")
+        .arg("--root")
+        .arg(root)
+        .arg(root)
+        .args(paths_to_open);
     util::set_pre_exec_to_start_new_session(&mut command);
     let mut child = smol::process::Command::from(command)
         .stdin(smol::process::Stdio::null())
@@ -541,6 +653,28 @@ fn send(session_paths: &SessionPaths, message: &ClientMessage) -> Result<()> {
     let mut stream = UnixStream::connect(&session_paths.socket)
         .with_context(|| format!("session {:?} is not running", session_paths.name))?;
     write_message(&mut stream, message)
+}
+
+pub fn list() -> Result<Vec<RunningSession>> {
+    let mut sessions = Vec::new();
+    let entries = match fs::read_dir(sessions_dir()) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(sessions),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Ok(session_paths) = SessionPaths::new(&name) else {
+            continue;
+        };
+        if is_running(&session_paths) {
+            let root = read_root(&session_paths);
+            sessions.push(RunningSession { name, root });
+        }
+    }
+    sessions.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(sessions)
 }
 
 #[cfg(test)]
@@ -731,6 +865,99 @@ mod tests {
         hub.send_last_frame_to(id, (3, 1));
         let message: ServerMessage = read_message(&mut client_reader).unwrap();
         assert_eq!(frame_size(&message), Some((3, 1)));
+    }
+
+    fn canonical(path: &Path) -> PathBuf {
+        path.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn session_roots_are_the_enclosing_git_repository() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = canonical(directory.path()).join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(repo.join("src/nested")).unwrap();
+        fs::write(repo.join("src/nested/a.rs"), "").unwrap();
+        let worktree = canonical(directory.path()).join("worktree");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::write(worktree.join(".git"), "gitdir: elsewhere").unwrap();
+        let plain = canonical(directory.path()).join("plain");
+        fs::create_dir_all(&plain).unwrap();
+        fs::write(plain.join("notes.txt"), "").unwrap();
+
+        assert_eq!(session_root_for(&repo.join("src/nested/a.rs")), repo);
+        assert_eq!(session_root_for(&repo.join("src/nested")), repo);
+        assert_eq!(session_root_for(&repo.join(".git/COMMIT_EDITMSG")), repo);
+        assert_eq!(session_root_for(&worktree), worktree);
+        assert_eq!(session_root_for(&plain.join("notes.txt")), plain);
+        assert_eq!(session_root_for(&plain), plain);
+    }
+
+    #[test]
+    fn targets_resolve_symlinks_and_missing_files_through_their_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let real = canonical(directory.path()).join("real");
+        fs::create_dir_all(&real).unwrap();
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert_eq!(canonical_target(Path::new("link"), directory.path()), real);
+        assert_eq!(
+            canonical_target(Path::new("link/new.txt"), directory.path()),
+            real.join("new.txt")
+        );
+        assert_eq!(
+            canonical_target(&link.join("missing/new.txt"), Path::new("/")),
+            link.join("missing/new.txt")
+        );
+    }
+
+    #[test]
+    fn session_names_from_roots_are_valid_stable_and_distinct() {
+        assert_eq!(
+            session_name_for_root(Path::new("/work/zed")),
+            "zed-a5a7578b"
+        );
+        assert_ne!(
+            session_name_for_root(Path::new("/work/zed")),
+            session_name_for_root(Path::new("/home/zed"))
+        );
+        for root in ["/", "/work/.hidden", "/work/한글 dir", "/work/a b/c:d"] {
+            let name = session_name_for_root(Path::new(root));
+            assert!(SessionPaths::new(&name).is_ok(), "{root:?} gave {name:?}");
+        }
+        assert!(session_name_for_root(Path::new("/")).starts_with("root-"));
+        assert!(session_name_for_root(Path::new("/work/.hidden")).starts_with("hidden-"));
+    }
+
+    #[test]
+    fn the_deepest_running_root_covers_a_path() {
+        let session = |name: &str, root: Option<&str>| RunningSession {
+            name: name.to_owned(),
+            root: root.map(PathBuf::from),
+        };
+        let sessions = [
+            session("unknown", None),
+            session("work", Some("/work")),
+            session("repo", Some("/work/repo")),
+        ];
+        let covering = |target: &str| {
+            deepest_covering(&sessions, Path::new(target)).map(|session| session.name.as_str())
+        };
+        assert_eq!(covering("/work/repo/src/a.rs"), Some("repo"));
+        assert_eq!(covering("/work/repo"), Some("repo"));
+        assert_eq!(covering("/work/repo2/a.rs"), Some("work"));
+        assert_eq!(covering("/elsewhere"), None);
+    }
+
+    #[test]
+    fn session_roots_round_trip_through_the_session_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let session_paths = SessionPaths::in_directory("roots", directory.path().to_path_buf());
+        assert_eq!(read_root(&session_paths), None);
+        let root = Path::new("/work/한글 repo");
+        write_root(&session_paths, root).unwrap();
+        assert_eq!(read_root(&session_paths).as_deref(), Some(root));
     }
 
     fn move_mouse(writer: &mut UnixStream, events: &mut UnboundedReceiver<ServerEvent>) {

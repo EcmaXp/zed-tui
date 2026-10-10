@@ -56,7 +56,13 @@ mod stubs {
 
 #[cfg(unix)]
 mod unix {
-    use std::{cell::RefCell, ffi::OsString, io::Write as _, path::PathBuf, rc::Rc};
+    use std::{
+        cell::RefCell,
+        ffi::OsString,
+        io::Write as _,
+        path::{Path, PathBuf},
+        rc::Rc,
+    };
 
     use anyhow::{Context as _, Result};
     use clap::{Parser, Subcommand};
@@ -75,7 +81,6 @@ mod unix {
 
     const DEFAULT_COLS: u16 = 120;
     const DEFAULT_ROWS: u16 = 40;
-    const SESSION: &str = "default";
 
     const TUI_DEFAULTS_PATH: &str = "settings/tui_defaults.json";
     const TUI_CONSTRAINTS_PATH: &str = "settings/tui_constraints.json";
@@ -84,6 +89,14 @@ mod unix {
     #[derive(Parser)]
     #[command(name = "zed --tui", about = "Zed in the terminal")]
     struct Cli {
+        #[arg(
+            long,
+            global = true,
+            help = "Session name; by default the session whose root covers the path"
+        )]
+        session: Option<String>,
+        #[arg(long, global = true)]
+        user_data_dir: Option<PathBuf>,
         #[command(subcommand)]
         command: Option<Command>,
         paths: Vec<PathBuf>,
@@ -92,11 +105,17 @@ mod unix {
     #[derive(Subcommand)]
     enum Command {
         #[command(about = "Attach to a running session")]
-        Attach,
+        Attach { path: Option<PathBuf> },
         #[command(about = "Run the session server in the foreground")]
-        Server { paths: Vec<PathBuf> },
+        Server {
+            #[arg(long, hide = true)]
+            root: Option<PathBuf>,
+            paths: Vec<PathBuf>,
+        },
         #[command(about = "Stop a session")]
-        Kill,
+        Kill { path: Option<PathBuf> },
+        #[command(about = "List running sessions")]
+        Ls,
     }
 
     pub struct TuiServer {
@@ -138,18 +157,103 @@ mod unix {
         Serve(TuiServer, Startup),
     }
 
+    struct Resolved {
+        paths: server::SessionPaths,
+        root: PathBuf,
+    }
+
+    fn resolve(session: Option<&str>, target: &Path) -> Result<Resolved> {
+        let root = server::session_root_for(target);
+        let name = match session {
+            Some(session) => session.to_owned(),
+            None => {
+                let sessions = server::list()?;
+                match server::deepest_covering(&sessions, target) {
+                    Some(covering) => covering.name.clone(),
+                    None => {
+                        let name = server::session_name_for_root(&root);
+                        if let Some(other) = sessions.iter().find(|session| session.name == name) {
+                            anyhow::bail!(
+                                "session {name:?} already serves {}; pass --session to pick another name",
+                                other
+                                    .root
+                                    .as_deref()
+                                    .map_or("another root".into(), |root| root
+                                        .display()
+                                        .to_string())
+                            );
+                        }
+                        name
+                    }
+                }
+            }
+        };
+        let paths = server::SessionPaths::new(&name)?;
+        Ok(Resolved { paths, root })
+    }
+
+    fn find_running(
+        session: Option<&str>,
+        path: Option<PathBuf>,
+        allow_only: bool,
+    ) -> Result<String> {
+        if let Some(session) = session {
+            return Ok(session.to_owned());
+        }
+        let sessions = server::list()?;
+        if allow_only && let [only] = sessions.as_slice() {
+            return Ok(only.name.clone());
+        }
+        let current_dir = std::env::current_dir().context("reading the current directory")?;
+        let target = server::canonical_target(&path.unwrap_or_default(), &current_dir);
+        if let Some(covering) = server::deepest_covering(&sessions, &target) {
+            return Ok(covering.name.clone());
+        }
+        let names = sessions
+            .iter()
+            .map(|session| session.name.as_str())
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            anyhow::bail!("no session is running");
+        }
+        anyhow::bail!(
+            "no running session covers {}; running sessions: {}",
+            target.display(),
+            names.join(", ")
+        )
+    }
+
     fn run(cli: Cli) -> Result<Outcome> {
-        let session_paths = server::SessionPaths::new(SESSION)?;
+        if let Some(user_data_dir) = &cli.user_data_dir {
+            paths::set_custom_data_dir(&user_data_dir.to_string_lossy());
+        }
         match cli.command {
-            None => open(cli.paths, &session_paths),
-            Some(Command::Attach) => attach(&session_paths),
-            Some(Command::Kill) => {
-                server::kill(&session_paths)?;
+            None => open(cli),
+            Some(Command::Attach { path }) => {
+                let name = find_running(cli.session.as_deref(), path, true)?;
+                attach(&server::SessionPaths::new(&name)?)
+            }
+            Some(Command::Kill { path }) => {
+                let name = find_running(cli.session.as_deref(), path, false)?;
+                server::kill(&server::SessionPaths::new(&name)?)?;
                 Ok(Outcome::Exit(0))
             }
-            Some(Command::Server { paths }) => {
+            Some(Command::Ls) => {
+                for session in server::list()? {
+                    let root = session
+                        .root
+                        .map_or("-".into(), |root| root.display().to_string());
+                    println!("{}\t{root}", session.name);
+                }
+                Ok(Outcome::Exit(0))
+            }
+            Some(Command::Server { root, paths }) => {
+                let name = cli.session.unwrap_or_else(|| "default".to_owned());
+                let session_paths = server::SessionPaths::new(&name)?;
                 let platform = TuiPlatform::new(DEFAULT_COLS, DEFAULT_ROWS);
-                let (session, started) = server::start_session(session_paths, platform.clone())?;
+                let root = root.map(|root| root.canonicalize().unwrap_or(root));
+                let (session, started) =
+                    server::start_session(session_paths, root.as_deref(), platform.clone())?;
                 Ok(Outcome::Serve(
                     TuiServer {
                         _session: session,
@@ -161,11 +265,30 @@ mod unix {
         }
     }
 
-    fn open(paths: Vec<PathBuf>, session_paths: &server::SessionPaths) -> Result<Outcome> {
-        if !server::is_running(session_paths) {
-            server::spawn_daemon(session_paths, &absolute_paths(paths)?)?;
+    fn open(cli: Cli) -> Result<Outcome> {
+        let current_dir = std::env::current_dir().context("reading the current directory")?;
+        let targets = cli
+            .paths
+            .iter()
+            .map(|path| server::canonical_target(path, &current_dir))
+            .collect::<Vec<_>>();
+        let first_target = targets.first().cloned().unwrap_or(current_dir);
+        let session = resolve(cli.session.as_deref(), &first_target)?;
+
+        if !server::is_running(&session.paths) {
+            let extra_targets = targets
+                .iter()
+                .filter(|target| **target != session.root)
+                .cloned()
+                .collect::<Vec<_>>();
+            server::spawn_daemon(
+                &session.paths,
+                &session.root,
+                &extra_targets,
+                cli.user_data_dir.as_deref(),
+            )?;
         }
-        attach(session_paths)
+        attach(&session.paths)
     }
 
     fn describe(session: &str, exit: client::Exit) -> Result<String> {
