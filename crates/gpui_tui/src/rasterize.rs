@@ -162,7 +162,7 @@ fn draw_block_caret(grid: &mut CellGrid, caret: &CaretCandidate) {
 }
 
 #[derive(Default)]
-struct RasterScratch {
+pub(crate) struct RasterScratch {
     candidates: Vec<TextCandidate>,
     placements: Vec<Option<Placement>>,
     line_cursors: Vec<LineCursor>,
@@ -176,9 +176,10 @@ pub(crate) fn rasterize_scene(
     cols: u16,
     rows: u16,
     canvas: Rgb,
+    scratch: &mut RasterScratch,
 ) -> (CellGrid, Vec<CaretCandidate>) {
-    let scratch = &mut RasterScratch::default();
     layout_text(scene, atlas, icon_glyph, scratch);
+    scratch.rules_by_row.iter_mut().for_each(Vec::clear);
     scratch.rules_by_row.resize_with(rows as usize, Vec::new);
     let mut rasterizer = Rasterizer {
         grid: CellGrid::new(cols, rows, Rgb::default()),
@@ -308,6 +309,7 @@ fn layout_text(
         line_cursors,
         ..
     } = scratch;
+    candidates.clear();
     candidates.extend(
         scene
             .monochrome_sprites
@@ -323,7 +325,9 @@ fn layout_text(
             .then(a.id.cmp(&b.id))
     });
 
+    placements.clear();
     placements.resize(scene.monochrome_sprites.len(), None);
+    line_cursors.clear();
     let mut current_row = None;
     for candidate in candidates.iter() {
         let row = candidate.placement.row;
@@ -831,12 +835,30 @@ mod tests {
         cols: u16,
         rows: u16,
     ) -> (CellGrid, Vec<CaretCandidate>) {
-        rasterize_scene(scene, atlas, &chevron_icon, cols, rows, Rgb::default())
+        rasterize_scene(
+            scene,
+            atlas,
+            &chevron_icon,
+            cols,
+            rows,
+            Rgb::default(),
+            &mut RasterScratch::default(),
+        )
     }
 
     fn rasterize_on(scene: &Scene, canvas: Rgb, cols: u16, rows: u16) -> CellGrid {
         let atlas = TuiAtlas::default();
-        rasterize_scene(scene, &atlas, &chevron_icon, cols, rows, canvas).0
+        let mut scratch = RasterScratch::default();
+        rasterize_scene(
+            scene,
+            &atlas,
+            &chevron_icon,
+            cols,
+            rows,
+            canvas,
+            &mut scratch,
+        )
+        .0
     }
 
     fn fill_quad(x: f32, y: f32, width: f32, height: f32, color: Hsla) -> Quad {

@@ -18,7 +18,10 @@ use crate::{
     caret_cell, cells_for_size,
     grid::{CellGrid, CursorPosition, Rgb},
     platform::{FrameOutput, PlatformOutputs, WindowRegistry},
-    rasterize::{CaretCandidate, CaretMode, canvas_if_untouched, rasterize_scene, resolve_carets},
+    rasterize::{
+        CaretCandidate, CaretMode, RasterScratch, canvas_if_untouched, rasterize_scene,
+        resolve_carets,
+    },
     size_for_cells, with_taken,
 };
 
@@ -47,6 +50,7 @@ pub(crate) struct WindowState {
     outputs: Rc<PlatformOutputs>,
     last_caret_color: Option<Rgb>,
     pending_frame: Option<(CellGrid, Vec<CaretCandidate>)>,
+    raster_scratch: RasterScratch,
     floating: Option<Floating>,
 }
 
@@ -163,6 +167,7 @@ impl TuiWindow {
                 outputs,
                 last_caret_color: None,
                 pending_frame: None,
+                raster_scratch: RasterScratch::default(),
                 floating,
             })),
             callbacks: Rc::default(),
@@ -601,6 +606,7 @@ impl PlatformWindow for TuiWindow {
             cols,
             rows,
             outputs.canvas.get(),
+            &mut state.raster_scratch,
         );
         state.pending_frame = Some(frame);
     }
