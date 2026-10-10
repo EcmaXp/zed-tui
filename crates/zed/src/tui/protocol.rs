@@ -76,7 +76,7 @@ pub enum ClientMessage {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Span(u32, u32, u8, String);
+pub struct Span(u32, u32, u8, String, Option<u32>);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RowPatch(u16, u16, Vec<Span>);
@@ -174,6 +174,14 @@ pub fn read_message<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T> {
     ciborium::from_reader(body.as_slice()).context("decoding message")
 }
 
+fn underline_color(cell: &Cell) -> Option<u32> {
+    cell.attrs
+        .contains(CellAttrs::UNDERLINE)
+        .then(|| cell.underline.rgb())
+        .flatten()
+        .map(u32::from)
+}
+
 fn encode_cells(cells: &[Cell]) -> Vec<Span> {
     cells
         .iter()
@@ -189,6 +197,7 @@ fn encode_cells(cells: &[Cell]) -> Vec<Span> {
                 u32::from(cell.bg),
                 (cell.attrs - CellAttrs::WIDE_CONTINUATION).bits(),
                 text,
+                underline_color(cell),
             )
         })
         .collect()
@@ -209,36 +218,50 @@ fn decode_spans<'a>(
     spans: &'a [Span],
     color: &'a impl Fn(u32) -> Rgb,
 ) -> impl Iterator<Item = Cell> + 'a {
-    spans.iter().flat_map(move |Span(fg, bg, attrs, text)| {
-        let (fg, bg) = (color(*fg), color(*bg));
-        let mut chars = text.chars().peekable();
-        let mut cluster = String::new();
-        std::iter::from_fn(move || {
-            let ch = chars.next()?;
-            let (glyph, attrs) = if ch == CONTINUATION {
-                (Glyph::from_char(' '), CellAttrs::WIDE_CONTINUATION)
-            } else if chars.peek() == Some(&CLUSTER_EXTEND) {
-                cluster.clear();
-                cluster.push(ch);
-                while chars.next_if_eq(&CLUSTER_EXTEND).is_some() {
-                    cluster.extend(chars.next());
-                }
-                (
-                    Glyph::from_cluster(&cluster),
-                    CellAttrs::from_bits_truncate(*attrs),
-                )
-            } else {
-                (Glyph::from_char(ch), CellAttrs::from_bits_truncate(*attrs))
-            };
-            Some(Cell {
-                glyph,
-                fg,
-                bg,
-                attrs,
-                underline: UnderlineColor::default(),
+    spans
+        .iter()
+        .flat_map(move |Span(fg, bg, attrs, text, underline)| {
+            let underline = underline.map_or(UnderlineColor::default(), |index| {
+                UnderlineColor::of(color(index))
+            });
+            let (fg, bg) = (color(*fg), color(*bg));
+            let mut chars = text.chars().peekable();
+            let mut cluster = String::new();
+            std::iter::from_fn(move || {
+                let ch = chars.next()?;
+                let (glyph, attrs, underline) = if ch == CONTINUATION {
+                    (
+                        Glyph::from_char(' '),
+                        CellAttrs::WIDE_CONTINUATION,
+                        UnderlineColor::default(),
+                    )
+                } else if chars.peek() == Some(&CLUSTER_EXTEND) {
+                    cluster.clear();
+                    cluster.push(ch);
+                    while chars.next_if_eq(&CLUSTER_EXTEND).is_some() {
+                        cluster.extend(chars.next());
+                    }
+                    (
+                        Glyph::from_cluster(&cluster),
+                        CellAttrs::from_bits_truncate(*attrs),
+                        underline,
+                    )
+                } else {
+                    (
+                        Glyph::from_char(ch),
+                        CellAttrs::from_bits_truncate(*attrs),
+                        underline,
+                    )
+                };
+                Some(Cell {
+                    glyph,
+                    fg,
+                    bg,
+                    attrs,
+                    underline,
+                })
             })
         })
-    })
 }
 
 #[derive(Default)]
@@ -344,6 +367,21 @@ mod tests {
             let decoded: ServerMessage = read_message(&mut reader).unwrap();
             assert_eq!(&decoded, message);
         }
+    }
+
+    #[test]
+    fn underline_colors_survive_the_wire() {
+        let (red, blue) = (Rgb::new(224, 108, 117), Rgb::new(97, 175, 239));
+        let mut grid = CellGrid::new(6, 1, Rgb::new(40, 44, 52));
+        for (col, cell) in grid.row_mut(0).iter_mut().enumerate() {
+            cell.glyph = 'x'.into();
+            cell.attrs = CellAttrs::UNDERLINE | CellAttrs::CURLY_UNDERLINE;
+            cell.underline = UnderlineColor::of(if col < 3 { red } else { blue });
+        }
+        let mut decoded = None;
+        let message = FrameEncoder.full_frame(&grid);
+        FrameDecoder.apply(&mut decoded, &message);
+        assert_eq!(decoded.as_ref(), Some(&grid));
     }
 
     fn assert_same_cells(actual: &CellGrid, expected: &CellGrid) {

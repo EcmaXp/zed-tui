@@ -181,6 +181,7 @@ impl vte::Perform for QueryReplies {
 enum Layer {
     Foreground,
     Background,
+    Underline,
 }
 
 impl Layer {
@@ -188,6 +189,7 @@ impl Layer {
         match self {
             Self::Foreground => "38",
             Self::Background => "48",
+            Self::Underline => "58",
         }
     }
 }
@@ -224,34 +226,54 @@ fn read_query_reply(timeout: Duration) -> QueryReplies {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum PenColor {
+    #[default]
+    Default,
+    Color(Rgb),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Pen {
     style: Option<Style>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Style {
-    fg: Option<Rgb>,
-    bg: Rgb,
+    fg: Option<PenColor>,
+    bg: PenColor,
+    underline: Option<PenColor>,
     attrs: CellAttrs,
 }
 
 impl Style {
-    fn blank(bg: Rgb) -> Self {
+    fn blank(bg: PenColor) -> Self {
         Self {
             fg: None,
             bg,
+            underline: None,
             attrs: CellAttrs::empty(),
         }
     }
 
-    fn of_cell(cell: &Cell) -> Self {
+    fn of_cell(cell: &Cell, styled_underlines: bool) -> Self {
         if cell.is_plain_blank() {
-            return Self::blank(cell.bg);
+            return Self::blank(PenColor::Color(cell.bg));
         }
+        let mut attrs = cell.attrs - CellAttrs::WIDE_CONTINUATION;
+        if !styled_underlines {
+            attrs.remove(CellAttrs::CURLY_UNDERLINE);
+        }
+        let underline = (styled_underlines && attrs.contains(CellAttrs::UNDERLINE)).then(|| {
+            match cell.underline.rgb() {
+                Some(color) if color != cell.fg => PenColor::Color(color),
+                _ => PenColor::Default,
+            }
+        });
         Self {
-            fg: Some(cell.fg),
-            bg: cell.bg,
-            attrs: cell.attrs - (CellAttrs::WIDE_CONTINUATION | CellAttrs::CURLY_UNDERLINE),
+            fg: Some(PenColor::Color(cell.fg)),
+            bg: PenColor::Color(cell.bg),
+            underline,
+            attrs,
         }
     }
 }
@@ -273,8 +295,9 @@ impl Pen {
         for (layer, color) in [
             (Layer::Foreground, style.fg),
             (Layer::Background, Some(style.bg)),
+            (Layer::Underline, style.underline),
         ] {
-            if let Some(Rgb { r, g, b }) = color {
+            if let Some(PenColor::Color(Rgb { r, g, b })) = color {
                 write!(output, ";{};2;{r};{g};{b}", layer.extended_code())?;
             }
         }
@@ -285,7 +308,13 @@ impl Pen {
 }
 
 fn underline_code(attrs: CellAttrs) -> Option<&'static str> {
-    attrs.contains(CellAttrs::UNDERLINE).then_some("4")
+    if !attrs.contains(CellAttrs::UNDERLINE) {
+        None
+    } else if attrs.contains(CellAttrs::CURLY_UNDERLINE) {
+        Some("4:3")
+    } else {
+        Some("4")
+    }
 }
 
 struct Terminal<W: Write> {
@@ -374,7 +403,7 @@ impl<W: Write> Terminal<W> {
             }
             let text_end = scratch.text.len();
             let cursor_after = (next_col < cols && character.is_some()).then_some(next_col);
-            let style = Style::of_cell(cell);
+            let style = Style::of_cell(cell, self.features.ghostty);
             match scratch.segments.last_mut() {
                 Some(DrawSegment {
                     style: last_style,
@@ -843,6 +872,7 @@ mod tests {
     struct Emulator {
         term: Term<VoidListener>,
         processor: Processor,
+        styled_underlines: bool,
     }
 
     impl Emulator {
@@ -854,6 +884,7 @@ mod tests {
                     VoidListener,
                 ),
                 processor: Processor::new(),
+                styled_underlines: false,
             }
         }
 
@@ -895,7 +926,22 @@ mod tests {
                     assert_eq!(shown_text, expected_text, "{at}");
                     assert_eq!(shown.bg, spec(expected.bg), "{at}");
                     let underline = expected.attrs.contains(CellAttrs::UNDERLINE);
-                    assert_eq!(shown.flags.contains(Flags::UNDERLINE), underline, "{at}");
+                    let curly = underline
+                        && self.styled_underlines
+                        && expected.attrs.contains(CellAttrs::CURLY_UNDERLINE);
+                    assert_eq!(
+                        shown.flags.contains(Flags::UNDERLINE),
+                        underline && !curly,
+                        "{at}"
+                    );
+                    assert_eq!(shown.flags.contains(Flags::UNDERCURL), curly, "{at}");
+                    if underline {
+                        let color = expected
+                            .underline
+                            .rgb()
+                            .filter(|color| self.styled_underlines && *color != expected.fg);
+                        assert_eq!(shown.underline_color(), color.map(spec), "{at}");
+                    }
                     if !expected.is_plain_blank() {
                         assert_eq!(shown.fg, spec(expected.fg), "{at}");
                         let bold = expected.attrs.contains(CellAttrs::BOLD);
@@ -932,6 +978,12 @@ mod tests {
             CellAttrs::BOLD,
             CellAttrs::ITALIC,
             CellAttrs::UNDERLINE,
+            CellAttrs::UNDERLINE | CellAttrs::CURLY_UNDERLINE,
+        ];
+        let underlines = [
+            UnderlineColor::default(),
+            UnderlineColor::of(Rgb::new(224, 108, 117)),
+            UnderlineColor::of(Rgb::new(200, 120, 60)),
         ];
         for _ in 0..edits {
             let row = random.next(grid.rows as usize) as i32;
@@ -945,7 +997,7 @@ mod tests {
                         fg: palette[random.next(palette.len())],
                         bg,
                         attrs: attrs[random.next(attrs.len())],
-                        underline: UnderlineColor::default(),
+                        underline: underlines[random.next(underlines.len())],
                     };
                 }
             }
@@ -989,6 +1041,23 @@ mod tests {
             }
         }
         mutate(grid, random, 0);
+    }
+
+    fn output_text(renderer: &Renderer<Vec<u8>>) -> String {
+        String::from_utf8(renderer.terminal.output.clone()).unwrap()
+    }
+
+    fn render_checked(
+        renderer: &mut Renderer<Vec<u8>>,
+        emulator: &mut Emulator,
+        grid: &CellGrid,
+    ) -> String {
+        renderer.grid = Some(grid.clone());
+        renderer.render().unwrap();
+        let output = output_text(renderer);
+        emulator.feed(renderer);
+        emulator.assert_shows(grid, grid.cols);
+        output
     }
 
     fn parse_replies(chunks: &[&[u8]]) -> QueryReplies {
@@ -1263,6 +1332,8 @@ mod tests {
 
     #[test]
     fn rendered_frames_match_an_emulated_terminal() {
+        let mut curled = false;
+        let mut colored_underlines = false;
         let cases = [(1, 40), (2, 40), (3, 33), (4, 27), (5, 44), (6, 40)];
         for (ghostty, (seed, terminal_cols)) in [false, true]
             .into_iter()
@@ -1273,6 +1344,7 @@ mod tests {
             let mut renderer = Renderer::new(Vec::new(), terminal_cols, 12);
             renderer.terminal.features.ghostty = ghostty;
             let mut emulator = Emulator::new(terminal_cols, 12);
+            emulator.styled_underlines = ghostty;
             paint_run(&mut grid, &mut random);
             mutate(&mut grid, &mut random, 60);
             renderer.grid = Some(grid.clone());
@@ -1285,21 +1357,70 @@ mod tests {
                 paint_run(&mut grid, &mut random);
                 mutate(&mut grid, &mut random, 3);
                 renderer.grid = Some(grid.clone());
+                renderer.render().unwrap();
+                let output = String::from_utf8_lossy(&renderer.terminal.output);
+                let styled = output.contains("4:3") || output.contains(";58;");
+                assert!(ghostty || !styled, "{output:?}");
+                curled |= output.contains("4:3");
+                colored_underlines |= output.contains(";58;") || output.contains("[58;");
                 emulator.feed(&mut renderer);
                 emulator.assert_shows(&grid, terminal_cols);
             }
         }
+        assert!(curled && colored_underlines);
+    }
+
+    fn underlined_output(ghostty: bool) -> String {
+        let red = Rgb::new(224, 108, 117);
+        let mut grid = CellGrid::new(12, 1, Rgb::new(40, 44, 52));
+        text_row(&mut grid, 0, 0, "abcdefgh");
+        for (col, cell) in grid.row_mut(0).iter_mut().enumerate().take(8) {
+            cell.fg = Rgb::new(200, 200, 200);
+            cell.attrs = match col {
+                0..2 => CellAttrs::UNDERLINE | CellAttrs::CURLY_UNDERLINE,
+                2..4 => CellAttrs::UNDERLINE,
+                4..6 => CellAttrs::UNDERLINE | CellAttrs::CURLY_UNDERLINE,
+                _ => CellAttrs::empty(),
+            };
+            if col < 4 {
+                cell.underline = UnderlineColor::of(red);
+            }
+        }
+        let mut renderer = Renderer::new(Vec::new(), 12, 1);
+        renderer.terminal.features.ghostty = ghostty;
+        let mut emulator = Emulator::new(12, 1);
+        emulator.styled_underlines = ghostty;
+        render_checked(&mut renderer, &mut emulator, &grid)
+    }
+
+    #[test]
+    fn ghostty_underlines_carry_their_curl_and_color() {
+        let output = underlined_output(true);
+        assert!(
+            output.contains("4:3") && output.contains(";58;2;224;108;117m"),
+            "{output:?}"
+        );
+        let output = underlined_output(false);
+        assert!(
+            !output.contains("4:3") && !output.contains(";58;"),
+            "{output:?}"
+        );
     }
 
     fn paint_run(grid: &mut CellGrid, random: &mut Random) {
         let glyphs = ['─', '=', 'a', WIDE[0]];
-        let attrs = [CellAttrs::empty(), CellAttrs::BOLD, CellAttrs::UNDERLINE];
+        let attrs = [
+            CellAttrs::empty(),
+            CellAttrs::BOLD,
+            CellAttrs::UNDERLINE,
+            CellAttrs::UNDERLINE | CellAttrs::CURLY_UNDERLINE,
+        ];
         let run = Cell {
             glyph: glyphs[random.next(glyphs.len())].into(),
             fg: Rgb::new(200, 120, 60),
             bg: Rgb::new(30, 33, 40),
             attrs: attrs[random.next(attrs.len())],
-            underline: UnderlineColor::default(),
+            underline: UnderlineColor::of(Rgb::new(224, 108, 117)),
         };
         let row = random.next(grid.rows as usize) as i32;
         let start = random.next(grid.cols as usize) as i32;
