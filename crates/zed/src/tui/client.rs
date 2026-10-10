@@ -18,7 +18,7 @@ use gpui::{CursorStyle, Modifiers};
 use gpui_tui::{Cell, CellAttrs, CellGrid, CursorShape, Glyph, Rgb};
 use parking_lot::Mutex;
 
-use crate::tui::frame_diff::{GridScroll, changed_ranges, find_moves};
+use crate::tui::frame_diff::{GridScroll, RowShift, changed_ranges, find_moves, find_row_shift};
 use crate::tui::protocol::{
     ClientMessage, FrameDecoder, KeyCode, MessageReader, MessageWriter, MouseAction,
     MouseButtonKind, PROTOCOL_VERSION, ServerMessage, TermEvent, WAIT_ONLY_SIZE,
@@ -663,6 +663,14 @@ fn is_blank_on(cell: &Cell, background: PenColor) -> bool {
     cell.is_plain_blank() && PenColor::background(cell) == background
 }
 
+fn uniform_blank_background(cells: &[Cell]) -> Option<PenColor> {
+    let background = PenColor::background(cells.first()?);
+    cells
+        .iter()
+        .all(|cell| is_blank_on(cell, background))
+        .then_some(background)
+}
+
 fn blank_tail_start(cells: &[Cell], cols: usize) -> Option<usize> {
     let cells = cells.get(..cols)?;
     let background = PenColor::background(cells.last()?);
@@ -899,6 +907,20 @@ impl<W: Write> Terminal<W> {
             self.cursor = Some((0, 0));
         }
         Ok(())
+    }
+
+    fn shift_cells(
+        &mut self,
+        row: u16,
+        shift: &RowShift,
+        erase: Option<PenColor>,
+    ) -> io::Result<()> {
+        if let Some(erase) = erase {
+            self.pen.write_style(&mut self.body, Style::blank(erase))?;
+        }
+        self.move_to(shift.start, row)?;
+        let final_byte = if shift.shift > 0 { '@' } else { 'P' };
+        CursorStep::Relative(final_byte, shift.shift.unsigned_abs()).write(&mut self.body)
     }
 
     fn flush_frame(&mut self, force_synchronize: bool) -> io::Result<()> {
@@ -1500,6 +1522,25 @@ impl<W: Write> Renderer<W> {
         };
         for scroll in &moves {
             terminal.move_cells(scroll)?;
+        }
+        if visible_cols == terminal.cols as usize && visible_cols == grid.cols as usize {
+            for row in 0..visible_rows as u16 {
+                let wanted = grid.row(row);
+                let Some(shift) = find_row_shift(screen.row(row), wanted) else {
+                    continue;
+                };
+                let vacated_range = shift.vacated(visible_cols);
+                let vacated = wanted.get(vacated_range.clone()).unwrap_or_default();
+                let erase = uniform_blank_background(vacated);
+                terminal.shift_cells(row, &shift, erase)?;
+                let shown = screen.row_mut(row);
+                shift.apply(shown, unknown_cell());
+                if erase.is_some()
+                    && let Some(shown) = shown.get_mut(vacated_range)
+                {
+                    shown.copy_from_slice(vacated);
+                }
+            }
         }
         for row in 0..visible_rows as u16 {
             let cells = grid.row(row);
@@ -3396,6 +3437,7 @@ mod tests {
 
     #[test]
     fn rendered_frames_match_an_emulated_terminal() {
+        let mut shifted_rows = false;
         let mut repeated = false;
         let mut curled = false;
         let mut colored_underlines = false;
@@ -3426,6 +3468,7 @@ mod tests {
                 renderer.grid = Some(grid.clone());
                 renderer.render().unwrap();
                 let output = String::from_utf8_lossy(&renderer.terminal.output);
+                shifted_rows |= output.contains('@') || output.contains("\x1b[P");
                 let repeats = repeats_in(&output);
                 let styled = output.contains("4:3") || output.contains(";58;");
                 assert!(ghostty || (repeats == 0 && !styled), "{output:?}");
@@ -3436,6 +3479,7 @@ mod tests {
                 emulator.assert_shows(&grid, terminal_cols);
             }
         }
+        assert!(shifted_rows);
         assert!(repeated && curled && colored_underlines);
     }
 
@@ -3556,6 +3600,89 @@ mod tests {
         assert_eq!(repeats_in(&output_text(&renderer)), 0);
         emulator.feed(&mut renderer);
         emulator.assert_shows(&grid, 20);
+    }
+
+    #[test]
+    fn typing_mid_line_shifts_the_rest_of_the_line() {
+        let mut grid = CellGrid::new(80, 3, Rgb::new(40, 44, 52));
+        let text = "    let measured_value = compute_bytes(first, second, third);";
+        text_row(&mut grid, 1, 0, text);
+        for (col, cell) in grid.row_mut(1).iter_mut().enumerate() {
+            cell.fg = Rgb::new(100 + (col / 5) as u8 * 10, 120, 60);
+        }
+        if let Some(cell) = grid.cell_mut(79, 1) {
+            cell.glyph = '│'.into();
+        }
+        let mut renderer = Renderer::new(Vec::new(), 80, 3);
+        let mut emulator = Emulator::new(80, 3);
+        renderer.grid = Some(grid.clone());
+        emulator.feed(&mut renderer);
+
+        let mut typed = grid.clone();
+        let row = typed.row_mut(1);
+        row[8..79].rotate_right(1);
+        row[8].glyph = 'x'.into();
+        renderer.grid = Some(typed.clone());
+        renderer.render().unwrap();
+        let output = output_text(&renderer);
+        assert!(output.contains("\x1b[@"), "{output:?}");
+        assert!(
+            output.len() < 96,
+            "typing took {} bytes: {output:?}",
+            output.len()
+        );
+        emulator.feed(&mut renderer);
+        emulator.assert_shows(&typed, 80);
+
+        renderer.grid = Some(grid.clone());
+        renderer.render().unwrap();
+        let output = output_text(&renderer);
+        assert!(output.contains("\x1b[P"), "{output:?}");
+        emulator.feed(&mut renderer);
+        emulator.assert_shows(&grid, 80);
+    }
+
+    #[test]
+    fn shifting_a_highlighted_line_erases_with_its_background() {
+        let editor = Rgb::new(40, 44, 52);
+        let mut grid = CellGrid::new(80, 3, editor);
+        text_row(
+            &mut grid,
+            1,
+            0,
+            "    let measured_value = compute_bytes(first, second, third);",
+        );
+        for cell in grid.row_mut(1) {
+            cell.bg = Rgb::new(50, 56, 66);
+        }
+        grid.mark_default_colors(&[editor], &[]);
+        let mut renderer = Renderer::new(Vec::new(), 80, 3);
+        let mut emulator = Emulator::new(80, 3);
+        renderer.grid = Some(grid.clone());
+        emulator.feed(&mut renderer);
+
+        let mut typed = grid.clone();
+        let row = typed.row_mut(1);
+        row[8..].rotate_right(1);
+        row[8].glyph = 'x'.into();
+        renderer.grid = Some(typed.clone());
+        renderer.render().unwrap();
+        let output = output_text(&renderer);
+        assert!(output.contains("\x1b[@"), "{output:?}");
+        assert!(
+            !output.contains("49m") && !output.contains("\x1b[m"),
+            "{output:?}"
+        );
+        emulator.feed(&mut renderer);
+        emulator.assert_shows(&typed, 80);
+
+        renderer.grid = Some(grid.clone());
+        renderer.render().unwrap();
+        let output = output_text(&renderer);
+        assert!(output.contains("\x1b[P"), "{output:?}");
+        assert!(!output.contains(' '), "{output:?}");
+        emulator.feed(&mut renderer);
+        emulator.assert_shows(&grid, 80);
     }
 
     fn rendered_change(cols: u16, before: &str, after: &str) -> String {

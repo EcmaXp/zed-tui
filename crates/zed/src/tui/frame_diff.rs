@@ -407,10 +407,105 @@ fn margin_columns(
         .then(|| window.start + columns.start..window.start + columns.end)
 }
 
+const MAX_ROW_SHIFT: usize = 8;
+const ROW_SHIFT_OVERHEAD: isize = 16;
+const STYLE_CHANGE_BYTES: isize = 12;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RowShift {
+    pub start: usize,
+    pub shift: isize,
+}
+
+impl RowShift {
+    pub fn vacated(&self, cols: usize) -> Range<usize> {
+        let distance = self.shift.unsigned_abs();
+        if self.shift > 0 {
+            self.start..self.start + distance
+        } else {
+            cols - distance..cols
+        }
+    }
+
+    pub fn apply(&self, row: &mut [Cell], fill: Cell) {
+        let cols = row.len();
+        let distance = self.shift.unsigned_abs();
+        if self.shift > 0 {
+            row.copy_within(self.start..cols - distance, self.start + distance);
+        } else {
+            row.copy_within(self.start + distance..cols, self.start);
+        }
+        if let Some(cells) = row.get_mut(self.vacated(cols)) {
+            cells.fill(fill);
+        }
+    }
+}
+
 fn is_continuation(cells: &[Cell], col: usize) -> bool {
     cells
         .get(col)
         .is_some_and(|cell| cell.is_wide_continuation())
+}
+
+fn redraw_weights(wanted: &[Cell]) -> Vec<isize> {
+    let style = |cell: &Cell| {
+        let cell = cell.appearance();
+        (cell.fg, cell.bg, cell.attrs)
+    };
+    let mut previous = None;
+    wanted
+        .iter()
+        .map(|cell| {
+            let current = style(cell);
+            let changed = previous.replace(current) != Some(current);
+            1 + if changed { STYLE_CHANGE_BYTES } else { 0 }
+        })
+        .collect()
+}
+
+pub fn find_row_shift(shown: &[Cell], wanted: &[Cell]) -> Option<RowShift> {
+    let cols = shown.len().min(wanted.len());
+    let (shown, wanted) = (&shown[..cols], &wanted[..cols]);
+    let start = (0..cols).find(|&col| !shown[col].looks_like(&wanted[col]))?;
+    if is_continuation(shown, start) {
+        return None;
+    }
+    let weights = redraw_weights(wanted);
+    let gain = |shifted: &dyn Fn(usize) -> Option<Cell>| {
+        (start..cols)
+            .map(|col| {
+                let matches_after = shifted(col).is_some_and(|cell| cell.looks_like(&wanted[col]));
+                let matches_now = shown[col].looks_like(&wanted[col]);
+                weights[col] * (matches_after as isize - matches_now as isize)
+            })
+            .sum::<isize>()
+    };
+    let mut best: Option<(RowShift, isize)> = None;
+    for distance in 1..=MAX_ROW_SHIFT.min(cols.saturating_sub(start + 1)) {
+        let inserted = if is_continuation(shown, cols - distance) {
+            isize::MIN
+        } else {
+            gain(&|col| {
+                col.checked_sub(distance)
+                    .filter(|source| *source >= start)
+                    .map(|source| shown[source])
+            })
+        };
+        let deleted = if is_continuation(shown, start + distance) {
+            isize::MIN
+        } else {
+            gain(&|col| shown.get(col + distance).copied())
+        };
+        for (shift, total) in [
+            (distance as isize, inserted),
+            (-(distance as isize), deleted),
+        ] {
+            if total > ROW_SHIFT_OVERHEAD && best.as_ref().is_none_or(|(_, best)| total > *best) {
+                best = Some((RowShift { start, shift }, total));
+            }
+        }
+    }
+    best.map(|(shift, _)| shift)
 }
 
 #[cfg(test)]
@@ -450,6 +545,109 @@ mod tests {
         shifted[2].attrs = CellAttrs::WIDE_CONTINUATION;
         shifted[2].bg = Rgb::new(9, 9, 9);
         assert_eq!(changed_ranges(&next, &shifted, 0), vec![1..3]);
+    }
+
+    fn colored_row(text: &str) -> Vec<Cell> {
+        let mut cells = row(text);
+        for (index, cell) in cells.iter_mut().enumerate() {
+            cell.fg = Rgb::new(index as u8 / 4, 100, 200);
+        }
+        cells
+    }
+
+    #[test]
+    fn typing_and_deleting_mid_line_are_found_as_row_shifts() {
+        let before = colored_row("let value = compute(1, 2, 3);       ");
+        let mut typed = before.clone();
+        typed.insert(
+            4,
+            Cell {
+                glyph: 'X'.into(),
+                ..before[4]
+            },
+        );
+        typed.pop();
+        assert_eq!(
+            find_row_shift(&before, &typed),
+            Some(RowShift { start: 4, shift: 1 })
+        );
+        assert_eq!(
+            find_row_shift(&typed, &before),
+            Some(RowShift {
+                start: 4,
+                shift: -1
+            })
+        );
+        assert_eq!(find_row_shift(&before, &before), None);
+    }
+
+    #[test]
+    fn short_tails_are_redrawn_instead_of_shifted() {
+        let before = colored_row("abc");
+        let mut typed = before.clone();
+        typed.insert(
+            1,
+            Cell {
+                glyph: 'X'.into(),
+                ..before[1]
+            },
+        );
+        typed.pop();
+        assert_eq!(find_row_shift(&before, &typed), None);
+    }
+
+    #[test]
+    fn row_shifts_never_split_wide_characters() {
+        let mut before = colored_row("ab한 cdefghijklmnopqrstuvwxyz0123456789");
+        before[3].attrs = CellAttrs::WIDE_CONTINUATION;
+        let mut deleted = before.clone();
+        deleted.remove(2);
+        deleted.push(before[0]);
+        assert_eq!(find_row_shift(&before, &deleted), None);
+    }
+
+    fn text(cells: &[Cell]) -> String {
+        cells
+            .iter()
+            .filter_map(|cell| cell.glyph.as_char())
+            .collect()
+    }
+
+    #[test]
+    fn applying_a_row_shift_matches_the_terminal() {
+        let mut cells = row("abcdef");
+        let fill = Cell {
+            glyph: '?'.into(),
+            ..Cell::blank(Rgb::new(0, 0, 0))
+        };
+        let insert = RowShift { start: 1, shift: 2 };
+        assert_eq!(insert.vacated(cells.len()), 1..3);
+        insert.apply(&mut cells, fill);
+        assert_eq!(text(&cells), "a??bcd");
+        let delete = RowShift {
+            start: 0,
+            shift: -2,
+        };
+        assert_eq!(delete.vacated(cells.len()), 4..6);
+        delete.apply(&mut cells, fill);
+        assert_eq!(text(&cells), "?bcd??");
+    }
+
+    #[test]
+    fn inserting_never_pushes_half_a_wide_character_off_the_row() {
+        let mut before = colored_row("let value = compute(1, 2, 3);       한 ");
+        let last = before.len() - 1;
+        before[last].attrs = CellAttrs::WIDE_CONTINUATION;
+        let mut typed = before.clone();
+        typed.insert(
+            4,
+            Cell {
+                glyph: 'X'.into(),
+                ..before[4]
+            },
+        );
+        typed.pop();
+        assert_eq!(find_row_shift(&before, &typed), None);
     }
 
     #[test]
