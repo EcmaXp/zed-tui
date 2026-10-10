@@ -250,13 +250,33 @@ pub enum CursorShape {
     Underline,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct CellGrid {
     pub cols: u16,
     pub rows: u16,
     pub cells: Vec<Cell>,
     pub cursor: Option<CursorPosition>,
     pub cursor_shape: CursorShape,
+}
+
+impl Clone for CellGrid {
+    fn clone(&self) -> Self {
+        Self {
+            cols: self.cols,
+            rows: self.rows,
+            cells: self.cells.clone(),
+            cursor: self.cursor,
+            cursor_shape: self.cursor_shape,
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.cols = source.cols;
+        self.rows = source.rows;
+        self.cells.clone_from(&source.cells);
+        self.cursor = source.cursor;
+        self.cursor_shape = source.cursor_shape;
+    }
 }
 
 impl CellGrid {

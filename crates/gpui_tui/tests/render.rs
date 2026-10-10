@@ -1160,6 +1160,35 @@ fn only_the_active_window_reaches_the_screen() {
     assert_eq!(shown(2), ["second"]);
 }
 
+#[test]
+fn redrawing_an_unchanged_view_sends_no_new_frame() {
+    let platform = TuiPlatform::new(20, 4);
+    let frames: Rc<RefCell<Vec<String>>> = Rc::default();
+    platform.set_frame_sink({
+        let frames = frames.clone();
+        move |grid| frames.borrow_mut().push(grid.row_text(0))
+    });
+    Application::with_platform(platform).run(|cx: &mut App| {
+        let window = cx
+            .open_window(WindowOptions::default(), |_, cx| cx.new(|_| Hello))
+            .expect("failed to open window");
+        cx.spawn(async move |cx| {
+            for _ in 0..3 {
+                cx.background_executor()
+                    .timer(Duration::from_millis(30))
+                    .await;
+                window.update(cx, |_, window, _| window.refresh()).ok();
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(30))
+                .await;
+            cx.update(|cx| cx.quit());
+        })
+        .detach();
+    });
+    assert_eq!(frames.borrow().len(), 1);
+}
+
 struct ModifierRecorder {
     focus_handle: FocusHandle,
     seen: Rc<RefCell<Vec<Modifiers>>>,

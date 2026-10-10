@@ -589,7 +589,14 @@ impl Drop for TuiWindow {
 }
 
 fn deliver_frame(frame_sink: &RefCell<FrameOutput>, grid: CellGrid) {
-    frame_sink.borrow_mut().last_delivered = Some(grid.clone());
+    {
+        let mut output = frame_sink.borrow_mut();
+        match &mut output.last_delivered {
+            Some(last) if *last == grid => return,
+            Some(last) => last.clone_from(&grid),
+            None => output.last_delivered = Some(grid.clone()),
+        }
+    }
     with_taken(frame_sink, |output| &mut output.sink, |sink| sink(grid));
 }
 
