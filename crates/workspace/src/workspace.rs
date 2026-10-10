@@ -1860,7 +1860,9 @@ impl Workspace {
 
                 _ => {}
             }
-            cx.notify()
+            if project_event_affects_workspace(event) {
+                cx.notify()
+            }
         })
         .detach();
 
@@ -9562,6 +9564,27 @@ impl Render for DraggedDock {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         gpui::Empty
     }
+}
+
+fn project_event_affects_workspace(event: &project::Event) -> bool {
+    !matches!(
+        event,
+        project::Event::BufferEdited { .. }
+            | project::Event::DiagnosticsUpdated { .. }
+            | project::Event::LanguageServerLog(..)
+            | project::Event::LanguageServerBufferRegistered { .. }
+            | project::Event::ToggleLspLogs { .. }
+            | project::Event::RefreshInlayHints { .. }
+            | project::Event::RefreshSemanticTokens { .. }
+            | project::Event::RefreshCodeLens { .. }
+            | project::Event::RefreshDocumentColors { .. }
+            | project::Event::RefreshDocumentLinks { .. }
+            | project::Event::RefreshDocumentHighlights { .. }
+            | project::Event::RefreshFoldingRanges { .. }
+            | project::Event::RefreshDocumentSymbols { .. }
+            | project::Event::SnippetEdit(..)
+            | project::Event::WorkspaceEditApplied(..)
+    )
 }
 
 impl Render for Workspace {

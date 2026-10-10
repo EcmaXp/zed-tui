@@ -227,3 +227,59 @@ async fn focus_panel_under_zoomed_pane(cx: &mut TestAppContext) -> [LayoutBounds
     });
     [before, layout_bounds(cx)]
 }
+
+#[gpui::test]
+async fn test_project_events_notify_workspace_only_when_they_affect_it(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+    let (workspace, cx) =
+        cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+    cx.run_until_parked();
+
+    let notifications = Rc::new(std::cell::Cell::new(0));
+    let _subscription = cx.update(|_, cx| {
+        cx.observe(&workspace, {
+            let notifications = notifications.clone();
+            move |_, _| notifications.set(notifications.get() + 1)
+        })
+    });
+
+    let notifications_for = |event: project::Event, cx: &mut VisualTestContext| {
+        let before = notifications.get();
+        project.update(cx, |_, cx| cx.emit(event));
+        cx.run_until_parked();
+        notifications.get() - before
+    };
+
+    assert_eq!(
+        notifications_for(
+            project::Event::BufferEdited {
+                source: language::BufferEditSource::User,
+            },
+            cx,
+        ),
+        0
+    );
+    assert_eq!(
+        notifications_for(
+            project::Event::DiagnosticsUpdated {
+                paths: Vec::new(),
+                language_server_id: language::LanguageServerId(0),
+            },
+            cx,
+        ),
+        0
+    );
+    assert_eq!(
+        notifications_for(
+            project::Event::RefreshInlayHints {
+                server_id: language::LanguageServerId(0),
+            },
+            cx,
+        ),
+        0
+    );
+    assert!(notifications_for(project::Event::WorktreeOrderChanged, cx) > 0);
+}
