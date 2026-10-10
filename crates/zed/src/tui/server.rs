@@ -41,6 +41,9 @@ use crate::tui::{
     },
 };
 
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(30);
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_SESSION_BASENAME: usize = 32;
@@ -211,6 +214,7 @@ struct ClientHandle {
     id: u64,
     receives_frames: bool,
     sender: mpsc::Sender<Outgoing>,
+    writer: thread::JoinHandle<()>,
 }
 
 #[derive(Default)]
@@ -262,6 +266,26 @@ impl ClientHub {
                 .send(Outgoing::Message(message.clone()))
                 .is_ok()
         });
+    }
+
+    fn shut_down(&self) {
+        let clients = std::mem::take(&mut self.state.lock().clients);
+        let writers = clients
+            .into_iter()
+            .filter(|client| {
+                client
+                    .sender
+                    .send(Outgoing::Message(ServerMessage::Shutdown))
+                    .is_ok()
+            })
+            .map(|client| client.writer)
+            .collect::<Vec<_>>();
+        let deadline = Instant::now() + SHUTDOWN_GRACE;
+        for writer in writers {
+            while !writer.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
     }
 
     fn send_last_frame_to(&self, id: u64, size: (u16, u16)) {
@@ -336,12 +360,14 @@ pub struct Started {
 }
 
 pub struct SessionGuard {
+    hub: Arc<ClientHub>,
     session_paths: SessionPaths,
     _pid_lock: fs::File,
 }
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
+        self.hub.shut_down();
         fs::remove_file(&self.session_paths.socket).log_err();
         fs::remove_file(&self.session_paths.pid).log_err();
     }
@@ -413,12 +439,16 @@ pub fn start_session(
             let hub = hub.clone();
             move |grid| hub.broadcast_frame(Arc::new(grid))
         }),
-        after_start: Box::new(move |cx| {
-            cx.spawn(async move |cx| handle_events(platform, hub, event_receiver, cx).await)
-                .detach();
+        after_start: Box::new({
+            let hub = hub.clone();
+            move |cx| {
+                cx.spawn(async move |cx| handle_events(platform, hub, event_receiver, cx).await)
+                    .detach();
+            }
         }),
     };
     let session = SessionGuard {
+        hub,
         session_paths,
         _pid_lock: pid_lock,
     };
@@ -692,6 +722,9 @@ fn serve_client(
     events: &UnboundedSender<ServerEvent>,
 ) -> Result<()> {
     let id = hub.next_id.fetch_add(1, Ordering::SeqCst);
+    if let Err(error) = stream.set_read_timeout(Some(HELLO_TIMEOUT)) {
+        log::debug!("client {id} closed before the hello timeout was set: {error}");
+    }
     let write_stream = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
 
@@ -729,10 +762,13 @@ fn serve_client(
         }
         other => bail!("expected a hello message, got {other:?}"),
     };
+    if let Err(error) = reader.get_ref().set_read_timeout(None) {
+        log::debug!("client {id} closed right after its hello: {error}");
+    }
 
     let receives_frames = (cols, rows) != WAIT_ONLY_SIZE;
     let (sender, receiver) = mpsc::channel();
-    thread::Builder::new()
+    let writer = thread::Builder::new()
         .name(format!("ClientWriter-{id}"))
         .spawn(move || write_to_client(write_stream, receiver))?;
     {
@@ -746,6 +782,7 @@ fn serve_client(
             id,
             receives_frames,
             sender,
+            writer,
         });
     }
 
@@ -818,6 +855,7 @@ fn read_from_client(
 }
 
 fn write_to_client(mut stream: UnixStream, receiver: mpsc::Receiver<Outgoing>) {
+    stream.set_write_timeout(Some(WRITE_TIMEOUT)).log_err();
     send_to_client(&mut stream, receiver);
     stream.shutdown(Shutdown::Both).ok();
 }
@@ -829,7 +867,8 @@ fn send_to_client(stream: &mut UnixStream, receiver: mpsc::Receiver<Outgoing>) {
             Outgoing::Frame(grid) => encoder.full_frame(&grid),
             Outgoing::Message(message) => message,
         };
-        if write_message(stream, &message).is_err() {
+        let is_shutdown = matches!(message, ServerMessage::Shutdown);
+        if write_message(stream, &message).is_err() || is_shutdown {
             return;
         }
     }
@@ -951,6 +990,28 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         panic!("no server event arrived");
+    }
+
+    #[test]
+    fn a_silent_client_does_not_block_later_attaches() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("server.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let hub = Arc::new(ClientHub::default());
+        let (event_sender, mut events) = unbounded();
+        thread::spawn(move || accept_clients(listener, hub, event_sender));
+
+        let _silent = UnixStream::connect(&socket).unwrap();
+        let mut attaching = UnixStream::connect(&socket).unwrap();
+        send_hello(&mut attaching, PROTOCOL_VERSION);
+        assert!(matches!(
+            next_event(&mut events),
+            ServerEvent::Resized {
+                cols: 4,
+                rows: 2,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1138,6 +1199,18 @@ mod tests {
         hub.send_last_frame_to(id, (3, 1));
         let message: ServerMessage = read_message(&mut client_reader).unwrap();
         assert_eq!(frame_size(&message), Some((3, 1)));
+    }
+
+    #[test]
+    fn shutting_down_tells_attached_clients_before_returning() {
+        let hub = Arc::new(ClientHub::default());
+        let (_, client_side, _events) = attach(&hub);
+
+        hub.shut_down();
+        assert!(hub.state.lock().clients.is_empty());
+        client_side.set_nonblocking(true).unwrap();
+        let message: ServerMessage = read_message(&mut BufReader::new(client_side)).unwrap();
+        assert_eq!(message, ServerMessage::Shutdown);
     }
 
     #[gpui::test]
