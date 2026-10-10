@@ -73,6 +73,7 @@ pub enum ClientMessage {
     Input(TermEvent),
     Resize { cols: u16, rows: u16 },
     Detach,
+    Kill,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

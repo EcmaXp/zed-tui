@@ -95,6 +95,8 @@ mod unix {
         Attach,
         #[command(about = "Run the session server in the foreground")]
         Server { paths: Vec<PathBuf> },
+        #[command(about = "Stop a session")]
+        Kill,
     }
 
     pub struct TuiServer {
@@ -141,6 +143,10 @@ mod unix {
         match cli.command {
             None => open(cli.paths, &session_paths),
             Some(Command::Attach) => attach(&session_paths),
+            Some(Command::Kill) => {
+                server::kill(&session_paths)?;
+                Ok(Outcome::Exit(0))
+            }
             Some(Command::Server { paths }) => {
                 let platform = TuiPlatform::new(DEFAULT_COLS, DEFAULT_ROWS);
                 let (session, started) = server::start_session(session_paths, platform.clone())?;

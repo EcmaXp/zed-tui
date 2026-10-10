@@ -23,7 +23,7 @@ use futures::{
     StreamExt as _,
     channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded},
 };
-use gpui::{App, CursorStyle};
+use gpui::{App, AsyncApp, CursorStyle};
 use gpui_tui::{CellGrid, TuiPlatform};
 use parking_lot::Mutex;
 use util::ResultExt as _;
@@ -194,6 +194,7 @@ enum ServerEvent {
     Resized { id: u64, cols: u16, rows: u16 },
     Disconnected { id: u64 },
     Input(TermEvent),
+    Kill,
 }
 
 pub struct Started {
@@ -276,7 +277,7 @@ pub fn start_session(
             move |grid| hub.broadcast_frame(Arc::new(grid))
         }),
         after_start: Box::new(move |cx| {
-            cx.spawn(async move |_| handle_events(platform, hub, event_receiver).await)
+            cx.spawn(async move |cx| handle_events(platform, hub, event_receiver, cx).await)
                 .detach();
         }),
     };
@@ -291,12 +292,13 @@ async fn handle_events(
     platform: Rc<TuiPlatform>,
     hub: Arc<ClientHub>,
     mut events: UnboundedReceiver<ServerEvent>,
+    cx: &mut AsyncApp,
 ) {
     let mut sizes: HashMap<u64, (u16, u16)> = HashMap::default();
     let mut translator = InputTranslator::default();
 
     while let Some(event) = events.next().await {
-        handle_event(event, &platform, &hub, &mut sizes, &mut translator);
+        handle_event(event, &platform, &hub, &mut sizes, &mut translator, cx);
     }
 }
 
@@ -306,6 +308,7 @@ fn handle_event(
     hub: &Arc<ClientHub>,
     sizes: &mut HashMap<u64, (u16, u16)>,
     translator: &mut InputTranslator,
+    cx: &mut AsyncApp,
 ) {
     match event {
         ServerEvent::Resized { id, cols, rows } => {
@@ -327,6 +330,9 @@ fn handle_event(
                     Translated::Text(text) => platform.insert_text(&text),
                 }
             }
+        }
+        ServerEvent::Kill => {
+            cx.update(|cx| cx.quit());
         }
     }
 }
@@ -393,12 +399,16 @@ fn serve_client(
             if version != PROTOCOL_VERSION {
                 let error = format!(
                     "the session runs protocol {PROTOCOL_VERSION} but this zed speaks {version}; \
-                     stop the session server and start it again"
+                     restart the session with `zed --tui kill`"
                 );
                 write_message(&mut &write_stream, &ServerMessage::Error(error)).log_err();
                 bail!("client speaks protocol {version}, expected {PROTOCOL_VERSION}");
             }
             (cols, rows)
+        }
+        ClientMessage::Kill => {
+            events.unbounded_send(ServerEvent::Kill).log_err();
+            return Ok(());
         }
         other => bail!("expected a hello message, got {other:?}"),
     };
@@ -458,6 +468,7 @@ fn read_from_client(
                 ServerEvent::Input(event)
             }
             Ok(ClientMessage::Resize { cols, rows }) => ServerEvent::Resized { id, cols, rows },
+            Ok(ClientMessage::Kill) => ServerEvent::Kill,
             Ok(ClientMessage::Detach) => return true,
             Ok(ClientMessage::Hello { .. }) => continue,
             Err(error) => {
@@ -522,6 +533,16 @@ pub fn spawn_daemon(session_paths: &SessionPaths, paths: &[PathBuf]) -> Result<(
     )
 }
 
+pub fn kill(session_paths: &SessionPaths) -> Result<()> {
+    send(session_paths, &ClientMessage::Kill)
+}
+
+fn send(session_paths: &SessionPaths, message: &ClientMessage) -> Result<()> {
+    let mut stream = UnixStream::connect(&session_paths.socket)
+        .with_context(|| format!("session {:?} is not running", session_paths.name))?;
+    write_message(&mut stream, message)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,7 +590,7 @@ mod tests {
         send_hello(&mut client_side, PROTOCOL_VERSION - 1);
         assert!(serve_client(server_side, &hub, &event_sender).is_err());
         let reply: ServerMessage = read_message(&mut client_side).unwrap();
-        assert!(matches!(reply, ServerMessage::Error(error) if error.contains("protocol")));
+        assert!(matches!(reply, ServerMessage::Error(error) if error.contains("zed --tui kill")));
     }
 
     #[test]
@@ -581,6 +602,17 @@ mod tests {
         create_private_dir(&session).unwrap();
         let mode = fs::metadata(&session).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn a_kill_from_a_client_that_already_closed_still_arrives() {
+        let hub = Arc::new(ClientHub::default());
+        let (event_sender, mut events) = unbounded();
+        let (server_side, mut client_side) = UnixStream::pair().unwrap();
+        write_message(&mut client_side, &ClientMessage::Kill).unwrap();
+        drop(client_side);
+        serve_client(server_side, &hub, &event_sender).unwrap();
+        assert!(matches!(next_event(&mut events), ServerEvent::Kill));
     }
 
     #[test]
