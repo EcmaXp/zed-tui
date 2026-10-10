@@ -163,7 +163,9 @@ impl Render for ZedPromptRenderer {
                 .occlude()
                 .absolute()
                 .inset_0()
-                .bg(gpui::black().opacity(0.2))
+                .when(window.text_system().cell_size().is_none(), |this| {
+                    this.bg(gpui::black().opacity(0.2))
+                })
                 .map(|this| match decorations {
                     Decorations::Server => this,
                     Decorations::Client { tiling } => this
