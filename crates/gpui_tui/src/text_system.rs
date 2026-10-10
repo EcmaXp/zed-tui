@@ -6,7 +6,8 @@ use gpui::{
     LineLayout, Pixels, PlatformTextSystem, Point, RenderGlyphParams, ShapedGlyph, ShapedRun, Size,
     TextRenderingMode, point, px, size,
 };
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{CELL_WIDTH, grid::Glyph, size_for_cells};
 
@@ -35,6 +36,10 @@ pub fn char_cells(ch: char) -> usize {
 
 fn glyph_cells(glyph_id: GlyphId) -> usize {
     Glyph::from_glyph_id(glyph_id).map_or(1, Glyph::cells)
+}
+
+pub(crate) fn cluster_cells(cluster: &str) -> usize {
+    UnicodeWidthStr::width(cluster).min(2)
 }
 
 impl PlatformTextSystem for TuiTextSystem {
@@ -119,7 +124,7 @@ impl PlatformTextSystem for TuiTextSystem {
         });
         let mut run = run_ends.next();
         let mut glyphs = Vec::new();
-        for (index, ch) in text.char_indices() {
+        for (index, cluster) in text.grapheme_indices(true) {
             while let Some((run_end, font_id)) = run
                 && index >= run_end
             {
@@ -134,14 +139,14 @@ impl PlatformTextSystem for TuiTextSystem {
             if run.is_none() {
                 break;
             }
-            let cells = char_cells(ch);
-            if ch.is_control() {
-                position += px(CELL_WIDTH * cells as f32);
+            if cluster.starts_with(char::is_control) {
+                position += px(CELL_WIDTH * cluster.chars().map(char_cells).sum::<usize>() as f32);
                 continue;
             }
+            let cells = cluster_cells(cluster);
             if cells > 0 {
                 glyphs.push(ShapedGlyph {
-                    id: Glyph::from_char(ch).to_glyph_id(),
+                    id: Glyph::from_cluster(cluster).to_glyph_id(),
                     position: point(position, px(0.)),
                     index,
                     is_emoji: false,
@@ -210,6 +215,74 @@ mod tests {
             .collect();
         assert_eq!(positions, vec![0., CELL_WIDTH, CELL_WIDTH * 3.]);
         assert_eq!(layout.width, px(CELL_WIDTH * 4.));
+    }
+
+    fn shaped(text: &str, runs: &[usize]) -> (Vec<(usize, String, f32, usize)>, Pixels) {
+        let runs: Vec<FontRun> = runs
+            .iter()
+            .enumerate()
+            .map(|(font, len)| FontRun {
+                len: *len,
+                font_id: FontId(font),
+            })
+            .collect();
+        let layout = TuiTextSystem.layout_line(text, px(12.), &runs);
+        let glyphs = layout
+            .runs
+            .iter()
+            .flat_map(|run| {
+                run.glyphs.iter().map(|glyph| {
+                    let mut text = String::new();
+                    Glyph::from_glyph_id(glyph.id).unwrap().push_to(&mut text);
+                    (run.font_id.0, text, glyph.position.x.as_f32(), glyph.index)
+                })
+            })
+            .collect();
+        (glyphs, layout.width)
+    }
+
+    #[test]
+    fn grapheme_clusters_are_one_glyph_holding_their_whole_text() {
+        let text = "cafe\u{301}👩\u{200d}💻❤\u{fe0f}한x";
+        let (glyphs, width) = shaped(text, &[text.len()]);
+        let clusters: Vec<(&str, f32)> = glyphs
+            .iter()
+            .map(|(_, text, x, _)| (text.as_str(), *x / CELL_WIDTH))
+            .collect();
+        assert_eq!(
+            clusters,
+            [
+                ("c", 0.),
+                ("a", 1.),
+                ("f", 2.),
+                ("e\u{301}", 3.),
+                ("👩\u{200d}💻", 4.),
+                ("❤\u{fe0f}", 6.),
+                ("한", 8.),
+                ("x", 10.),
+            ]
+        );
+        assert_eq!(width, px(CELL_WIDTH * 11.));
+        let indices: Vec<usize> = glyphs.iter().map(|glyph| glyph.3).collect();
+        assert_eq!(indices, [0, 1, 2, 3, 6, 17, 23, 26]);
+    }
+
+    #[test]
+    fn style_runs_that_split_a_cluster_keep_it_whole() {
+        let text = "ae\u{301}b";
+        let (glyphs, _) = shaped(text, &[2, text.len() - 2]);
+        let runs: Vec<(usize, &str)> = glyphs
+            .iter()
+            .map(|(font, text, _, _)| (*font, text.as_str()))
+            .collect();
+        assert_eq!(runs, [(0, "a"), (0, "e\u{301}"), (1, "b")]);
+    }
+
+    #[test]
+    fn zero_width_text_alone_takes_no_cell() {
+        let (glyphs, width) = shaped("\u{200b}x", &["\u{200b}x".len()]);
+        assert_eq!(glyphs.len(), 1);
+        assert_eq!(width, px(CELL_WIDTH));
     }
 
     #[test]

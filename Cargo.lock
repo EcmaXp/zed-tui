@@ -7760,6 +7760,7 @@ dependencies = [
  "open",
  "parking_lot",
  "raw-window-handle",
+ "unicode-segmentation",
  "unicode-width 0.2.2",
  "uuid",
 ]

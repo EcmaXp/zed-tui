@@ -203,3 +203,31 @@ fn only_the_active_window_reaches_the_screen() {
     assert_eq!(shown(1), ["first"]);
     assert_eq!(shown(2), ["second"]);
 }
+
+struct Banner(String);
+
+impl Render for Banner {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.0.clone())
+    }
+}
+
+#[test]
+fn combining_and_zwj_text_reach_the_frame() {
+    let grid = first_frame(TuiPlatform::new(20, 2), |cx: &mut App| {
+        cx.open_window(WindowOptions::default(), |_, cx| {
+            cx.new(|_| Banner("cafe\u{301} 👩\u{200d}💻 x".into()))
+        })
+        .expect("failed to open window");
+    });
+    assert_eq!(grid.row_text(0).trim_end(), "cafe\u{301} 👩\u{200d}💻 x");
+    let zwj = grid.cell(5, 0).expect("cell");
+    assert_eq!(zwj.glyph.cells(), 2);
+    assert!(
+        grid.cell(6, 0)
+            .expect("cell")
+            .attrs
+            .contains(gpui_tui::CellAttrs::WIDE_CONTINUATION)
+    );
+    assert_eq!(grid.cell(8, 0).expect("cell").glyph, 'x');
+}

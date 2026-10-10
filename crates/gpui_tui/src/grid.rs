@@ -1,8 +1,13 @@
-use std::{fmt, io};
+use std::{
+    fmt, io,
+    sync::{Arc, LazyLock},
+};
 
+use collections::HashMap;
 use gpui::{GlyphId, Hsla, Rgba};
+use parking_lot::RwLock;
 
-use crate::text_system::char_cells;
+use crate::text_system::{char_cells, cluster_cells};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Rgb {
@@ -62,6 +67,16 @@ bitflags::bitflags! {
     }
 }
 
+const FIRST_CLUSTER_ID: u32 = 0x11_0000;
+
+#[derive(Default)]
+struct ClusterTable {
+    ids: HashMap<Arc<str>, u32>,
+    clusters: Vec<(Arc<str>, u8)>,
+}
+
+static CLUSTERS: LazyLock<RwLock<ClusterTable>> = LazyLock::new(RwLock::default);
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Glyph(u32);
 
@@ -70,9 +85,37 @@ impl Glyph {
         Self(ch as u32)
     }
 
+    pub fn from_cluster(cluster: &str) -> Self {
+        let mut chars = cluster.chars();
+        let Some(first) = chars.next() else {
+            return Self::from_char(' ');
+        };
+        if chars.next().is_none() {
+            return Self::from_char(first);
+        }
+        if let Some(id) = CLUSTERS.read().ids.get(cluster) {
+            return Self(*id);
+        }
+        let mut table = CLUSTERS.write();
+        if let Some(id) = table.ids.get(cluster) {
+            return Self(*id);
+        }
+        let Some(id) = u32::try_from(table.clusters.len())
+            .ok()
+            .and_then(|index| FIRST_CLUSTER_ID.checked_add(index))
+        else {
+            return Self::from_char(first);
+        };
+        let cells = cluster_cells(cluster).max(1) as u8;
+        let cluster: Arc<str> = cluster.into();
+        table.clusters.push((cluster.clone(), cells));
+        table.ids.insert(cluster, id);
+        Self(id)
+    }
+
     pub fn from_glyph_id(id: GlyphId) -> Option<Self> {
         let glyph = Self(id.0);
-        glyph.as_char().is_some().then_some(glyph)
+        (glyph.as_char().is_some() || glyph.cluster_cells().is_some()).then_some(glyph)
     }
 
     pub fn to_glyph_id(self) -> GlyphId {
@@ -88,13 +131,19 @@ impl Glyph {
     }
 
     pub fn cells(self) -> usize {
-        self.as_char().map_or(1, char_cells)
+        match self.as_char() {
+            Some(ch) => char_cells(ch),
+            None => self.cluster_cells().map_or(1, usize::from),
+        }
     }
 
     pub fn with_str<R>(self, f: impl FnOnce(&str) -> R) -> R {
         match self.as_char() {
             Some(ch) => f(ch.encode_utf8(&mut [0; 4])),
-            None => f(" "),
+            None => match self.cluster() {
+                Some((cluster, _)) => f(&cluster),
+                None => f(" "),
+            },
         }
     }
 
@@ -104,6 +153,20 @@ impl Glyph {
 
     pub fn write_to(self, output: &mut impl io::Write) -> io::Result<()> {
         self.with_str(|text| output.write_all(text.as_bytes()))
+    }
+
+    fn cluster(self) -> Option<(Arc<str>, u8)> {
+        let index = self.0.checked_sub(FIRST_CLUSTER_ID)?;
+        CLUSTERS.read().clusters.get(index as usize).cloned()
+    }
+
+    fn cluster_cells(self) -> Option<u8> {
+        let index = self.0.checked_sub(FIRST_CLUSTER_ID)?;
+        CLUSTERS
+            .read()
+            .clusters
+            .get(index as usize)
+            .map(|(_, cells)| *cells)
     }
 }
 
@@ -236,6 +299,30 @@ impl CellGrid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clusters_keep_their_whole_text_past_sixty_five_thousand_entries() {
+        for index in 0..70_000u32 {
+            let mut cluster = String::from("a");
+            for bit in 0..17 {
+                cluster.push(if index & (1 << bit) == 0 {
+                    '\u{301}'
+                } else {
+                    '\u{302}'
+                });
+            }
+            let mut text = String::new();
+            Glyph::from_cluster(&cluster).push_to(&mut text);
+            assert_eq!(text, cluster);
+        }
+        for cluster in ["e\u{301}", "👩\u{200d}💻", "❤\u{fe0f}"] {
+            let glyph = Glyph::from_cluster(cluster);
+            let mut text = String::new();
+            glyph.push_to(&mut text);
+            assert_eq!(text, cluster);
+            assert_eq!(Glyph::from_glyph_id(glyph.to_glyph_id()), Some(glyph));
+        }
+    }
 
     #[test]
     fn blending_respects_alpha() {
