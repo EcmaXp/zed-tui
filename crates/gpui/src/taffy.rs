@@ -62,6 +62,9 @@ impl TaffyLayoutEngine {
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
         self.computed_layouts.clear();
+        if let Some(cell_snapper) = &mut self.cell_snapper {
+            cell_snapper.clear();
+        }
     }
 
     pub fn set_cell_size(&mut self, cell_size: Option<Size<Pixels>>, scale_factor: f32) {
@@ -400,7 +403,7 @@ impl TaffyLayoutEngine {
             absolute_far.map(round_half_toward_zero),
         );
         let snapped_bounds = match &self.cell_snapper {
-            Some(cells) => cells.snap_bounds(absolute_outer_origin, absolute_far, layout_size),
+            Some(cells) => cells.snap_bounds(id, absolute_outer_origin, absolute_far, layout_size),
             None => snapped_bounds,
         };
 

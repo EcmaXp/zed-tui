@@ -130,6 +130,104 @@ fn collapsed_frames_do_not_draw_rules_between_text_on_their_edge_rows() {
     assert_eq!(rows, ["┌Run Debug ┐", "└Spawn     ┘"], "{}", grid.text());
 }
 
+#[derive(Clone, Copy)]
+enum Leading {
+    Nothing,
+    HiddenItem,
+    Divider,
+}
+
+#[derive(Default)]
+struct GapBounds {
+    child_lefts: Vec<Pixels>,
+    divider: Option<Bounds<Pixels>>,
+}
+
+struct GapRow {
+    padding: Pixels,
+    leading: Leading,
+    bounds: Rc<RefCell<GapBounds>>,
+}
+
+impl Render for GapRow {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        self.bounds.take();
+        let bounds = self.bounds.clone();
+        let leading = match self.leading {
+            Leading::Nothing => None,
+            Leading::HiddenItem => Some(div().child(div().hidden()).into_any_element()),
+            Leading::Divider => Some(
+                canvas(
+                    move |divider, _, _| bounds.borrow_mut().divider = Some(divider),
+                    |_, _, _, _| {},
+                )
+                .w(px(1.))
+                .h(px(16.))
+                .into_any_element(),
+            ),
+        };
+        div()
+            .flex()
+            .gap(px(2.5))
+            .children(leading)
+            .children((0..3).map(|_| {
+                let bounds = self.bounds.clone();
+                div().px(self.padding).child(
+                    canvas(
+                        move |child, _, _| bounds.borrow_mut().child_lefts.push(child.origin.x),
+                        |_, _, _, _| {},
+                    )
+                    .w(px(8.))
+                    .h(px(16.)),
+                )
+            }))
+    }
+}
+
+fn gap_bounds(padding: Pixels, leading: Leading) -> GapBounds {
+    let bounds: Rc<RefCell<GapBounds>> = Rc::default();
+    first_frame(TuiPlatform::new(25, 1), {
+        let bounds = bounds.clone();
+        move |cx: &mut App| {
+            cx.open_window(WindowOptions::default(), |_, cx| {
+                cx.new(|_| GapRow {
+                    padding,
+                    leading,
+                    bounds,
+                })
+            })
+            .expect("failed to open window");
+        }
+    });
+    bounds.take()
+}
+
+#[test]
+fn gaps_collapse_only_between_padded_children() {
+    assert_eq!(
+        gap_bounds(px(2.), Leading::Nothing).child_lefts,
+        [8., 32., 56.].map(px)
+    );
+    assert_eq!(
+        gap_bounds(px(0.), Leading::Nothing).child_lefts,
+        [0., 16., 32.].map(px)
+    );
+    assert_eq!(
+        gap_bounds(px(2.), Leading::HiddenItem).child_lefts,
+        [8., 32., 56.].map(px)
+    );
+    let with_divider = gap_bounds(px(2.), Leading::Divider);
+    assert_eq!(with_divider.child_lefts, [16., 40., 64.].map(px));
+    assert_eq!(
+        with_divider.divider,
+        Some(Bounds::new(point(px(3.5), px(0.)), size(px(1.), px(16.))))
+    );
+    assert_eq!(
+        gap_bounds(px(0.), Leading::Divider).child_lefts,
+        [16., 32., 48.].map(px)
+    );
+}
+
 #[derive(Debug, Default, PartialEq)]
 struct ActiveWindows {
     platform: Option<AnyWindowHandle>,
