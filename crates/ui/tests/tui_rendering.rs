@@ -4,7 +4,7 @@ use std::{cell::RefCell, rc::Rc};
 
 use gpui::{Application, KeybindingKeystroke, Keystroke, WindowOptions};
 use gpui_tui::{CellGrid, TuiPlatform};
-use ui::{KeyBinding, prelude::*};
+use ui::{KeyBinding, KeybindingHint, prelude::*};
 
 fn keybinding(source: &str) -> KeyBinding {
     let keystrokes = source
@@ -48,6 +48,27 @@ fn first_frame(cols: u16, rows: Rows) -> CellGrid {
     let mut frames = frames.borrow_mut();
     assert!(!frames.is_empty(), "no frame was presented");
     frames.remove(0)
+}
+
+#[test]
+fn keybinding_hint_keys_sit_inline_on_a_cell_grid() {
+    let grid = first_frame(
+        40,
+        Rows(vec![Box::new(|cx| {
+            KeybindingHint::new(
+                keybinding("ctrl-shift-e"),
+                cx.theme().colors().surface_background,
+            )
+            .suffix("Focus Content")
+            .into_any_element()
+        })]),
+    );
+    assert_eq!(
+        grid.row_text(0).trim_end(),
+        " Ctrl-Shift-E Focus Content",
+        "{}",
+        grid.text()
+    );
 }
 
 #[test]
