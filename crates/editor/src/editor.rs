@@ -1927,6 +1927,11 @@ impl Editor {
         if !self.mode.is_full() {
             return;
         }
+        if !EditorSettings::get_global(cx).sticky_scroll.enabled {
+            self.sticky_headers_task = Task::ready(());
+            self.sticky_headers = None;
+            return;
+        }
         let multi_buffer = display_snapshot.buffer_snapshot().clone();
         let scroll_anchor = self
             .scroll_manager
@@ -10423,6 +10428,12 @@ impl Editor {
 
             if language_settings_changed || accents_changed {
                 self.colorize_brackets(true, cx);
+            }
+
+            if EditorSettings::get_global(cx).sticky_scroll.enabled && self.sticky_headers.is_none()
+            {
+                let snapshot = self.snapshot(window, cx);
+                self.refresh_sticky_headers(&snapshot, cx);
             }
 
             if language_settings_changed {

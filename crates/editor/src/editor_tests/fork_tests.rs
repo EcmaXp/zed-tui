@@ -1,6 +1,14 @@
 use super::*;
 use pretty_assertions::assert_eq;
 
+pub(super) fn enable_sticky_scroll(cx: &mut TestAppContext) {
+    update_test_editor_settings(cx, &|settings| {
+        settings.sticky_scroll = Some(settings::StickyScrollContent {
+            enabled: Some(true),
+        });
+    });
+}
+
 #[gpui::test]
 async fn test_highlight_background_without_ranges_before_or_after_does_not_notify(
     cx: &mut TestAppContext,
@@ -341,6 +349,48 @@ async fn test_transactions_unfold_the_buffer_holding_the_cursor(cx: &mut TestApp
             .map(|excerpt| editor.is_buffer_folded(excerpt.context.start.buffer_id, cx))
             .collect::<Vec<_>>();
         assert_eq!(folded, [false, true]);
+    });
+}
+
+#[gpui::test]
+async fn test_sticky_headers_are_only_computed_while_sticky_scroll_is_enabled(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.set_state(indoc! {"
+        ˇfn foo() {
+            let abc = 123;
+            let def = 456;
+        }
+    "});
+    cx.update_editor(|editor, _, cx| {
+        editor
+            .buffer()
+            .read(cx)
+            .as_singleton()
+            .unwrap()
+            .update(cx, |buffer, cx| {
+                buffer.set_language(Some(rust_lang()), cx);
+            })
+    });
+
+    cx.update_editor(|editor, window, cx| {
+        editor.scroll(gpui::Point { x: 0., y: 1. }, window, cx);
+    });
+    cx.run_until_parked();
+    cx.update_editor(|editor, _, _| {
+        assert_eq!(editor.sticky_headers, None);
+    });
+
+    enable_sticky_scroll(&mut cx);
+    cx.run_until_parked();
+    cx.update_editor(|editor, window, cx| {
+        let header_starts = EditorElement::sticky_headers(editor, &editor.snapshot(window, cx))
+            .into_iter()
+            .map(|header| header.start_point)
+            .collect::<Vec<_>>();
+        assert_eq!(header_starts, vec![Point::new(0, 0)]);
     });
 }
 

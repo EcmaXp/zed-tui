@@ -43781,6 +43781,7 @@ async fn test_end_of_editor_context(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn test_sticky_scroll(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
+    fork_tests::enable_sticky_scroll(cx);
     let mut cx = EditorTestContext::new(cx).await;
 
     let buffer = indoc! {"
@@ -43857,6 +43858,7 @@ async fn test_sticky_scroll(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn test_sticky_scroll_with_decoration_prefix_in_item(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
+    fork_tests::enable_sticky_scroll(cx);
     let mut cx = EditorTestContext::new(cx).await;
 
     let language = Arc::new(
@@ -43929,6 +43931,7 @@ async fn test_sticky_scroll_with_decoration_prefix_in_item(cx: &mut TestAppConte
 #[gpui::test]
 async fn test_sticky_scroll_anchors_multiline_c_signature_on_name_row(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
+    fork_tests::enable_sticky_scroll(cx);
     let mut cx = EditorTestContext::new(cx).await;
 
     let buffer = indoc! {"
@@ -43992,6 +43995,7 @@ async fn test_sticky_scroll_with_expanded_deleted_diff_hunks(
     cx: &mut TestAppContext,
 ) {
     init_test(cx, |_| {});
+    fork_tests::enable_sticky_scroll(cx);
     let mut cx = EditorTestContext::new(cx).await;
 
     let diff_base = indoc! {"
@@ -44078,6 +44082,7 @@ async fn test_sticky_scroll_with_expanded_deleted_diff_hunks(
 #[gpui::test]
 async fn test_no_duplicated_sticky_headers(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
+    fork_tests::enable_sticky_scroll(cx);
     let mut cx = EditorTestContext::new(cx).await;
 
     cx.set_state(indoc! {"
