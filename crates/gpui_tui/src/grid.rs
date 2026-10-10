@@ -65,6 +65,8 @@ bitflags::bitflags! {
         const UNDERLINE = 1 << 2;
         const CURLY_UNDERLINE = 1 << 3;
         const WIDE_CONTINUATION = 1 << 4;
+        const DEFAULT_BACKGROUND = 1 << 5;
+        const DEFAULT_FOREGROUND = 1 << 6;
     }
 }
 
@@ -306,6 +308,18 @@ impl CellGrid {
             })
     }
 
+    pub fn mark_default_colors(&mut self, backgrounds: &[Rgb], foregrounds: &[Rgb]) {
+        for cell in &mut self.cells {
+            let default_background = backgrounds.contains(&cell.bg);
+            cell.attrs
+                .set(CellAttrs::DEFAULT_BACKGROUND, default_background);
+            cell.attrs.set(
+                CellAttrs::DEFAULT_FOREGROUND,
+                default_background && foregrounds.contains(&cell.fg),
+            );
+        }
+    }
+
     pub fn text(&self) -> String {
         (0..self.rows)
             .map(|row| self.row_text(row).trim_end().to_string())
@@ -342,6 +356,53 @@ mod tests {
         assert_eq!(underline, UnderlineColor::of(color));
         assert_eq!(underline.rgb(), Some(color));
         assert_eq!(UnderlineColor::default().rgb(), None);
+    }
+
+    #[test]
+    fn default_text_color_is_only_used_on_default_backgrounds() {
+        let editor = Rgb::new(40, 44, 51);
+        let popup = Rgb::new(47, 52, 62);
+        let text = Rgb::new(220, 223, 228);
+        let mut grid = CellGrid::new(2, 1, editor);
+        for cell in grid.row_mut(0) {
+            cell.fg = text;
+        }
+        if let Some(cell) = grid.cell_mut(1, 0) {
+            cell.bg = popup;
+        }
+        grid.mark_default_colors(&[editor], &[text]);
+        let flagged: Vec<bool> = grid
+            .row(0)
+            .iter()
+            .map(|cell| cell.attrs.contains(CellAttrs::DEFAULT_FOREGROUND))
+            .collect();
+        assert_eq!(flagged, vec![true, false]);
+    }
+
+    #[test]
+    fn mark_default_background_flags_only_matching_cells() {
+        let editor = Rgb::new(40, 44, 51);
+        let mut grid = CellGrid::new(3, 1, editor);
+        if let Some(cell) = grid.cell_mut(1, 0) {
+            cell.bg = Rgb::new(47, 52, 62);
+        }
+        grid.mark_default_colors(&[editor], &[]);
+        let flagged = |grid: &CellGrid| {
+            grid.row(0)
+                .iter()
+                .map(|cell| cell.attrs.contains(CellAttrs::DEFAULT_BACKGROUND))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(flagged(&grid), vec![true, false, true]);
+
+        if let Some(cell) = grid.cell_mut(0, 0) {
+            cell.bg = Rgb::new(1, 2, 3);
+        }
+        grid.mark_default_colors(&[editor], &[]);
+        assert_eq!(flagged(&grid), vec![false, false, true]);
+
+        grid.mark_default_colors(&[editor, Rgb::new(47, 52, 62)], &[]);
+        assert_eq!(flagged(&grid), vec![false, true, true]);
     }
 
     #[test]
