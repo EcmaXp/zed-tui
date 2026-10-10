@@ -567,7 +567,7 @@ impl<W: Write> Renderer<W> {
 
     fn apply(&mut self, message: &ServerMessage) -> io::Result<bool> {
         match message {
-            ServerMessage::FullFrame(..) => {
+            ServerMessage::FullFrame(..) | ServerMessage::Diff(..) => {
                 self.decoder.apply(&mut self.grid, message);
                 return Ok(true);
             }
@@ -774,6 +774,7 @@ fn exit_of(message: &ServerMessage) -> Option<Exit> {
             errors: errors.clone(),
         }),
         ServerMessage::FullFrame(..)
+        | ServerMessage::Diff(..)
         | ServerMessage::Clipboard(_)
         | ServerMessage::Title(_)
         | ServerMessage::Pointer(_) => None,
@@ -1824,7 +1825,8 @@ mod tests {
     fn full_frame(cols: u16, rows: u16) -> RenderEvent {
         let mut grid = CellGrid::new(cols, rows, Rgb::new(40, 44, 52));
         text_row(&mut grid, 0, 0, "hello");
-        RenderEvent::Server(crate::tui::protocol::FrameEncoder.full_frame(&grid))
+        let mut encoder = crate::tui::protocol::FrameEncoder;
+        RenderEvent::Server(encoder.update(None, &grid).unwrap())
     }
 
     #[test]

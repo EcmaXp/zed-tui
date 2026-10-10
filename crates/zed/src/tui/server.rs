@@ -874,7 +874,8 @@ fn write_to_client(mut stream: UnixStream, receiver: mpsc::Receiver<Outgoing>) {
 
 fn send_to_client(stream: &mut UnixStream, receiver: mpsc::Receiver<Outgoing>) {
     let mut writer = MessageWriter::default();
-    let encoder = FrameEncoder;
+    let mut encoder = FrameEncoder;
+    let mut last_sent: Option<Arc<CellGrid>> = None;
     let mut newest_frame: Option<Arc<CellGrid>> = None;
     let mut frames_in_flight: u32 = 0;
     while let Ok(first) = receiver.recv() {
@@ -897,9 +898,12 @@ fn send_to_client(stream: &mut UnixStream, receiver: mpsc::Receiver<Outgoing>) {
         if frames_in_flight < MAX_FRAMES_IN_FLIGHT
             && let Some(grid) = newest_frame.take()
         {
-            if writer.push(&encoder.full_frame(&grid)).log_err().is_some() {
+            if let Some(update) = encoder.update(last_sent.as_deref(), &grid)
+                && writer.push(&update).log_err().is_some()
+            {
                 frames_in_flight += 1;
             }
+            last_sent = Some(grid);
         }
         if writer.flush(stream).is_err() {
             return;
@@ -1159,7 +1163,7 @@ mod tests {
         }
         hub.broadcast_frame(Arc::new(second.clone()));
         let message: ServerMessage = read_message(&mut client_reader).unwrap();
-        assert!(matches!(message, ServerMessage::FullFrame(..)));
+        assert!(matches!(message, ServerMessage::Diff(..)));
         decoder.apply(&mut mirrored, &message);
         assert_eq!(mirrored.as_ref(), Some(&second));
 

@@ -260,6 +260,23 @@ impl Cell {
                 .attrs
                 .intersects(CellAttrs::UNDERLINE | CellAttrs::WIDE_CONTINUATION)
     }
+
+    pub fn appearance(&self) -> Cell {
+        if self.is_plain_blank() {
+            Cell {
+                fg: Rgb::default(),
+                attrs: self.attrs & CellAttrs::DEFAULT_BACKGROUND,
+                underline: UnderlineColor::default(),
+                ..*self
+            }
+        } else {
+            *self
+        }
+    }
+
+    pub fn looks_like(&self, other: &Cell) -> bool {
+        self == other || self.appearance() == other.appearance()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -444,6 +461,28 @@ mod tests {
         assert_eq!(underline, UnderlineColor::of(color));
         assert_eq!(underline.rgb(), Some(color));
         assert_eq!(UnderlineColor::default().rgb(), None);
+    }
+
+    #[test]
+    fn blanks_that_differ_only_in_invisible_attributes_look_alike() {
+        let editor = Rgb::new(40, 44, 51);
+        let mut grid = CellGrid::new(2, 1, editor);
+        if let Some(cell) = grid.cell_mut(1, 0) {
+            cell.fg = Rgb::new(1, 2, 3);
+            cell.attrs = CellAttrs::BOLD | CellAttrs::ITALIC;
+        }
+        grid.mark_default_colors(&[editor], &[Rgb::new(255, 255, 255)]);
+        let row = grid.row(0);
+        assert!(row[0].attrs.contains(CellAttrs::DEFAULT_FOREGROUND));
+        assert!(!row[1].attrs.contains(CellAttrs::DEFAULT_FOREGROUND));
+        assert!(row[0].looks_like(&row[1]));
+
+        let mut underlined = row[1];
+        underlined.attrs.insert(CellAttrs::UNDERLINE);
+        assert!(!row[0].looks_like(&underlined));
+        let mut other_background = row[1];
+        other_background.attrs.remove(CellAttrs::DEFAULT_BACKGROUND);
+        assert!(!row[0].looks_like(&other_background));
     }
 
     #[test]

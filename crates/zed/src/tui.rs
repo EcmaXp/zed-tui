@@ -1,6 +1,8 @@
 #[cfg(unix)]
 mod client;
 #[cfg(unix)]
+mod frame_diff;
+#[cfg(unix)]
 mod icon_glyphs;
 #[cfg(unix)]
 mod input;

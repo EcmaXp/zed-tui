@@ -10,9 +10,12 @@ use gpui_tui::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+use crate::tui::frame_diff::changed_ranges;
+
 pub const PROTOCOL_VERSION: u32 = 15;
 pub const WAIT_ONLY_SIZE: (u16, u16) = (0, 0);
 const MAX_MESSAGE_LEN: usize = 64 * 1024 * 1024;
+const PATCH_MERGE_GAP: usize = 8;
 const CONTINUATION: char = '\0';
 const CLUSTER_EXTEND: char = '\u{1}';
 
@@ -120,6 +123,7 @@ pub enum ServerMessage {
         Vec<RowPatch>,
         #[serde(with = "wire_cursor")] FrameCursor,
     ),
+    Diff(Vec<RowPatch>, #[serde(with = "wire_cursor")] FrameCursor),
     Clipboard(String),
     Title(String),
     Shutdown,
@@ -329,11 +333,35 @@ fn decode_spans<'a>(
 pub struct FrameEncoder;
 
 impl FrameEncoder {
-    pub fn full_frame(&self, grid: &CellGrid) -> ServerMessage {
+    fn full_frame(&self, grid: &CellGrid) -> ServerMessage {
         let patches = (0..grid.rows)
             .map(|row| RowPatch(row, 0, encode_cells(grid.row(row))))
             .collect();
         ServerMessage::FullFrame(grid.cols, grid.rows, patches, frame_cursor(grid))
+    }
+
+    pub fn update(
+        &mut self,
+        previous: Option<&CellGrid>,
+        next: &CellGrid,
+    ) -> Option<ServerMessage> {
+        let previous = match previous {
+            Some(previous) if previous.cols == next.cols && previous.rows == next.rows => previous,
+            _ => return Some(self.full_frame(next)),
+        };
+        let mut patches = Vec::new();
+        for row in 0..next.rows {
+            let cells = next.row(row);
+            for range in changed_ranges(previous.row(row), cells, PATCH_MERGE_GAP) {
+                if let Some(changed) = cells.get(range.clone()) {
+                    patches.push(RowPatch(row, range.start as u16, encode_cells(changed)));
+                }
+            }
+        }
+        if patches.is_empty() && frame_cursor(previous) == frame_cursor(next) {
+            return None;
+        }
+        Some(ServerMessage::Diff(patches, frame_cursor(next)))
     }
 }
 
@@ -359,6 +387,12 @@ impl FrameDecoder {
                 self.apply_patches(&mut frame, patches);
                 set_frame_cursor(&mut frame, *cursor);
                 *grid = Some(frame);
+            }
+            ServerMessage::Diff(patches, cursor) => {
+                if let Some(grid) = grid {
+                    self.apply_patches(grid, patches);
+                    set_frame_cursor(grid, *cursor);
+                }
             }
             ServerMessage::Clipboard(_)
             | ServerMessage::Title(_)
@@ -445,16 +479,19 @@ mod tests {
             cell.underline = UnderlineColor::of(if col < 3 { red } else { blue });
         }
         let mut decoded = None;
-        let message = FrameEncoder.full_frame(&grid);
+        let message = FrameEncoder.update(None, &grid).unwrap();
         FrameDecoder.apply(&mut decoded, &message);
         assert_eq!(decoded.as_ref(), Some(&grid));
     }
 
-    fn assert_same_cells(actual: &CellGrid, expected: &CellGrid) {
+    fn assert_looks_like(actual: &CellGrid, expected: &CellGrid) {
         assert_eq!((actual.cols, actual.rows), (expected.cols, expected.rows));
         assert_eq!(frame_cursor(actual), frame_cursor(expected));
         for (index, (actual, expected)) in actual.cells.iter().zip(&expected.cells).enumerate() {
-            assert_eq!(actual, expected, "cell {index}");
+            assert!(
+                actual.looks_like(expected),
+                "cell {index}: {actual:?} != {expected:?}"
+            );
         }
     }
 
@@ -487,18 +524,56 @@ mod tests {
     }
 
     #[test]
-    fn cursor_shapes_reach_the_client_in_full_frames() {
+    fn diffs_reproduce_the_full_frame() {
+        let first = sample_grid();
+        let mut second = first.clone();
+        if let Some(cell) = second.cell_mut(3, 2) {
+            cell.glyph = 'z'.into();
+            cell.fg = Rgb::new(1, 2, 3);
+        }
+        second.cursor = Some(CursorPosition { col: 3, row: 2 });
+
+        let mut encoder = FrameEncoder;
+        let mut decoder = FrameDecoder;
+        let mut client = None;
+        let initial = encoder.update(None, &first).unwrap();
+        assert!(matches!(initial, ServerMessage::FullFrame(..)));
+        decoder.apply(&mut client, &initial);
+        assert_looks_like(client.as_ref().unwrap(), &first);
+
+        let diff = encoder.update(Some(&first), &second).unwrap();
+        match &diff {
+            ServerMessage::Diff(patches, _) => {
+                assert_eq!(patches.len(), 1);
+                assert_eq!(patches[0].0, 2);
+            }
+            other => panic!("expected a diff, got {other:?}"),
+        }
+        let mut buffer = Vec::new();
+        write_message(&mut buffer, &diff).unwrap();
+        assert!(buffer.len() < 48, "diff took {} bytes", buffer.len());
+        let decoded: ServerMessage = read_message(&mut buffer.as_slice()).unwrap();
+        decoder.apply(&mut client, &decoded);
+        assert_looks_like(client.as_ref().unwrap(), &second);
+
+        assert_eq!(encoder.update(Some(&second), &second), None);
+    }
+
+    #[test]
+    fn cursor_shapes_reach_the_client_in_full_frames_and_diffs() {
         let mut first = sample_grid();
         first.cursor = Some(CursorPosition { col: 2, row: 0 });
         first.cursor_shape = CursorShape::Underline;
         let mut second = first.clone();
         second.cursor_shape = CursorShape::Block;
 
-        let encoder = FrameEncoder;
+        let mut encoder = FrameEncoder;
         let mut decoder = FrameDecoder;
         let mut client = None;
-        for grid in [&first, &second] {
-            let message = encoder.full_frame(grid);
+        for (previous, grid) in [(None, &first), (Some(&first), &second)] {
+            let message = encoder
+                .update(previous, grid)
+                .expect("a changed cursor shape needs a frame");
             let mut buffer = Vec::new();
             write_message(&mut buffer, &message).unwrap();
             let decoded: ServerMessage = read_message(&mut buffer.as_slice()).unwrap();
@@ -512,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn clusters_survive_full_frames() {
+    fn clusters_survive_full_frames_and_diffs() {
         let mut first = sample_grid();
         let clusters = [
             (2, 1, "e\u{301}"),
@@ -532,16 +607,16 @@ mod tests {
             cell.glyph = Glyph::from_cluster("o\u{308}");
         }
 
-        let encoder = FrameEncoder;
+        let mut encoder = FrameEncoder;
         let mut decoder = FrameDecoder;
         let mut client = None;
-        for grid in [&first, &second] {
-            let message = encoder.full_frame(grid);
+        for (previous, grid) in [(None, &first), (Some(&first), &second)] {
+            let message = encoder.update(previous, grid).unwrap();
             let mut buffer = Vec::new();
             write_message(&mut buffer, &message).unwrap();
             let decoded: ServerMessage = read_message(&mut buffer.as_slice()).unwrap();
             decoder.apply(&mut client, &decoded);
-            assert_same_cells(client.as_ref().unwrap(), grid);
+            assert_looks_like(client.as_ref().unwrap(), grid);
         }
         assert!(
             client
@@ -575,13 +650,11 @@ mod tests {
         let mut random = Random::new(7);
         let mut next_random = |bound: usize| random.next(bound);
         let mut first_line = 0;
-        let encoder = FrameEncoder;
+        let mut server = editor_grid(&lines, first_line);
+        let mut encoder = FrameEncoder;
         let mut decoder = FrameDecoder;
         let mut client = None;
-        decoder.apply(
-            &mut client,
-            &encoder.full_frame(&editor_grid(&lines, first_line)),
-        );
+        decoder.apply(&mut client, &encoder.update(None, &server).unwrap());
         for _ in 0..300 {
             first_line = (first_line + next_random(9))
                 .saturating_sub(4)
@@ -599,14 +672,17 @@ mod tests {
             });
             next.cursor_shape =
                 [CursorShape::Bar, CursorShape::Block, CursorShape::Underline][next_random(3)];
-            let mut buffer = Vec::new();
-            write_message(&mut buffer, &encoder.full_frame(&next)).unwrap();
-            let update: ServerMessage = read_message(&mut buffer.as_slice()).unwrap();
-            decoder.apply(&mut client, &update);
+            if let Some(update) = encoder.update(Some(&server), &next) {
+                let mut buffer = Vec::new();
+                write_message(&mut buffer, &update).unwrap();
+                let update: ServerMessage = read_message(&mut buffer.as_slice()).unwrap();
+                decoder.apply(&mut client, &update);
+            }
             let mirrored = client.as_ref().unwrap();
-            assert_same_cells(mirrored, &next);
+            assert_looks_like(mirrored, &next);
             assert_eq!(mirrored.cursor, next.cursor);
             assert_eq!(mirrored.cursor_shape, next.cursor_shape);
+            server = next;
         }
     }
 }
