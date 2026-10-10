@@ -11,6 +11,11 @@ use crate::tui::protocol::{KeyCode, MouseAction, MouseButtonKind, TermEvent};
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(400);
 const SCROLL_LINES: f32 = 3.;
 
+pub enum Translated {
+    Input(PlatformInput),
+    Text(String),
+}
+
 #[derive(Default)]
 pub struct InputTranslator {
     last_click: Option<(Instant, u16, u16, MouseButton)>,
@@ -19,18 +24,22 @@ pub struct InputTranslator {
 }
 
 impl InputTranslator {
-    pub fn translate(&mut self, event: TermEvent) -> Vec<PlatformInput> {
+    pub fn translate(&mut self, event: TermEvent) -> Vec<Translated> {
         match event {
             TermEvent::Key { code, modifiers } => key_down(code, modifiers)
-                .map(PlatformInput::KeyDown)
-                .into_iter()
-                .collect(),
+                .map(|event| vec![Translated::Input(PlatformInput::KeyDown(event))])
+                .unwrap_or_default(),
+            TermEvent::Paste(text) => vec![Translated::Text(text)],
             TermEvent::Mouse {
                 action,
                 col,
                 row,
                 modifiers,
-            } => self.mouse(action, col, row, modifiers),
+            } => self
+                .mouse(action, col, row, modifiers)
+                .into_iter()
+                .map(Translated::Input)
+                .collect(),
         }
     }
 
@@ -244,6 +253,13 @@ mod tests {
     }
 
     #[test]
+    fn pastes_become_text() {
+        let mut translator = InputTranslator::default();
+        let translated = translator.translate(TermEvent::Paste("넓은 글자".into()));
+        assert!(matches!(translated.as_slice(), [Translated::Text(text)] if text == "넓은 글자"));
+    }
+
+    #[test]
     fn repeated_clicks_increase_click_count() {
         let mut translator = InputTranslator::default();
         let click = |translator: &mut InputTranslator| {
@@ -255,8 +271,8 @@ mod tests {
                     modifiers: Modifiers::default(),
                 })
                 .into_iter()
-                .find_map(|input| match input {
-                    PlatformInput::MouseDown(event) => Some(event),
+                .find_map(|translated| match translated {
+                    Translated::Input(PlatformInput::MouseDown(event)) => Some(event),
                     _ => None,
                 })
                 .unwrap()

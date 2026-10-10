@@ -41,6 +41,7 @@ impl TerminalSetup {
             terminal::EnterAlternateScreen,
             cursor::Hide,
             event::EnableMouseCapture,
+            event::EnableBracketedPaste,
         )?;
         Ok(())
     }
@@ -50,6 +51,7 @@ impl TerminalSetup {
             crossterm::execute!(
                 output,
                 style::ResetColor,
+                event::DisableBracketedPaste,
                 event::DisableMouseCapture,
                 cursor::Show,
                 terminal::LeaveAlternateScreen,
@@ -477,8 +479,9 @@ pub fn attach(socket: &Path) -> Result<Exit> {
                     inputs.extend(term_key(&key));
                 }
                 event::Event::Mouse(mouse) => inputs.push(term_mouse(&mouse)),
+                event::Event::Paste(text) => inputs.push(TermEvent::Paste(text)),
                 event::Event::Resize(cols, rows) => resize = Some((cols, rows)),
-                event::Event::FocusGained | event::Event::FocusLost | event::Event::Paste(_) => {}
+                event::Event::FocusGained | event::Event::FocusLost => {}
             }
         }
         let mut messages: Vec<ClientMessage> =

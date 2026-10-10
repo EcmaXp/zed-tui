@@ -62,6 +62,7 @@ pub enum TermEvent {
         row: u16,
         modifiers: Modifiers,
     },
+    Paste(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -270,6 +271,7 @@ mod tests {
                     ..Default::default()
                 },
             }),
+            ClientMessage::Input(TermEvent::Paste("한글 paste".into())),
             ClientMessage::Resize {
                 cols: 100,
                 rows: 30,

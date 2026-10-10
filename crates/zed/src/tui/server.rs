@@ -29,7 +29,7 @@ use parking_lot::Mutex;
 use util::ResultExt as _;
 
 use crate::tui::{
-    input::InputTranslator,
+    input::{InputTranslator, Translated},
     protocol::{
         ClientMessage, FrameEncoder, PROTOCOL_VERSION, ServerMessage, TermEvent, read_message,
         write_message,
@@ -263,8 +263,11 @@ fn handle_event(
             apply_shared_size(platform, sizes);
         }
         ServerEvent::Input(event) => {
-            for input in translator.translate(event) {
-                platform.handle_input(input);
+            for translated in translator.translate(event) {
+                match translated {
+                    Translated::Input(input) => platform.handle_input(input),
+                    Translated::Text(text) => platform.insert_text(&text),
+                }
             }
         }
     }
