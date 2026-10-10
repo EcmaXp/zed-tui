@@ -46,6 +46,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(30);
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_FRAMES_IN_FLIGHT: u32 = 2;
 const MAX_SESSION_BASENAME: usize = 32;
 const FIRST_WINDOW_POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub const SESSION_ENV: &str = "ZED_TUI_SESSION";
@@ -208,6 +209,7 @@ pub fn is_running(paths: &SessionPaths) -> bool {
 enum Outgoing {
     Frame(Arc<CellGrid>),
     Message(ServerMessage),
+    Rendered(u32),
 }
 
 struct ClientHandle {
@@ -768,6 +770,7 @@ fn serve_client(
 
     let receives_frames = (cols, rows) != WAIT_ONLY_SIZE;
     let (sender, receiver) = mpsc::channel();
+    let render_acks = sender.clone();
     let writer = thread::Builder::new()
         .name(format!("ClientWriter-{id}"))
         .spawn(move || write_to_client(write_stream, receiver))?;
@@ -800,7 +803,7 @@ fn serve_client(
     thread::Builder::new()
         .name(format!("ClientReader-{id}"))
         .spawn(move || {
-            let detached = read_from_client(id, reader, &hub, &events);
+            let detached = read_from_client(id, reader, &hub, &events, &render_acks);
             hub.remove(id);
             events
                 .unbounded_send(ServerEvent::Disconnected { id })
@@ -821,6 +824,7 @@ fn read_from_client(
     mut reader: BufReader<UnixStream>,
     hub: &ClientHub,
     events: &UnboundedSender<ServerEvent>,
+    render_acks: &mpsc::Sender<Outgoing>,
 ) -> bool {
     let mut message_reader = MessageReader::default();
     loop {
@@ -844,6 +848,10 @@ fn read_from_client(
             },
             Ok(ClientMessage::Detach) => return true,
             Ok(ClientMessage::Hello { .. }) => continue,
+            Ok(ClientMessage::Rendered(frames)) => {
+                render_acks.send(Outgoing::Rendered(frames)).ok();
+                continue;
+            }
             Err(error) => {
                 log::debug!("client {id} disconnected: {error:#}");
                 return false;
@@ -865,10 +873,14 @@ fn send_to_client(stream: &mut UnixStream, receiver: mpsc::Receiver<Outgoing>) {
     let mut writer = MessageWriter::default();
     let encoder = FrameEncoder;
     let mut newest_frame: Option<Arc<CellGrid>> = None;
+    let mut frames_in_flight: u32 = 0;
     while let Ok(first) = receiver.recv() {
         for outgoing in std::iter::once(first).chain(receiver.try_iter()) {
             match outgoing {
                 Outgoing::Frame(grid) => newest_frame = Some(grid),
+                Outgoing::Rendered(frames) => {
+                    frames_in_flight = frames_in_flight.saturating_sub(frames)
+                }
                 Outgoing::Message(message) => {
                     let is_shutdown = matches!(message, ServerMessage::Shutdown);
                     writer.push(&message).log_err();
@@ -879,8 +891,12 @@ fn send_to_client(stream: &mut UnixStream, receiver: mpsc::Receiver<Outgoing>) {
                 }
             }
         }
-        if let Some(grid) = newest_frame.take() {
-            writer.push(&encoder.full_frame(&grid)).log_err();
+        if frames_in_flight < MAX_FRAMES_IN_FLIGHT
+            && let Some(grid) = newest_frame.take()
+        {
+            if writer.push(&encoder.full_frame(&grid)).log_err().is_some() {
+                frames_in_flight += 1;
+            }
         }
         if writer.flush(stream).is_err() {
             return;
@@ -1213,6 +1229,39 @@ mod tests {
         hub.send_last_frame_to(id, (3, 1));
         let message: ServerMessage = read_message(&mut client_reader).unwrap();
         assert_eq!(frame_size(&message), Some((3, 1)));
+    }
+
+    #[test]
+    fn frames_wait_for_the_client_to_render_but_other_messages_do_not() {
+        let hub = Arc::new(ClientHub::default());
+        let (_, client_side, _events) = attach(&hub);
+        let mut client_writer = client_side.try_clone().unwrap();
+        let mut client_reader = BufReader::new(client_side);
+
+        let frame = |ch: char| {
+            let mut grid = CellGrid::new(4, 2, Rgb::new(0, 0, 0));
+            if let Some(cell) = grid.cell_mut(0, 0) {
+                cell.glyph = ch.into();
+            }
+            Arc::new(grid)
+        };
+        let mut decoder = FrameDecoder;
+        let mut mirrored = None;
+        for ch in ['a', 'b'] {
+            hub.broadcast_frame(frame(ch));
+            let message: ServerMessage = read_message(&mut client_reader).unwrap();
+            decoder.apply(&mut mirrored, &message);
+        }
+        hub.broadcast_frame(frame('c'));
+        hub.broadcast_frame(frame('d'));
+        hub.broadcast_message(ServerMessage::Title("title".into()));
+        let message: ServerMessage = read_message(&mut client_reader).unwrap();
+        assert_eq!(message, ServerMessage::Title("title".into()));
+
+        write_message(&mut client_writer, &ClientMessage::Rendered(2)).unwrap();
+        let message: ServerMessage = read_message(&mut client_reader).unwrap();
+        decoder.apply(&mut mirrored, &message);
+        assert_eq!(mirrored.as_ref(), Some(&*frame('d')));
     }
 
     #[test]

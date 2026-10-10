@@ -88,6 +88,7 @@ pub enum ClientMessage {
     Open {
         paths: Vec<PathBuf>,
     },
+    Rendered(u32),
     OpenAndWait {
         paths: Vec<PathBuf>,
         quit_session: bool,

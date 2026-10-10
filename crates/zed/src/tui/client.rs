@@ -805,9 +805,10 @@ pub fn attach(socket: &Path, wait: Option<ClientMessage>) -> Result<Exit> {
         })?;
     let (event_sender, events) = mpsc::channel();
     thread::Builder::new().name("Render".to_owned()).spawn({
+        let socket_writer = socket_writer.clone();
         let event_sender = event_sender.clone();
         move || {
-            let exit = render_messages(&mut renderer, &render_receiver);
+            let exit = render_messages(&mut renderer, &render_receiver, &socket_writer);
             event_sender.send(ClientEvent::Exit(exit)).ok();
         }
     })?;
@@ -925,6 +926,7 @@ enum RenderEvent {
 fn render_messages<W: Write>(
     renderer: &mut Renderer<W>,
     events: &mpsc::Receiver<RenderEvent>,
+    socket: &Mutex<UnixStream>,
 ) -> Exit {
     let mut resize_deadline: Option<Instant> = None;
     loop {
@@ -958,6 +960,11 @@ fn render_messages<W: Write>(
         resize_deadline =
             resize_deadline.filter(|deadline| !resized_frame_arrived && Instant::now() < *deadline);
         if resize_deadline.is_none() && renderer.render().is_err() {
+            return Exit::Disconnected;
+        }
+        if frames > 0
+            && write_message(&mut *socket.lock(), &ClientMessage::Rendered(frames)).is_err()
+        {
             return Exit::Disconnected;
         }
     }
@@ -1824,11 +1831,12 @@ mod tests {
     fn a_resize_waits_for_the_resized_frame_before_repainting() {
         let output = SharedOutput::default();
         let (sender, receiver) = mpsc::channel();
+        let (socket, _peer) = UnixStream::pair().unwrap();
         let render_thread = thread::spawn({
             let output = output.clone();
             move || {
                 let mut renderer = Renderer::new(output, 20, 4);
-                render_messages(&mut renderer, &receiver);
+                render_messages(&mut renderer, &receiver, &Mutex::new(socket));
             }
         });
         let take_output = || {
