@@ -1,5 +1,67 @@
 use super::*;
 
+struct SpanToNameResolver;
+
+impl RunnableResolver for SpanToNameResolver {
+    fn resolve(
+        &self,
+        local_captures: &[RunnableMatchCapture],
+        shared_captures: &[RunnableMatchCapture],
+        _buffer: &BufferSnapshot,
+    ) -> Option<ResolvedRunnable> {
+        let run = local_captures.iter().find(|capture| capture.is_run())?;
+        let name = shared_captures
+            .iter()
+            .find(|capture| capture.name() == Some("_name"))?;
+        Some(ResolvedRunnable {
+            run_range: run.range(),
+            extra_captures: SmallVec::new(),
+            full_range: Some(run.range().start..name.range().end),
+        })
+    }
+}
+
+const SAME_NODE_GROUPED_QUERY: &str = indoc! {r#"
+    (((line_comment) @run @run_item)+
+      .
+      (function_item
+        name: (identifier) @_name))
+"#};
+
+#[gpui::test]
+fn test_run_item_on_the_same_node_as_run_forms_its_own_group(cx: &mut TestAppContext) {
+    let source = "// first\n// second\nfn documented() {}\n";
+    let resolver: Arc<dyn RunnableResolver> = Arc::new(SpanToNameResolver);
+    let runnables = collect_runnables(cx, source, SAME_NODE_GROUPED_QUERY, Some(resolver));
+
+    let found: Vec<(String, String, Option<String>)> = runnables
+        .iter()
+        .map(|range| {
+            (
+                source[range.run_range.clone()].to_string(),
+                source[range.full_range.clone()].to_string(),
+                range.extra_captures.get("_name").cloned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        found,
+        vec![
+            (
+                "// first".to_string(),
+                "// first\n// second\nfn documented".to_string(),
+                Some("documented".to_string()),
+            ),
+            (
+                "// second".to_string(),
+                "// second\nfn documented".to_string(),
+                Some("documented".to_string()),
+            ),
+        ],
+        "each `@run_item` line should resolve with its own `@run`, the resolver's full range, and the shared captures"
+    );
+}
+
 fn run_texts_from_full_query(
     cx: &mut TestAppContext,
     source: &str,

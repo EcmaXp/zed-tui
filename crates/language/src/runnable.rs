@@ -52,6 +52,7 @@ impl RunnableMatchCapture {
 pub struct ResolvedRunnable {
     pub run_range: Range<usize>,
     pub extra_captures: SmallVec<[(String, String); 2]>,
+    pub full_range: Option<Range<usize>>,
 }
 
 pub trait RunnableResolver: Send + Sync {
@@ -176,7 +177,11 @@ fn group_runnable_matches(
     let mut sorted: SmallVec<[&QueryCapture<'_>; 16]> = captures.iter().collect();
     sorted.sort_by_key(|capture| {
         let range = capture.node.byte_range();
-        (range.start, Reverse(range.end))
+        let is_run_item = matches!(
+            runnable_config.extra_captures.get(capture.index as usize),
+            Some(RunnableCapture::RunItem)
+        );
+        (range.start, Reverse(range.end), !is_run_item)
     });
 
     let mut groups = SmallVec::new();
@@ -280,6 +285,7 @@ fn runnable_ranges_from_grouped_matches(
         let Some(ResolvedRunnable {
             run_range,
             extra_captures: local_extras,
+            full_range,
         }) = resolver.resolve(&group.captures, &shared_captures, buffer)
         else {
             continue;
@@ -289,7 +295,7 @@ fn runnable_ranges_from_grouped_matches(
 
         runnable_ranges.push(RunnableRange {
             run_range,
-            full_range: group.range,
+            full_range: full_range.unwrap_or(group.range),
             runnable: Runnable {
                 tags: tags.clone(),
                 language: language.clone(),
@@ -461,6 +467,7 @@ mod tests {
             Some(ResolvedRunnable {
                 run_range: run.range(),
                 extra_captures: SmallVec::new(),
+                full_range: None,
             })
         }
     }
@@ -487,6 +494,7 @@ mod tests {
             Some(ResolvedRunnable {
                 run_range: run.range(),
                 extra_captures: extras,
+                full_range: None,
             })
         }
     }
@@ -510,6 +518,7 @@ mod tests {
             Some(ResolvedRunnable {
                 run_range: run.range(),
                 extra_captures: SmallVec::new(),
+                full_range: None,
             })
         }
     }
@@ -530,6 +539,7 @@ mod tests {
             Some(ResolvedRunnable {
                 run_range: run.range(),
                 extra_captures: extras,
+                full_range: None,
             })
         }
     }
