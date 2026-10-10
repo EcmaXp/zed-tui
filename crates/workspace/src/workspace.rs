@@ -63,12 +63,12 @@ use futures::{
 };
 use gpui::{
     Action, AnyEntity, AnyView, AnyWeakView, App, AppContext, AsyncApp, AsyncWindowContext, Axis,
-    Bounds, ClipboardItem, Context, CursorStyle, Decorations, DragMoveEvent, Entity, EntityId,
-    EventEmitter, FocusHandle, Focusable, Global, HitboxBehavior, Hsla, KeyContext, Keystroke,
-    ManagedView, MouseButton, PathPromptOptions, Point, PromptLevel, Render, ResizeEdge, Size,
-    Stateful, Subscription, SystemWindowTabController, Task, TaskExt, Tiling, WeakEntity,
-    WindowBounds, WindowHandle, WindowId, WindowOptions, actions, canvas, point, relative, size,
-    transparent_black,
+    Bounds, ClipboardItem, Context, CursorStyle, Decorations, DispatchPhase, DragMoveEvent, Entity,
+    EntityId, EventEmitter, FocusHandle, Focusable, Global, HitboxBehavior, Hsla, KeyContext,
+    Keystroke, ManagedView, MouseButton, PathPromptOptions, Point, PromptLevel, Render, ResizeEdge,
+    SharedActionListener, Size, Stateful, Subscription, SystemWindowTabController, Task, TaskExt,
+    Tiling, WeakEntity, WindowBounds, WindowHandle, WindowId, WindowOptions, actions, canvas,
+    point, relative, size, transparent_black,
 };
 pub use history_manager::*;
 pub use item::{
@@ -8492,13 +8492,23 @@ impl Workspace {
         &mut self,
         callback: impl Fn(&mut Self, &A, &mut Window, &mut Context<Self>) + 'static,
     ) -> &mut Self {
-        let callback = Arc::new(callback);
+        let workspace = self.weak_self.clone();
+        let listener: SharedActionListener = Rc::new(
+            move |action: &dyn std::any::Any,
+                  phase: DispatchPhase,
+                  window: &mut Window,
+                  cx: &mut App| {
+                if phase == DispatchPhase::Bubble
+                    && let Some(action) = action.downcast_ref::<A>()
+                    && let Some(workspace) = workspace.upgrade()
+                {
+                    workspace.update(cx, |workspace, cx| callback(workspace, action, window, cx));
+                }
+            },
+        );
 
-        self.workspace_actions.push(Box::new(move |div, _, _, cx| {
-            let callback = callback.clone();
-            div.on_action(cx.listener(move |workspace, event, window, cx| {
-                (callback)(workspace, event, window, cx)
-            }))
+        self.workspace_actions.push(Box::new(move |div, _, _, _| {
+            div.on_shared_action(TypeId::of::<A>(), listener.clone())
         }));
         self
     }
