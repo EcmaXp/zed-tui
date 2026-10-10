@@ -356,7 +356,14 @@ impl PlatformWindow for TuiWindow {
         let outputs = state.outputs.clone();
         let icon_glyphs = outputs.icon_glyphs.borrow();
         let icon_glyph = |path: &str| icon_glyphs.as_ref().and_then(|glyphs| glyphs(path));
-        let frame = rasterize_scene(scene, &state.atlas, &icon_glyph, cols, rows);
+        let frame = rasterize_scene(
+            scene,
+            &state.atlas,
+            &icon_glyph,
+            cols,
+            rows,
+            outputs.canvas.get(),
+        );
         state.pending_frame = Some(frame);
     }
 

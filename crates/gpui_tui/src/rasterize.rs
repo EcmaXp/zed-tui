@@ -48,6 +48,14 @@ fn intersect(a: Range<i32>, b: &Range<i32>) -> Range<i32> {
     a.start.max(b.start)..a.end.min(b.end)
 }
 
+pub(crate) fn canvas_if_untouched(background: Rgb, canvas: Rgb) -> Rgb {
+    if background == Rgb::default() {
+        canvas
+    } else {
+        background
+    }
+}
+
 fn paint_line_glyph(cell: &mut Cell, ch: char, color: Rgba) -> bool {
     let fg = cell.bg.blend_rgba(color);
     if fg.distance(cell.bg) < MIN_LINE_CONTRAST {
@@ -80,11 +88,13 @@ pub(crate) fn rasterize_scene(
     icon_glyph: &dyn Fn(&str) -> Option<char>,
     cols: u16,
     rows: u16,
+    canvas: Rgb,
 ) -> CellGrid {
     let scratch = &mut RasterScratch::default();
     layout_text(scene, atlas, icon_glyph, scratch);
     let mut rasterizer = Rasterizer {
         grid: CellGrid::new(cols, rows, Rgb::default()),
+        canvas,
         scratch,
     };
     for batch in scene.batches() {
@@ -259,6 +269,7 @@ fn layout_text(
 
 struct Rasterizer<'a> {
     grid: CellGrid,
+    canvas: Rgb,
     scratch: &'a mut RasterScratch,
 }
 
@@ -297,6 +308,7 @@ impl Rasterizer<'_> {
             return;
         }
         let (first_col, end_col) = (cols.start, cols.end);
+        let canvas = self.canvas;
         for row in intersect(covered_rows(rect), &(0..self.grid.rows.into())) {
             if clears_text {
                 self.clear_char(first_col, row);
@@ -309,7 +321,7 @@ impl Rasterizer<'_> {
                         cell.attrs = CellAttrs::empty();
                         cell.underline = UnderlineColor::default();
                     }
-                    cell.bg = cell.bg.blend_rgba(rgba);
+                    cell.bg = canvas_if_untouched(cell.bg, canvas).blend_rgba(rgba);
                 }
             }
         }
@@ -498,7 +510,12 @@ mod tests {
     };
 
     fn rasterize(scene: &Scene, atlas: &TuiAtlas, cols: u16, rows: u16) -> CellGrid {
-        rasterize_scene(scene, atlas, &chevron_icon, cols, rows)
+        rasterize_scene(scene, atlas, &chevron_icon, cols, rows, Rgb::default())
+    }
+
+    fn rasterize_on(scene: &Scene, canvas: Rgb, cols: u16, rows: u16) -> CellGrid {
+        let atlas = TuiAtlas::default();
+        rasterize_scene(scene, &atlas, &chevron_icon, cols, rows, canvas)
     }
 
     fn fill_quad(x: f32, y: f32, width: f32, height: f32, color: Hsla) -> Quad {
@@ -586,6 +603,57 @@ mod tests {
         assert!(straight.attrs.contains(CellAttrs::UNDERLINE));
         assert!(!straight.attrs.contains(CellAttrs::CURLY_UNDERLINE));
         assert!(!grid.cell(0, 1).unwrap().attrs.intersects(curly));
+    }
+
+    #[test]
+    fn translucent_fills_on_untouched_cells_blend_over_the_canvas() {
+        let canvas = rgb(40, 44, 51);
+        let selection = Hsla::from(gpui::rgba(0x74ade83d));
+        let mut scene = Scene::default();
+        scene.insert_primitive(fill_quad(0., 0., 16., 16., selection));
+        scene.finish();
+        let grid = rasterize_on(&scene, canvas, 3, 1);
+        let selected = canvas.blend(selection);
+        assert_eq!(
+            grid.row(0).iter().map(|cell| cell.bg).collect::<Vec<_>>(),
+            [selected, selected, Rgb::default()]
+        );
+    }
+
+    fn canvas_fills(fills: &[(f32, Hsla)], canvas: Rgb) -> Vec<Rgb> {
+        let mut scene = Scene::default();
+        for (width, color) in fills {
+            scene.insert_primitive(fill_quad(0., 0., *width, 16., *color));
+        }
+        scene.finish();
+        let grid = rasterize_on(&scene, canvas, 3, 1);
+        grid.row(0).iter().map(|cell| cell.bg).collect()
+    }
+
+    #[test]
+    fn opaque_fills_in_the_canvas_color_stay_distinct_from_untouched_cells() {
+        let canvas = rgb(40, 44, 51);
+        let tab = Hsla::from(gpui::rgb(0x282c33));
+        assert_eq!(
+            canvas_fills(&[(8., tab)], canvas),
+            [canvas, Rgb::default(), Rgb::default()]
+        );
+    }
+
+    #[test]
+    fn translucent_fills_stack_over_the_fill_below_not_the_canvas() {
+        let canvas = rgb(40, 44, 51);
+        let surface = Hsla::from(gpui::rgb(0x2f343e));
+        let selection = Hsla::from(gpui::rgba(0x74ade83d));
+        let surface_rgb = Rgb::default().blend(surface);
+        assert_eq!(
+            canvas_fills(&[(16., surface), (24., selection)], canvas),
+            [
+                surface_rgb.blend(selection),
+                surface_rgb.blend(selection),
+                canvas.blend(selection)
+            ]
+        );
     }
 
     fn bordered_quad(width: f32, height: f32) -> Scene {

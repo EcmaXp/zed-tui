@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use crate::{
     dispatcher::{TuiDispatcher, run_runnable},
-    grid::CellGrid,
+    grid::{CellGrid, Rgb},
     size_for_cells,
     text_system::TuiTextSystem,
     window::{TuiWindow, TuiWindowHandle},
@@ -33,6 +33,7 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 pub(crate) struct PlatformOutputs {
     pub(crate) frame_sink: RefCell<Option<Box<dyn FnMut(CellGrid)>>>,
     pub(crate) icon_glyphs: RefCell<Option<Box<dyn Fn(&str) -> Option<char>>>>,
+    pub(crate) canvas: Cell<Rgb>,
 }
 
 #[derive(Debug)]
@@ -190,6 +191,10 @@ impl TuiPlatform {
 
     pub fn set_icon_glyphs(&self, glyphs: impl Fn(&str) -> Option<char> + 'static) {
         *self.outputs.icon_glyphs.borrow_mut() = Some(Box::new(glyphs));
+    }
+
+    pub fn set_canvas(&self, canvas: Rgb) {
+        self.outputs.canvas.set(canvas);
     }
 
     pub(crate) fn focused_window(&self) -> Option<TuiWindowHandle> {
