@@ -629,6 +629,10 @@ fn assume_erased(shown: &mut [Cell], wanted: &[Cell]) {
     }
 }
 
+fn starts_its_own_cell(ch: char) -> bool {
+    matches!(ch, ' '..='~' | '\u{2500}'..='\u{259f}')
+}
+
 fn is_blank_on(cell: &Cell, background: PenColor) -> bool {
     cell.is_plain_blank() && PenColor::background(cell) == background
 }
@@ -1061,7 +1065,12 @@ impl<W: Write> Terminal<W> {
                 (true, false) => (Glyph::from_char(' '), 1),
                 (false, _) => (cell.glyph, 1),
             };
-            let next_col = col + width;
+            let repeats = if self.features.ghostty && !is_wide {
+                repeat_count(cells, col, range.end)
+            } else {
+                0
+            };
+            let next_col = col + width + repeats;
             let character = glyph.as_char();
             scratch.has_clusters |= character.is_none();
             let text_start = scratch.text.len();
@@ -1070,6 +1079,9 @@ impl<W: Write> Terminal<W> {
                     .text
                     .extend_from_slice(character.encode_utf8(&mut [0; 4]).as_bytes()),
                 None => glyph.write_to(&mut scratch.text)?,
+            }
+            if repeats > 0 {
+                CursorStep::Relative('b', repeats).write(&mut scratch.text)?;
             }
             let text_end = scratch.text.len();
             let content = text_end - text_start;
@@ -1111,7 +1123,7 @@ impl<W: Write> Terminal<W> {
                     });
                 }
             }
-            col += 1;
+            col += 1 + repeats;
         }
         Ok(range.end)
     }
@@ -1250,6 +1262,28 @@ impl DrawState {
             + segment.content;
         (bytes, SegmentPlan { moves, sgr })
     }
+}
+
+fn repeat_count(cells: &[Cell], col: usize, end: usize) -> usize {
+    let Some(cell) = cells.get(col) else {
+        return 0;
+    };
+    let Some(ch) = cell.glyph.as_char().filter(|ch| starts_its_own_cell(*ch)) else {
+        return 0;
+    };
+    if cell.is_plain_blank() {
+        return 0;
+    }
+    let repeats = cells
+        .get(col + 1..end)
+        .unwrap_or_default()
+        .iter()
+        .take_while(|next| *next == cell)
+        .count();
+    if repeats * ch.len_utf8() <= CursorStep::Relative('b', repeats).len() {
+        return 0;
+    }
+    repeats
 }
 
 struct Renderer<W: Write> {
@@ -2839,6 +2873,7 @@ mod tests {
 
     #[test]
     fn rendered_frames_match_an_emulated_terminal() {
+        let mut repeated = false;
         let mut curled = false;
         let mut colored_underlines = false;
         let cases = [(1, 40), (2, 40), (3, 33), (4, 27), (5, 44), (6, 40)];
@@ -2866,15 +2901,17 @@ mod tests {
                 renderer.grid = Some(grid.clone());
                 renderer.render().unwrap();
                 let output = String::from_utf8_lossy(&renderer.terminal.output);
+                let repeats = repeats_in(&output);
                 let styled = output.contains("4:3") || output.contains(";58;");
-                assert!(ghostty || !styled, "{output:?}");
+                assert!(ghostty || (repeats == 0 && !styled), "{output:?}");
+                repeated |= repeats > 0;
                 curled |= output.contains("4:3");
                 colored_underlines |= output.contains(";58;") || output.contains("[58;");
                 emulator.feed(&mut renderer);
                 emulator.assert_shows(&grid, terminal_cols);
             }
         }
-        assert!(curled && colored_underlines);
+        assert!(repeated && curled && colored_underlines);
     }
 
     fn underlined_output(ghostty: bool) -> String {
@@ -2936,6 +2973,64 @@ mod tests {
                 *cell = run;
             }
         }
+    }
+
+    fn repeats_in(output: &str) -> usize {
+        output
+            .split("\x1b[")
+            .skip(1)
+            .filter(|sequence| {
+                let digits = sequence.bytes().take_while(u8::is_ascii_digit).count();
+                sequence.as_bytes().get(digits) == Some(&b'b')
+            })
+            .count()
+    }
+
+    fn rendered_text(cols: u16, text: &str, ghostty: bool) -> String {
+        let mut grid = CellGrid::new(cols, 1, Rgb::new(40, 44, 52));
+        text_row(&mut grid, 0, 0, text);
+        let mut renderer = Renderer::new(Vec::new(), cols, 1);
+        renderer.terminal.features.ghostty = ghostty;
+        let mut emulator = Emulator::new(cols, 1);
+        render_checked(&mut renderer, &mut emulator, &grid)
+    }
+
+    #[test]
+    fn ghostty_repeats_runs_only_when_shorter() {
+        let border = format!("┌{}┐", "─".repeat(28));
+        assert!(rendered_text(40, &border, true).contains("─\x1b[27b┐"));
+        assert_eq!(repeats_in(&rendered_text(40, &border, false)), 0);
+        let output = rendered_text(40, "x======y=====z", true);
+        assert!(output.contains("x=\x1b[5by====="), "{output:?}");
+        assert_eq!(repeats_in(&rendered_text(40, "ab───cd", true)), 1);
+        assert_eq!(repeats_in(&rendered_text(40, "ab──cd", true)), 0);
+        let full_width = "=".repeat(40);
+        assert!(rendered_text(40, &full_width, true).contains("=\x1b[39b\x1b[?2026l"));
+    }
+
+    #[test]
+    fn ghostty_repeats_only_characters_that_start_their_own_cell() {
+        assert_eq!(
+            repeats_in(&rendered_text(40, "x\u{93e}\u{93e}\u{93e}\u{93e}y", true)),
+            0
+        );
+        assert_eq!(repeats_in(&rendered_text(40, "x▀▀▀▀y", true)), 1);
+    }
+
+    #[test]
+    fn ghostty_does_not_repeat_clusters() {
+        let mut grid = CellGrid::new(20, 1, Rgb::new(40, 44, 52));
+        for cell in grid.row_mut(0).iter_mut().take(8) {
+            cell.glyph = Glyph::from_cluster("e\u{301}");
+        }
+        let mut renderer = Renderer::new(Vec::new(), 20, 1);
+        renderer.terminal.features.ghostty = true;
+        let mut emulator = Emulator::new(20, 1);
+        renderer.grid = Some(grid.clone());
+        renderer.render().unwrap();
+        assert_eq!(repeats_in(&output_text(&renderer)), 0);
+        emulator.feed(&mut renderer);
+        emulator.assert_shows(&grid, 20);
     }
 
     fn rendered_change(cols: u16, before: &str, after: &str) -> String {
