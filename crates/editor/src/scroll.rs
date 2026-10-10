@@ -21,7 +21,7 @@ use language::{Bias, Point};
 pub use scroll_amount::ScrollAmount;
 use settings::Settings;
 use std::{cmp::Ordering, time::Duration};
-use ui::scrollbars::ScrollbarAutoHide;
+use ui::scrollbars::{ScrollbarAutoHide, ShowScrollbar};
 use util::ResultExt;
 use workspace::{ItemId, WorkspaceId};
 
@@ -438,7 +438,9 @@ impl ScrollManager {
     pub fn show_scrollbars(&mut self, window: &mut Window, cx: &mut Context<Editor>) {
         if !self.show_scrollbars {
             self.show_scrollbars = true;
-            cx.notify();
+            if Self::scrollbar_visibility_is_rendered(cx) {
+                cx.notify();
+            }
         }
 
         if cx.default_global::<ScrollbarAutoHide>().should_hide() {
@@ -448,8 +450,11 @@ impl ScrollManager {
                     .await;
                 editor
                     .update(cx, |editor, cx| {
-                        editor.scroll_manager.show_scrollbars = false;
-                        cx.notify();
+                        let was_shown =
+                            std::mem::replace(&mut editor.scroll_manager.show_scrollbars, false);
+                        if was_shown && Self::scrollbar_visibility_is_rendered(cx) {
+                            cx.notify();
+                        }
                     })
                     .log_err();
             }));
@@ -460,6 +465,13 @@ impl ScrollManager {
 
     pub fn scrollbars_visible(&self) -> bool {
         self.show_scrollbars
+    }
+
+    fn scrollbar_visibility_is_rendered(cx: &App) -> bool {
+        matches!(
+            EditorSettings::get_global(cx).scrollbar.show,
+            ShowScrollbar::Auto | ShowScrollbar::System
+        )
     }
 
     pub fn has_autoscroll_request(&self) -> bool {

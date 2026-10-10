@@ -343,3 +343,47 @@ async fn test_transactions_unfold_the_buffer_holding_the_cursor(cx: &mut TestApp
         assert_eq!(folded, [false, true]);
     });
 }
+
+#[gpui::test]
+async fn test_scrollbar_auto_hide_notifies_only_when_scrollbar_visibility_is_rendered(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+    update_test_editor_settings(cx, &|settings| {
+        settings.cursor_blink = Some(false);
+    });
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.set_state(&format!("ˇ{}", "line\n".repeat(100)));
+    cx.update(|_, cx| cx.set_global(ScrollbarAutoHide(true)));
+
+    let notifications = Rc::new(std::cell::Cell::new(0));
+    let editor = cx.editor.clone();
+    let _subscription = cx.update(|_, cx| {
+        cx.observe(&editor, {
+            let notifications = notifications.clone();
+            move |_, _| notifications.set(notifications.get() + 1)
+        })
+    });
+
+    let notifications_from_auto_hide = |offset: ScrollOffset, cx: &mut EditorTestContext| {
+        cx.update_editor(|editor, window, cx| {
+            editor.scroll(gpui::Point { x: 0., y: offset }, window, cx);
+        });
+        cx.run_until_parked();
+        let before_hide = notifications.get();
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        notifications.get() - before_hide
+    };
+
+    assert_eq!(notifications_from_auto_hide(1., &mut cx), 1);
+
+    update_test_editor_settings(&mut cx, &|settings| {
+        settings.scrollbar = Some(settings::ScrollbarContent {
+            show: Some(settings::ShowScrollbar::Never),
+            ..Default::default()
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(notifications_from_auto_hide(2., &mut cx), 0);
+}
