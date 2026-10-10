@@ -1582,6 +1582,7 @@ impl Window {
         let scale_factor = platform_window.scale_factor();
         let mut layout_engine = TaffyLayoutEngine::new();
         layout_engine.set_cell_size(cx.text_system().cell_size(), scale_factor);
+        layout_engine.set_viewport_width(content_size.width, scale_factor);
         let appearance = platform_window.appearance();
         let text_system = Arc::new(WindowTextSystem::new(cx.text_system().clone()));
         let invalidator = WindowInvalidator::new(handle.window_id());
@@ -2690,6 +2691,9 @@ impl Window {
         self.scale_factor = self.platform_window.scale_factor();
         self.viewport_size = self.platform_window.content_size();
         self.display_id = self.platform_window.display().map(|display| display.id());
+        if let Some(layout_engine) = &mut self.layout_engine {
+            layout_engine.set_viewport_width(self.viewport_size.width, self.scale_factor);
+        }
         self.mouse_position = self.platform_window.mouse_position();
 
         self.refresh();

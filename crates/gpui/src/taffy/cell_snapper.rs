@@ -1,17 +1,25 @@
 use super::{EXPECT_MESSAGE, LayoutId, NodeContext, NodeMeasureFn};
 use crate::{
-    AbsoluteLength, Bounds, DefiniteLength, Pixels, Point, Size, Style, Window, size,
+    AbsoluteLength, Bounds, DefiniteLength, Length, Pixels, Point, Size, Style, Window, size,
     util::round_half_toward_zero,
 };
 use taffy::TaffyTree;
 
 pub(super) struct CellSnapper {
     cell_size: Size<f32>,
+    viewport_width: f32,
 }
 
 impl CellSnapper {
     pub(super) fn new(cell_size: Size<f32>) -> Self {
-        Self { cell_size }
+        Self {
+            cell_size,
+            viewport_width: f32::INFINITY,
+        }
+    }
+
+    pub(super) fn set_viewport_width(&mut self, viewport_width: f32) {
+        self.viewport_width = viewport_width;
     }
 
     pub(super) fn request_layout(
@@ -21,7 +29,7 @@ impl CellSnapper {
         style: &Style,
         children: &[LayoutId],
     ) -> LayoutId {
-        snap_to_cells(&mut taffy_style, style, self.cell_size);
+        snap_to_cells(&mut taffy_style, style, self.cell_size, self.viewport_width);
         if children.is_empty() {
             tree.new_leaf(taffy_style)
         } else {
@@ -38,7 +46,7 @@ impl CellSnapper {
         style: &Style,
         measure: NodeMeasureFn,
     ) -> LayoutId {
-        snap_to_cells(&mut taffy_style, style, self.cell_size);
+        snap_to_cells(&mut taffy_style, style, self.cell_size, self.viewport_width);
         tree.new_leaf_with_context(taffy_style, NodeContext { measure })
             .expect(EXPECT_MESSAGE)
             .into()
@@ -79,7 +87,12 @@ fn length_value(length: impl Into<taffy::style::Dimension>) -> Option<f32> {
     (raw.tag() == taffy::style::CompactLength::LENGTH_TAG).then(|| raw.value())
 }
 
-fn snap_to_cells(taffy_style: &mut taffy::style::Style, style: &Style, cell_size: Size<f32>) {
+fn snap_to_cells(
+    taffy_style: &mut taffy::style::Style,
+    style: &Style,
+    cell_size: Size<f32>,
+    viewport_width: f32,
+) {
     let zero = taffy::style::LengthPercentage::length(0.);
     if is_pixel_nudge(style.padding.left) {
         taffy_style.padding.left = zero;
@@ -90,7 +103,38 @@ fn snap_to_cells(taffy_style: &mut taffy::style::Style, style: &Style, cell_size
     if is_pixel_nudge(style.gap.width) {
         taffy_style.gap.width = zero;
     }
+    widen_text_widths(taffy_style, style, cell_size.width, viewport_width);
     snap_style_to_cells(taffy_style, cell_size);
+}
+
+const TEXT_REM_CELLS: f32 = 2.25;
+const MIN_TEXT_WIDTH_REMS: f32 = 8.;
+
+fn widen_text_widths(
+    taffy_style: &mut taffy::style::Style,
+    style: &Style,
+    cell_width: f32,
+    viewport_width: f32,
+) {
+    let text_width = |length: Length| match length {
+        Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Rems(rems)))
+            if rems.0 >= MIN_TEXT_WIDTH_REMS =>
+        {
+            Some((rems.0 * TEXT_REM_CELLS * cell_width).min(viewport_width))
+        }
+        _ => None,
+    };
+    if let Some(width) = text_width(style.max_size.width) {
+        taffy_style.max_size.width =
+            snap_length(taffy_style.max_size.width, |value| value.max(width));
+    }
+    if let Some(width) = text_width(style.size.width) {
+        let widened = snap_length(taffy_style.size.width, |value| value.max(width));
+        if widened != taffy_style.size.width && taffy_style.max_size.width.is_auto() {
+            taffy_style.max_size.width = taffy::style::Dimension::percent(1.);
+        }
+        taffy_style.size.width = widened;
+    }
 }
 
 fn is_pixel_nudge(length: DefiniteLength) -> bool {
@@ -163,6 +207,14 @@ impl Window {
             .cell_size()
             .map_or(line_height, |cell_size| cell_size.height)
     }
+
+    #[expect(missing_docs)]
+    pub fn text_width_scale(&self) -> f32 {
+        match self.text_system().cell_size() {
+            Some(cell) => (TEXT_REM_CELLS * cell.width / self.rem_size()).max(1.),
+            None => 1.,
+        }
+    }
 }
 
 fn round_to_cell(value: f32, cell: f32) -> f32 {
@@ -201,6 +253,114 @@ fn ceil_to_cell(value: f32, cell: f32) -> f32 {
 mod tests {
     use super::*;
     use taffy::geometry::{Rect as TaffyRect, Size as TaffySize};
+
+    fn width_style(width: AbsoluteLength) -> (Style, taffy::style::Style) {
+        let mut style = Style::default();
+        style.size.width = Length::Definite(DefiniteLength::Absolute(width));
+        let pixels = width.to_pixels(Pixels(10.)).0;
+        let taffy_style = taffy::style::Style {
+            size: TaffySize {
+                width: taffy::style::Dimension::length(pixels),
+                height: taffy::style::Dimension::auto(),
+            },
+            ..Default::default()
+        };
+        (style, taffy_style)
+    }
+
+    #[test]
+    fn rem_widths_for_text_widen_but_stay_within_the_parent() {
+        let (style, mut taffy_style) = width_style(AbsoluteLength::Rems(crate::Rems(40.)));
+        widen_text_widths(&mut taffy_style, &style, 8., f32::INFINITY);
+        assert_eq!(
+            taffy_style.size.width,
+            taffy::style::Dimension::length(720.)
+        );
+        assert_eq!(
+            taffy_style.max_size.width,
+            taffy::style::Dimension::percent(1.)
+        );
+    }
+
+    #[test]
+    fn notification_bodies_fit_their_action_buttons() {
+        let cells = |length: taffy::style::Dimension| length.into_raw().value() / 8.;
+        let (toast_style, mut toast) = width_style(AbsoluteLength::Rems(crate::Rems(28.)));
+        widen_text_widths(&mut toast, &toast_style, 8., f32::INFINITY);
+        assert!(cells(toast.size.width) >= 57.);
+
+        let mut body_style = Style::default();
+        body_style.max_size.width = Length::Definite(DefiniteLength::Absolute(
+            AbsoluteLength::Rems(crate::Rems(24.)),
+        ));
+        let mut body = taffy::style::Style {
+            max_size: TaffySize {
+                width: taffy::style::Dimension::length(240.),
+                height: taffy::style::Dimension::auto(),
+            },
+            ..Default::default()
+        };
+        widen_text_widths(&mut body, &body_style, 8., f32::INFINITY);
+        assert!(cells(body.max_size.width) >= 49.);
+    }
+
+    #[test]
+    fn widened_widths_stop_at_the_viewport_but_never_shrink() {
+        let (style, mut taffy_style) = width_style(AbsoluteLength::Rems(crate::Rems(40.)));
+        widen_text_widths(&mut taffy_style, &style, 8., 640.);
+        assert_eq!(
+            taffy_style.size.width,
+            taffy::style::Dimension::length(640.)
+        );
+
+        let (style, mut taffy_style) = width_style(AbsoluteLength::Rems(crate::Rems(40.)));
+        let unchanged = taffy_style.clone();
+        widen_text_widths(&mut taffy_style, &style, 8., 320.);
+        assert_eq!(taffy_style, unchanged);
+    }
+
+    #[test]
+    fn rem_widths_that_already_fit_their_text_keep_their_size() {
+        let mut style = Style::default();
+        style.size.width = Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Rems(
+            crate::Rems(34.),
+        )));
+        let (_, mut taffy_style) = width_style(AbsoluteLength::Pixels(Pixels(34. * 20.)));
+        let unchanged = taffy_style.clone();
+        widen_text_widths(&mut taffy_style, &style, 8., f32::INFINITY);
+        assert_eq!(taffy_style, unchanged);
+    }
+
+    #[test]
+    fn rem_minimum_widths_reserve_layout_space_and_keep_their_size() {
+        let mut style = Style::default();
+        style.min_size.width = Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Rems(
+            crate::Rems(16.),
+        )));
+        let mut taffy_style = taffy::style::Style {
+            min_size: TaffySize {
+                width: taffy::style::Dimension::length(160.),
+                height: taffy::style::Dimension::auto(),
+            },
+            ..Default::default()
+        };
+        let unchanged = taffy_style.clone();
+        widen_text_widths(&mut taffy_style, &style, 8., f32::INFINITY);
+        assert_eq!(taffy_style, unchanged);
+    }
+
+    #[test]
+    fn pixel_and_icon_widths_keep_their_size() {
+        for width in [
+            AbsoluteLength::Pixels(Pixels(400.)),
+            AbsoluteLength::Rems(crate::Rems(1.25)),
+        ] {
+            let (style, mut taffy_style) = width_style(width);
+            let unchanged = taffy_style.clone();
+            widen_text_widths(&mut taffy_style, &style, 8., f32::INFINITY);
+            assert_eq!(taffy_style, unchanged);
+        }
+    }
 
     #[test]
     fn cells_round_toward_zero_and_hairlines_keep_their_extent() {

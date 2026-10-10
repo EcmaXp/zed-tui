@@ -69,6 +69,12 @@ impl TaffyLayoutEngine {
             .map(|cell_size| CellSnapper::new(cell_size.map(|extent| extent.0 * scale_factor)));
     }
 
+    pub fn set_viewport_width(&mut self, viewport_width: Pixels, scale_factor: f32) {
+        if let Some(cell_snapper) = &mut self.cell_snapper {
+            cell_snapper.set_viewport_width(viewport_width.0 * scale_factor);
+        }
+    }
+
     pub fn request_layout(
         &mut self,
         style: Style,
