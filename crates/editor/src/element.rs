@@ -9908,8 +9908,11 @@ impl Element for EditorElement {
                             }
                             None => full_height,
                         };
-                        let header_bottom_padding =
-                            BUFFER_HEADER_PADDING.to_pixels(window.rem_size());
+                        let header_bottom_padding = if window.text_system().cell_size().is_some() {
+                            Pixels::ZERO
+                        } else {
+                            BUFFER_HEADER_PADDING.to_pixels(window.rem_size())
+                        };
                         sticky_scroll_header_height + offset - header_bottom_padding
                     } else {
                         sticky_scroll_header_height

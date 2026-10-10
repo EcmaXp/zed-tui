@@ -2041,6 +2041,12 @@ impl Editor {
             merge_adjacent: true,
             ..FoldPlaceholder::default()
         };
+        let renders_to_cell_grid = window.text_system().cell_size().is_some();
+        let file_header_height = if renders_to_cell_grid {
+            1
+        } else {
+            FILE_HEADER_HEIGHT
+        };
         let display_map = display_map.unwrap_or_else(|| {
             cx.new(|cx| {
                 DisplayMap::new(
@@ -2048,7 +2054,7 @@ impl Editor {
                     style.font(),
                     font_size,
                     None,
-                    FILE_HEADER_HEIGHT,
+                    file_header_height,
                     MULTI_BUFFER_EXCERPT_HEADER_HEIGHT,
                     fold_placeholder,
                     diagnostics_max_severity,
@@ -2388,7 +2394,11 @@ impl Editor {
                 horizontal: full_mode,
                 vertical: full_mode,
             },
-            minimap_visibility: MinimapVisibility::for_mode(&mode, cx),
+            minimap_visibility: if renders_to_cell_grid {
+                MinimapVisibility::Disabled
+            } else {
+                MinimapVisibility::for_mode(&mode, cx)
+            },
             offset_content: !matches!(mode, EditorMode::SingleLine),
             breadcrumbs_visibility: BreadcrumbsVisibility::from_settings(cx),
             show_gutter: full_mode,
@@ -8962,7 +8972,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<Self>> {
-        (minimap_settings.minimap_enabled() && self.buffer_kind(cx) == ItemBufferKind::Singleton)
+        (minimap_settings.minimap_enabled() && self.supports_minimap(cx))
             .then(|| self.initialize_new_minimap(minimap_settings, window, cx))
     }
 
