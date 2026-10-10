@@ -20,7 +20,8 @@ use parking_lot::Mutex;
 
 use crate::tui::protocol::{
     ClientMessage, FrameDecoder, KeyCode, MessageReader, MessageWriter, MouseAction,
-    MouseButtonKind, PROTOCOL_VERSION, ServerMessage, TermEvent, WAIT_ONLY_SIZE, write_message,
+    MouseButtonKind, PROTOCOL_VERSION, ServerMessage, TermEvent, WAIT_ONLY_SIZE,
+    drop_superseded_moves, write_message,
 };
 const PUSH_TITLE: &str = "\x1b[22;0t";
 const POP_TITLE: &str = "\x1b[23;0t";
@@ -34,6 +35,7 @@ const GHOSTTY_VERSION_PREFIXES: [&[u8]; 2] = [b"ghostty", b"libghostty"];
 const QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 const HANGUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const RESIZE_FRAME_WAIT: Duration = Duration::from_millis(100);
+const MOUSE_MOVE_INTERVAL: Duration = Duration::from_millis(8);
 const ATTRIBUTE_CODES: [(CellAttrs, &str); 2] = [(CellAttrs::BOLD, "1"), (CellAttrs::ITALIC, "3")];
 
 pub enum Exit {
@@ -840,7 +842,29 @@ pub fn attach(socket: &Path, wait: Option<ClientMessage>) -> Result<Exit> {
 
     let mut detach_pending = false;
     let mut outgoing = MessageWriter::default();
-    while let Ok(first) = events.recv() {
+    let mut throttle = MoveThrottle::default();
+    loop {
+        let received = match throttle.deadline() {
+            Some(deadline) => {
+                events.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            }
+            None => events
+                .recv()
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+        };
+        let first = match received {
+            Ok(event) => event,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(input) = throttle.take_due(Instant::now()) {
+                    outgoing.push(&ClientMessage::Input(input))?;
+                    if outgoing.flush(&mut *socket_writer.lock()).is_err() {
+                        return Ok(Exit::Disconnected);
+                    }
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         let mut inputs = Vec::new();
         let mut resize = None;
         for event in std::iter::once(first).chain(events.try_iter()) {
@@ -859,7 +883,8 @@ pub fn attach(socket: &Path, wait: Option<ClientMessage>) -> Result<Exit> {
                         continue;
                     }
                     if was_pending && key.code == event::KeyCode::Char('d') {
-                        for input in inputs {
+                        push_inputs(&mut outgoing, &mut throttle, inputs)?;
+                        if let Some(input) = throttle.pending.take() {
                             outgoing.push(&ClientMessage::Input(input))?;
                         }
                         outgoing.push(&ClientMessage::Detach)?;
@@ -874,9 +899,7 @@ pub fn attach(socket: &Path, wait: Option<ClientMessage>) -> Result<Exit> {
                 event::Event::FocusGained | event::Event::FocusLost => {}
             }
         }
-        for input in inputs {
-            outgoing.push(&ClientMessage::Input(input))?;
-        }
+        push_inputs(&mut outgoing, &mut throttle, inputs)?;
         if let Some((cols, rows)) = resize {
             render_sender.send(RenderEvent::Resized(cols, rows)).ok();
             outgoing.push(&ClientMessage::Resize { cols, rows })?;
@@ -917,6 +940,63 @@ fn wait_for_hangup(fd: RawFd) -> bool {
         }
         thread::sleep(HANGUP_POLL_INTERVAL);
     }
+}
+
+fn push_inputs(
+    outgoing: &mut MessageWriter,
+    throttle: &mut MoveThrottle,
+    inputs: Vec<TermEvent>,
+) -> Result<()> {
+    for input in throttle.push(Instant::now(), inputs) {
+        outgoing.push(&ClientMessage::Input(input))?;
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct MoveThrottle {
+    pending: Option<TermEvent>,
+    last_sent: Option<Instant>,
+}
+
+impl MoveThrottle {
+    fn push(&mut self, now: Instant, inputs: Vec<TermEvent>) -> Vec<TermEvent> {
+        let mut inputs: Vec<_> = self.pending.take().into_iter().chain(inputs).collect();
+        drop_superseded_moves(&mut inputs, |input| Some(input));
+        let throttled = self
+            .last_sent
+            .is_some_and(|sent| now.saturating_duration_since(sent) < MOUSE_MOVE_INTERVAL);
+        if throttled && inputs.last().is_some_and(is_move) {
+            self.pending = inputs.pop();
+        }
+        if inputs.iter().any(is_move) {
+            self.last_sent = Some(now);
+        }
+        inputs
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.pending.as_ref()?;
+        self.last_sent.map(|sent| sent + MOUSE_MOVE_INTERVAL)
+    }
+
+    fn take_due(&mut self, now: Instant) -> Option<TermEvent> {
+        if self.deadline().is_none_or(|deadline| now < deadline) {
+            return None;
+        }
+        self.last_sent = Some(now);
+        self.pending.take()
+    }
+}
+
+fn is_move(input: &TermEvent) -> bool {
+    matches!(
+        input,
+        TermEvent::Mouse {
+            action: MouseAction::Moved | MouseAction::Drag(_),
+            ..
+        }
+    )
 }
 
 enum RenderEvent {
@@ -1878,5 +1958,71 @@ mod tests {
         renderer.resize(20, 4);
         emulator.feed(&mut renderer);
         emulator.assert_shows(&grid, 20);
+    }
+
+    fn mouse(action: MouseAction, col: u16) -> TermEvent {
+        TermEvent::Mouse {
+            action,
+            col,
+            row: 0,
+            modifiers: Modifiers::default(),
+        }
+    }
+
+    fn columns(inputs: &[TermEvent]) -> Vec<u16> {
+        inputs
+            .iter()
+            .map(|input| match input {
+                TermEvent::Mouse { col, .. } => *col,
+                _ => u16::MAX,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mouse_moves_are_throttled_to_the_latest_position() {
+        let mut throttle = MoveThrottle::default();
+        let start = Instant::now();
+        let moved = |col| vec![mouse(MouseAction::Moved, col)];
+
+        assert_eq!(columns(&throttle.push(start, moved(1))), [1]);
+        assert!(throttle.push(start, moved(2)).is_empty());
+        assert!(
+            throttle
+                .push(start + Duration::from_millis(3), moved(3))
+                .is_empty()
+        );
+        let deadline = start + MOUSE_MOVE_INTERVAL;
+        assert_eq!(throttle.deadline(), Some(deadline));
+        assert!(
+            throttle
+                .take_due(deadline - Duration::from_millis(1))
+                .is_none()
+        );
+        assert_eq!(
+            columns(&throttle.take_due(deadline).into_iter().collect::<Vec<_>>()),
+            [3]
+        );
+        assert_eq!(throttle.deadline(), None);
+
+        let quiet = deadline + MOUSE_MOVE_INTERVAL;
+        assert_eq!(columns(&throttle.push(quiet, moved(4))), [4]);
+    }
+
+    #[test]
+    fn a_click_flushes_the_held_move_first() {
+        let mut throttle = MoveThrottle::default();
+        let start = Instant::now();
+        throttle.push(start, vec![mouse(MouseAction::Moved, 1)]);
+        assert!(
+            throttle
+                .push(start, vec![mouse(MouseAction::Moved, 2)])
+                .is_empty()
+        );
+
+        let click = mouse(MouseAction::Down(MouseButtonKind::Left), 2);
+        let sent = throttle.push(start, vec![click.clone()]);
+        assert_eq!(sent, [mouse(MouseAction::Moved, 2), click]);
+        assert_eq!(throttle.deadline(), None);
     }
 }
