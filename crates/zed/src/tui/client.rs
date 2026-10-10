@@ -18,6 +18,7 @@ use gpui::{CursorStyle, Modifiers};
 use gpui_tui::{Cell, CellAttrs, CellGrid, CursorShape, Glyph, Rgb};
 use parking_lot::Mutex;
 
+use crate::tui::frame_diff::changed_ranges;
 use crate::tui::protocol::{
     ClientMessage, FrameDecoder, KeyCode, MessageReader, MessageWriter, MouseAction,
     MouseButtonKind, PROTOCOL_VERSION, ServerMessage, TermEvent, WAIT_ONLY_SIZE,
@@ -25,6 +26,7 @@ use crate::tui::protocol::{
 };
 const PUSH_TITLE: &str = "\x1b[22;0t";
 const POP_TITLE: &str = "\x1b[23;0t";
+const REDRAW_MERGE_GAP: usize = 4;
 const POINTER_RESET: &[u8] = b"\x1b]22;text\x1b\\";
 const CURSOR_SHAPE_RESET: &[u8] = b"\x1b[0 q";
 const KEYBOARD_FLAGS_QUERY: &str = "\x1b[?u";
@@ -385,6 +387,21 @@ fn underline_code(attrs: CellAttrs) -> Option<&'static str> {
     }
 }
 
+fn assume_erased(shown: &mut [Cell], wanted: &[Cell]) {
+    for (shown, wanted) in shown.iter_mut().zip(wanted) {
+        if wanted.is_plain_blank() && wanted.attrs.contains(CellAttrs::DEFAULT_BACKGROUND) {
+            *shown = *wanted;
+        }
+    }
+}
+
+fn unknown_cell() -> Cell {
+    Cell {
+        glyph: '\0'.into(),
+        ..Cell::blank(Rgb::default())
+    }
+}
+
 struct Terminal<W: Write> {
     output: W,
     body: Vec<u8>,
@@ -541,7 +558,7 @@ struct DrawSegment {
 struct Renderer<W: Write> {
     terminal: Terminal<W>,
     grid: Option<CellGrid>,
-    drawn_size: Option<(u16, u16)>,
+    screen: Option<CellGrid>,
     decoder: FrameDecoder,
 }
 
@@ -562,7 +579,7 @@ impl<W: Write> Renderer<W> {
                 draw_scratch: DrawScratch::default(),
             },
             grid: None,
-            drawn_size: None,
+            screen: None,
             decoder: FrameDecoder::default(),
         }
     }
@@ -586,7 +603,7 @@ impl<W: Write> Renderer<W> {
     fn resize(&mut self, cols: u16, rows: u16) {
         self.terminal.cols = cols;
         self.terminal.rows = rows;
-        self.drawn_size = None;
+        self.screen = None;
     }
 
     fn grid_fills_terminal(&self) -> bool {
@@ -600,14 +617,35 @@ impl<W: Write> Renderer<W> {
             return Ok(());
         };
         let terminal = &mut self.terminal;
-        if self.drawn_size != Some((grid.cols, grid.rows)) {
-            terminal.clear()?;
-            self.drawn_size = Some((grid.cols, grid.rows));
-        }
+        let mut screen = match self.screen.take() {
+            Some(screen) if screen.cols == grid.cols && screen.rows == grid.rows => screen,
+            _ => {
+                terminal.clear()?;
+                let mut cleared = CellGrid::new(grid.cols, grid.rows, Rgb::default());
+                cleared.cells.fill(unknown_cell());
+                assume_erased(&mut cleared.cells, &grid.cells);
+                cleared
+            }
+        };
         let visible_cols = (grid.cols.min(terminal.cols)) as usize;
         let visible_rows = grid.rows.min(terminal.rows) as usize;
         for row in 0..visible_rows as u16 {
-            terminal.draw(row, grid.row(row), 0..visible_cols)?;
+            let cells = grid.row(row);
+            let visible = cells.get(..visible_cols).unwrap_or(cells);
+            let shown = screen.row(row).get(..visible_cols).unwrap_or_default();
+            let ranges = changed_ranges(shown, visible, REDRAW_MERGE_GAP);
+            if ranges.is_empty() {
+                continue;
+            }
+            for range in ranges {
+                terminal.draw(row, cells, range.clone())?;
+                if let (Some(target), Some(source)) = (
+                    screen.row_mut(row).get_mut(range.clone()),
+                    visible.get(range),
+                ) {
+                    target.copy_from_slice(source);
+                }
+            }
         }
         let caret = grid.cursor.filter(|cursor| {
             (cursor.col as usize) < visible_cols && (cursor.row as usize) < visible_rows
@@ -635,6 +673,7 @@ impl<W: Write> Renderer<W> {
             }
             None => {}
         }
+        self.screen = Some(screen);
         terminal.flush_frame()
     }
 
@@ -1807,6 +1846,18 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_frames_write_nothing() {
+        let mut grid = CellGrid::new(20, 4, Rgb::new(40, 44, 52));
+        mutate(&mut grid, &mut Random::new(7), 10);
+        grid.cursor = Some(CursorPosition { col: 5, row: 2 });
+        let mut renderer = Renderer::new(Vec::new(), 20, 4);
+        let mut emulator = Emulator::new(20, 4);
+        renderer.grid = Some(grid.clone());
+        assert!(emulator.feed(&mut renderer) > 0);
+        assert_eq!(emulator.feed(&mut renderer), 0);
+    }
+
+    #[test]
     fn the_terminal_cursor_follows_the_frame_cursor() {
         let mut grid = CellGrid::new(20, 4, Rgb::new(40, 44, 52));
         text_row(&mut grid, 1, 0, "some text");
@@ -1866,6 +1917,7 @@ mod tests {
                 "{shape:?}"
             );
         }
+        assert_eq!(emulator.feed(&mut renderer), 0);
     }
 
     #[test]
