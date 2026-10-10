@@ -189,6 +189,8 @@ trait AnySettingField {
     fn json_path(&self) -> Option<&'static str>;
 
     fn is_overridden_by_organization(&self, cx: &App) -> bool;
+
+    fn differs_between(&self, content: &SettingsContent, other: &SettingsContent) -> bool;
 }
 
 impl<T: PartialEq + Clone + Send + Sync + 'static> AnySettingField for SettingField<T> {
@@ -276,6 +278,10 @@ impl<T: PartialEq + Clone + Send + Sync + 'static> AnySettingField for SettingFi
         };
 
         (org_override)(&org_config).is_some()
+    }
+
+    fn differs_between(&self, content: &SettingsContent, other: &SettingsContent) -> bool {
+        (self.pick)(content) != (self.pick)(other)
     }
 }
 
@@ -750,7 +756,7 @@ fn open_settings_editor_to_page(
             page_filter.fill(true);
         }
         settings_window.has_query = false;
-        settings_window.filter_matches_to_file();
+        settings_window.filter_matches_to_file(cx);
 
         let Some(navbar_entry_index) = settings_window
             .navbar_entries
@@ -796,7 +802,7 @@ fn open_settings_editor_at_target(
         settings_window.search_bar.update(cx, |editor, cx| {
             editor.set_text(query.clone(), window, cx);
         });
-        settings_window.apply_match_indices(indices.iter().copied(), &query);
+        settings_window.apply_match_indices(indices.iter().copied(), &query, cx);
 
         if indices.len() == 1
             && let Some(search_index) = settings_window.search_index.as_ref()
@@ -2207,13 +2213,26 @@ impl SettingsWindow {
         })
     }
 
-    fn filter_matches_to_file(&mut self) {
+    fn filter_matches_to_file(&mut self, cx: &App) {
         let current_file = self.current_file.mask();
+        let pinned_settings = SettingsStore::global(cx)
+            .get_content_for_file(settings::SettingsFile::Server)
+            .map(|server_settings| (server_settings, SettingsContent::default()));
         for (page, page_filter) in std::iter::zip(&self.pages, &mut self.filter_table) {
             let mut header_index = 0;
             let mut any_found_since_last_header = true;
 
             for (index, item) in page.items.iter().enumerate() {
+                let is_pinned = match item {
+                    SettingsPageItem::SettingItem(SettingItem { field, .. })
+                    | SettingsPageItem::DynamicItem(DynamicItem {
+                        discriminant: SettingItem { field, .. },
+                        ..
+                    }) => pinned_settings
+                        .as_ref()
+                        .is_some_and(|(server, unset)| field.differs_between(server, unset)),
+                    _ => false,
+                };
                 match item {
                     SettingsPageItem::SectionHeader(_) => {
                         if !any_found_since_last_header {
@@ -2228,16 +2247,16 @@ impl SettingsWindow {
                         discriminant: SettingItem { files, .. },
                         ..
                     }) => {
-                        if !files.contains(current_file) {
+                        if !files.contains(current_file) || is_pinned {
                             page_filter[index] = false;
-                        } else {
+                        } else if page_filter[index] || pinned_settings.is_none() {
                             any_found_since_last_header = true;
                         }
                     }
                     SettingsPageItem::ActionLink(ActionLink { files, .. }) => {
                         if !files.contains(current_file) {
                             page_filter[index] = false;
-                        } else {
+                        } else if page_filter[index] || pinned_settings.is_none() {
                             any_found_since_last_header = true;
                         }
                     }
@@ -2274,7 +2293,12 @@ impl SettingsWindow {
         indices
     }
 
-    fn apply_match_indices(&mut self, match_indices: impl Iterator<Item = usize>, query: &str) {
+    fn apply_match_indices(
+        &mut self,
+        match_indices: impl Iterator<Item = usize>,
+        query: &str,
+        cx: &App,
+    ) {
         let Some(search_index) = self.search_index.as_ref() else {
             return;
         };
@@ -2295,7 +2319,7 @@ impl SettingsWindow {
             page[item_index] = true;
         }
         self.has_query = true;
-        self.filter_matches_to_file();
+        self.filter_matches_to_file(cx);
         let query_lower = query.to_lowercase();
         let query_words: Vec<&str> = query_lower.split_whitespace().collect();
         self.open_best_matching_nav_page(&query_words);
@@ -2311,7 +2335,7 @@ impl SettingsWindow {
                 page.fill(true);
             }
             self.has_query = false;
-            self.filter_matches_to_file();
+            self.filter_matches_to_file(cx);
             self.reset_list_state();
             cx.notify();
             return;
@@ -2321,7 +2345,7 @@ impl SettingsWindow {
         if is_json_link_query {
             let indices = self.filter_by_json_path(&query);
             if !indices.is_empty() {
-                self.apply_match_indices(indices.into_iter(), &query);
+                self.apply_match_indices(indices.into_iter(), &query, cx);
                 cx.notify();
                 return;
             }
@@ -2375,7 +2399,7 @@ impl SettingsWindow {
                     .map(|fuzzy_match| fuzzy_match.candidate_id);
                 let merged_indices = exact_indices.chain(fuzzy_indices);
 
-                this.apply_match_indices(merged_indices, &query);
+                this.apply_match_indices(merged_indices, &query, cx);
                 cx.notify();
             })
             .ok();
@@ -5324,6 +5348,7 @@ fn render_icon_theme_picker(
 
 #[cfg(test)]
 pub mod test {
+    mod fork_tests;
 
     use super::*;
 
