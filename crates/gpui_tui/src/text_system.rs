@@ -313,4 +313,20 @@ mod tests {
         assert!(!is_bold(regular));
         assert!(is_bold(bold));
     }
+
+    #[test]
+    fn em_widths_are_one_cell_at_every_font_size() {
+        let text_system = gpui::TextSystem::new(std::sync::Arc::new(TuiTextSystem));
+        let font_id = text_system.resolve_font(&gpui::font("Zed Mono"));
+        for font_size in [px(10.), px(16.)] {
+            assert_eq!(
+                text_system.em_advance(font_id, font_size).unwrap(),
+                px(CELL_WIDTH)
+            );
+            assert_eq!(
+                text_system.em_width(font_id, font_size).unwrap(),
+                px(CELL_WIDTH)
+            );
+        }
+    }
 }
