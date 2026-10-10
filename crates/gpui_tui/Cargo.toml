@@ -1,0 +1,31 @@
+[package]
+name = "gpui_tui"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/gpui_tui.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+bitflags.workspace = true
+collections.workspace = true
+flume.workspace = true
+futures.workspace = true
+gpui.workspace = true
+gpui_util.workspace = true
+log.workspace = true
+open.workspace = true
+parking_lot.workspace = true
+raw-window-handle.workspace = true
+unicode-width.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

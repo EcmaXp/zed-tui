@@ -7746,6 +7746,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpui_tui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bitflags 2.13.1",
+ "collections",
+ "flume 0.12.0",
+ "futures 0.3.34",
+ "gpui",
+ "gpui_util",
+ "log",
+ "open",
+ "parking_lot",
+ "raw-window-handle",
+ "unicode-width 0.2.2",
+ "uuid",
+]
+
+[[package]]
 name = "gpui_util"
 version = "0.1.0"
 dependencies = [
