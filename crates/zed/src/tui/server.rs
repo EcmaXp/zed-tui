@@ -230,6 +230,10 @@ pub fn start_session(
             hub.broadcast_message(ServerMessage::Title(title.to_string()));
         }
     });
+    platform.on_clipboard_write({
+        let hub = hub.clone();
+        move |text| hub.broadcast_message(ServerMessage::Clipboard(text))
+    });
 
     let started = Started {
         on_frame: Box::new({

@@ -329,6 +329,7 @@ impl<W: Write> Renderer<W> {
                 self.decoder.apply(&mut self.grid, message);
                 return Ok(true);
             }
+            ServerMessage::Clipboard(text) => self.copy_to_clipboard(text)?,
             ServerMessage::Title(title) => self.set_title(title)?,
             ServerMessage::Shutdown | ServerMessage::Error(_) => {}
         }
@@ -389,6 +390,14 @@ impl<W: Write> Renderer<W> {
         write!(self.terminal.output, "\x1b]2;{title}\x07")?;
         self.terminal.output.flush()
     }
+
+    fn copy_to_clipboard(&mut self, text: &str) -> io::Result<()> {
+        crossterm::queue!(
+            self.terminal.output,
+            crossterm::clipboard::CopyToClipboard::to_clipboard_from(text)
+        )?;
+        self.terminal.output.flush()
+    }
 }
 
 enum ClientEvent {
@@ -414,7 +423,9 @@ fn exit_of(message: &ServerMessage) -> Option<Exit> {
     match message {
         ServerMessage::Shutdown => Some(Exit::ServerShutdown),
         ServerMessage::Error(error) => Some(Exit::Rejected(error.clone())),
-        ServerMessage::FullFrame(..) | ServerMessage::Title(_) => None,
+        ServerMessage::FullFrame(..) | ServerMessage::Clipboard(_) | ServerMessage::Title(_) => {
+            None
+        }
     }
 }
 
@@ -850,6 +861,15 @@ mod tests {
         let (result, undo) = undo_after_setup(0);
         assert!(result.is_ok());
         assert!(undo.contains(LEAVE_ALTERNATE_SCREEN) && undo.ends_with(POP_TITLE));
+    }
+
+    #[test]
+    fn clipboard_uses_osc52_with_st() {
+        let mut renderer = Renderer::new(Vec::new(), 10, 2);
+        renderer
+            .apply(&ServerMessage::Clipboard("hi".into()))
+            .unwrap();
+        assert_eq!(renderer.terminal.output, b"\x1b]52;c;aGk=\x1b\\");
     }
 
     #[test]
