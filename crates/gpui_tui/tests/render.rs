@@ -5,8 +5,9 @@ use std::{cell::RefCell, ops::Range, rc::Rc, time::Duration};
 use gpui::{
     AnyWindowHandle, App, AppContext as _, Application, BorderStyle, Bounds, Context,
     ElementInputHandler, EntityInputHandler, FocusHandle, InteractiveElement as _, IntoElement,
-    PaintQuad, ParentElement, Pixels, Render, Styled, UTF16Selection, Window, WindowOptions,
-    canvas, div, fill, outline, point, px, rgb, size,
+    KeyDownEvent, Keystroke, Modifiers, PaintQuad, ParentElement, Pixels, PlatformInput, Render,
+    Styled, UTF16Selection, Window, WindowOptions, canvas, div, fill, outline, point, px, rgb,
+    size,
 };
 use gpui_tui::{CellAttrs, CellGrid, CursorPosition, CursorShape, Rgb, TuiPlatform};
 
@@ -403,6 +404,66 @@ fn only_the_active_window_reaches_the_screen() {
     assert_eq!(shown(0), ["second"]);
     assert_eq!(shown(1), ["first"]);
     assert_eq!(shown(2), ["second"]);
+}
+
+struct ModifierRecorder {
+    focus_handle: FocusHandle,
+    seen: Rc<RefCell<Vec<Modifiers>>>,
+}
+
+impl Render for ModifierRecorder {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let seen = self.seen.clone();
+        div()
+            .size_full()
+            .track_focus(&self.focus_handle)
+            .on_modifiers_changed(move |event, _, _| seen.borrow_mut().push(event.modifiers))
+    }
+}
+
+fn key_down(keystroke: &str) -> PlatformInput {
+    PlatformInput::KeyDown(KeyDownEvent {
+        keystroke: Keystroke::parse(keystroke).unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+    })
+}
+
+#[test]
+fn terminal_keys_release_their_modifiers_after_each_press() {
+    let platform = TuiPlatform::new(20, 4);
+    let seen: Rc<RefCell<Vec<Modifiers>>> = Rc::default();
+    let seen_after_plain_key: Rc<RefCell<Option<usize>>> = Rc::default();
+    Application::with_platform(platform.clone()).run({
+        let seen = seen.clone();
+        let seen_after_plain_key = seen_after_plain_key.clone();
+        move |cx: &mut App| {
+            cx.open_window(WindowOptions::default(), |window, cx| {
+                let recorder = cx.new(|cx| ModifierRecorder {
+                    focus_handle: cx.focus_handle(),
+                    seen: seen.clone(),
+                });
+                let focus_handle = recorder.read(cx).focus_handle.clone();
+                window.focus(&focus_handle, cx);
+                recorder
+            })
+            .expect("failed to open window");
+            cx.spawn(async move |cx| {
+                let settle = Duration::from_millis(20);
+                cx.background_executor().timer(settle).await;
+                platform.handle_input(key_down("a"));
+                cx.background_executor().timer(settle).await;
+                *seen_after_plain_key.borrow_mut() = Some(seen.borrow().len());
+                platform.handle_input(key_down("ctrl-a"));
+                cx.background_executor().timer(settle).await;
+                cx.update(|cx| cx.quit());
+            })
+            .detach();
+        }
+    });
+
+    assert_eq!(*seen_after_plain_key.borrow(), Some(0));
+    assert_eq!(*seen.borrow(), [Modifiers::default()]);
 }
 
 struct Banner(String);

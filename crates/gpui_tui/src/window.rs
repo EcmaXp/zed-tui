@@ -5,10 +5,11 @@ use std::{
 };
 
 use gpui::{
-    AnyWindowHandle, Bounds, Capslock, DispatchEventResult, GpuSpecs, Modifiers, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, PromptLevel, RequestFrameOptions, Scene, Size, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams, WindowVisibility,
+    AnyWindowHandle, Bounds, Capslock, DispatchEventResult, GpuSpecs, Modifiers,
+    ModifiersChangedEvent, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
+    Scene, Size, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    WindowParams, WindowVisibility,
 };
 
 use crate::{
@@ -109,14 +110,16 @@ impl TuiWindowHandle {
             }
         }
 
-        let typed = match &input {
-            PlatformInput::KeyDown(event) => event
-                .keystroke
-                .modifiers
-                .is_subset_of(&Modifiers::shift())
-                .then(|| event.keystroke.key_char.clone())
-                .flatten(),
-            _ => None,
+        let (typed, releases_modifiers) = match &input {
+            PlatformInput::KeyDown(event) => {
+                let modifiers = event.keystroke.modifiers;
+                let typed = modifiers
+                    .is_subset_of(&Modifiers::shift())
+                    .then(|| event.keystroke.key_char.clone())
+                    .flatten();
+                (typed, modifiers.modified())
+            }
+            _ => (None, false),
         };
         let result = with_taken(
             &self.callbacks,
@@ -126,6 +129,13 @@ impl TuiWindowHandle {
         let handled = result.is_some_and(|result| !result.propagate);
         if !handled && let Some(typed) = typed {
             self.insert_text(&typed);
+        }
+
+        if releases_modifiers {
+            self.handle_input(PlatformInput::ModifiersChanged(ModifiersChangedEvent {
+                modifiers: Modifiers::default(),
+                capslock: Capslock::default(),
+            }));
         }
     }
 
