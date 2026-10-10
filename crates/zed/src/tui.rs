@@ -62,6 +62,7 @@ mod unix {
         io::Write as _,
         path::{Path, PathBuf},
         rc::Rc,
+        time::Duration,
     };
 
     use anyhow::{Context as _, Result};
@@ -118,10 +119,27 @@ mod unix {
         Kill { path: Option<PathBuf> },
         #[command(about = "List running sessions")]
         Ls,
+        #[command(
+            hide = true,
+            about = "Render one frame and print it without starting a server"
+        )]
+        Snapshot {
+            paths: Vec<PathBuf>,
+            #[arg(long, default_value_t = DEFAULT_COLS)]
+            cols: u16,
+            #[arg(long, default_value_t = DEFAULT_ROWS)]
+            rows: u16,
+            #[arg(long, default_value_t = 3000)]
+            wait_ms: u64,
+            #[arg(long)]
+            ansi: bool,
+            #[arg(long, value_delimiter = ' ')]
+            keys: Vec<String>,
+        },
     }
 
     pub struct TuiServer {
-        _session: server::SessionGuard,
+        _session: Option<server::SessionGuard>,
         paths: Vec<PathBuf>,
     }
 
@@ -263,7 +281,31 @@ mod unix {
                     server::start_session(session_paths, root.as_deref(), platform.clone())?;
                 Ok(Outcome::Serve(
                     TuiServer {
-                        _session: session,
+                        _session: Some(session),
+                        paths: absolute_paths(paths)?,
+                    },
+                    Startup { platform, started },
+                ))
+            }
+            Some(Command::Snapshot {
+                paths,
+                cols,
+                rows,
+                wait_ms,
+                ansi,
+                keys,
+            }) => {
+                unsafe { std::env::set_var("ZED_STATELESS", "1") };
+                let platform = TuiPlatform::new(cols, rows);
+                let started = server::start_snapshot(
+                    platform.clone(),
+                    Duration::from_millis(wait_ms),
+                    keys,
+                    ansi,
+                )?;
+                Ok(Outcome::Serve(
+                    TuiServer {
+                        _session: None,
                         paths: absolute_paths(paths)?,
                     },
                     Startup { platform, started },

@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     ffi::OsString,
     fs,
     io::{BufReader, ErrorKind, Write as _},
@@ -422,6 +423,63 @@ pub fn start_session(
         _pid_lock: pid_lock,
     };
     Ok((session, started))
+}
+
+fn print_snapshot(grid: Option<CellGrid>, ansi: bool) {
+    let Some(grid) = grid else {
+        eprintln!("zed --tui: no frame was rendered");
+        return;
+    };
+    if !ansi {
+        println!("{}", grid.text());
+        return;
+    }
+    match crate::tui::client::ansi_text(&grid) {
+        Ok(text) => print!("{text}"),
+        Err(error) => eprintln!("zed --tui: {error:#}"),
+    }
+}
+
+pub fn start_snapshot(
+    platform: Rc<TuiPlatform>,
+    wait: Duration,
+    keys: Vec<String>,
+    ansi: bool,
+) -> Result<Started> {
+    let keystrokes = keys
+        .iter()
+        .map(|key| {
+            gpui::Keystroke::parse(key)
+                .map(gpui::Keystroke::with_simulated_ime)
+                .with_context(|| format!("parsing key {key:?}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let last_frame: Rc<RefCell<Option<CellGrid>>> = Rc::default();
+    Ok(Started {
+        on_frame: Box::new({
+            let last_frame = last_frame.clone();
+            move |grid| *last_frame.borrow_mut() = Some(grid)
+        }),
+        after_start: Box::new(move |cx| {
+            cx.spawn(async move |cx| {
+                cx.background_executor().timer(wait / 2).await;
+                for keystroke in keystrokes {
+                    platform.handle_input(gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                        keystroke,
+                        is_held: false,
+                        prefer_character_input: false,
+                    }));
+                    cx.background_executor()
+                        .timer(Duration::from_millis(100))
+                        .await;
+                }
+                cx.background_executor().timer(wait / 2).await;
+                print_snapshot(last_frame.borrow_mut().take(), ansi);
+                cx.update(|cx| cx.quit());
+            })
+            .detach();
+        }),
+    })
 }
 
 fn file_urls(paths: &[PathBuf]) -> Vec<String> {

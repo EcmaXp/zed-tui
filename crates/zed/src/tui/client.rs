@@ -674,6 +674,23 @@ fn pointer_name(style: CursorStyle) -> &'static str {
     }
 }
 
+pub fn ansi_text(grid: &CellGrid) -> io::Result<String> {
+    let mut output = Vec::new();
+    for row in 0..grid.rows {
+        let mut pen = Pen::default();
+        for cell in grid.row(row) {
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            pen.write_style(&mut output, Style::of_cell(cell, false))?;
+            cell.glyph.write_to(&mut output)?;
+        }
+        crossterm::queue!(output, style::ResetColor)?;
+        output.push(b'\n');
+    }
+    Ok(String::from_utf8_lossy(&output).into_owned())
+}
+
 enum ClientEvent {
     Terminal(event::Event),
     Exit(Exit),
