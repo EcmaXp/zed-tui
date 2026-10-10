@@ -928,6 +928,174 @@ impl LspInstaller for RustLspAdapter {
 
 pub(crate) struct RustContextProvider;
 
+pub(crate) struct RustRunnableResolver;
+
+const DOC_TEST_FENCE: &str = "```";
+
+const TEST_ATTRIBUTE_TEXT: &str = "test";
+
+fn doc_comment_content(comment: &str) -> Option<&str> {
+    if let Some(content) = comment.strip_prefix("//!") {
+        return Some(content);
+    }
+    let content = comment.strip_prefix("///")?;
+    (!content.starts_with('/')).then_some(content)
+}
+
+fn closing_doc_test_fence(comments_before_item: &str) -> Option<&str> {
+    for line in comments_before_item.split_inclusive('\n') {
+        let comment = line.trim_start();
+        if comment.trim_end().is_empty() {
+            continue;
+        }
+        if !comment.starts_with("//") {
+            return None;
+        }
+        if doc_comment_content(comment).is_some_and(|content| content.contains(DOC_TEST_FENCE)) {
+            return Some(comment);
+        }
+    }
+    None
+}
+
+fn resolve_doc_test(
+    local_captures: &[RunnableMatchCapture],
+    shared_captures: &[RunnableMatchCapture],
+    buffer: &BufferSnapshot,
+) -> Option<ResolvedRunnable> {
+    let opening = local_captures
+        .iter()
+        .find(|capture| capture.is_run())?
+        .range();
+    let opening_text = buffer.text_for_range(opening.clone()).collect::<String>();
+    let opening_content = doc_comment_content(&opening_text)?;
+    if !opening_content.contains(DOC_TEST_FENCE) {
+        return None;
+    }
+    let item = shared_captures
+        .iter()
+        .find(|capture| capture.name() == Some("_end"))?
+        .range();
+    let comments_before_item = buffer
+        .text_for_range(opening.end..item.start)
+        .collect::<String>();
+    let closing = closing_doc_test_fence(&comments_before_item)?;
+    let closing_content = doc_comment_content(closing)?;
+
+    Some(ResolvedRunnable {
+        run_range: opening.clone(),
+        extra_captures: SmallVec::from_vec(vec![
+            ("_comment_content".to_string(), opening_content.to_string()),
+            ("_end_code_block".to_string(), closing.to_string()),
+            (
+                "_end_comment_content".to_string(),
+                closing_content.to_string(),
+            ),
+            ("_start".to_string(), opening_text.clone()),
+        ]),
+        full_range: Some(opening.start..item.end),
+    })
+}
+
+fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).collect()
+}
+
+fn attribute_item_at<'a>(buffer: &'a BufferSnapshot, range: &Range<usize>) -> Option<Node<'a>> {
+    buffer
+        .syntax_layers_for_range(range.clone(), true)
+        .filter_map(|layer| {
+            layer
+                .node()
+                .descendant_for_byte_range(range.start, range.end)
+        })
+        .find(|node| node.kind() == "attribute_item" && node.byte_range() == *range)
+}
+
+fn test_attribute_identifier<'a>(
+    attribute_item: Node<'a>,
+    buffer: &BufferSnapshot,
+) -> Option<Node<'a>> {
+    named_children(attribute_item)
+        .into_iter()
+        .filter(|child| child.kind() == "attribute")
+        .flat_map(named_children)
+        .flat_map(|path| match path.kind() {
+            "identifier" => vec![path],
+            "scoped_identifier" => named_children(path)
+                .into_iter()
+                .filter(|segment| segment.kind() == "identifier")
+                .collect(),
+            _ => Vec::new(),
+        })
+        .find(|identifier| {
+            buffer
+                .text_for_range(identifier.byte_range())
+                .collect::<String>()
+                .contains(TEST_ATTRIBUTE_TEXT)
+        })
+}
+
+fn resolve_test(
+    local_captures: &[RunnableMatchCapture],
+    shared_captures: &[RunnableMatchCapture],
+    buffer: &BufferSnapshot,
+) -> Option<ResolvedRunnable> {
+    let attribute_item_range = local_captures
+        .iter()
+        .find(|capture| capture.name() == Some("_attribute_item"))?
+        .range();
+    let attribute_text = buffer
+        .text_for_range(attribute_item_range.clone())
+        .collect::<String>();
+    if !attribute_text.contains(TEST_ATTRIBUTE_TEXT) {
+        return None;
+    }
+    let attribute_item = attribute_item_at(buffer, &attribute_item_range)?;
+    let test_identifier = test_attribute_identifier(attribute_item, buffer)?;
+    let function_name = shared_captures
+        .iter()
+        .find(|capture| capture.is_run())?
+        .range();
+    let function = shared_captures
+        .iter()
+        .find(|capture| capture.name() == Some("_end"))?
+        .range();
+
+    Some(ResolvedRunnable {
+        run_range: function_name,
+        extra_captures: SmallVec::from_vec(vec![
+            (
+                "_attribute".to_string(),
+                buffer
+                    .text_for_range(test_identifier.byte_range())
+                    .collect(),
+            ),
+            ("_start".to_string(), attribute_text),
+        ]),
+        full_range: Some(attribute_item_range.start..function.end),
+    })
+}
+
+impl RunnableResolver for RustRunnableResolver {
+    fn resolve(
+        &self,
+        local_captures: &[RunnableMatchCapture],
+        shared_captures: &[RunnableMatchCapture],
+        buffer: &BufferSnapshot,
+    ) -> Option<ResolvedRunnable> {
+        let is_test_match = shared_captures
+            .iter()
+            .any(|capture| capture.name() == Some("_test_name"));
+        if is_test_match {
+            resolve_test(local_captures, shared_captures, buffer)
+        } else {
+            resolve_doc_test(local_captures, shared_captures, buffer)
+        }
+    }
+}
+
 const RUST_PACKAGE_TASK_VARIABLE: VariableName =
     VariableName::Custom(Cow::Borrowed("RUST_PACKAGE"));
 
@@ -1208,6 +1376,10 @@ impl ContextProvider for RustContextProvider {
     fn lsp_task_source(&self) -> Option<LanguageServerName> {
         Some(SERVER_NAME)
     }
+
+    fn runnable_resolver(&self) -> Option<Arc<dyn RunnableResolver>> {
+        Some(Arc::new(RustRunnableResolver))
+    }
 }
 
 /// Part of the data structure of Cargo metadata
@@ -1471,6 +1643,7 @@ fn test_fragment(variables: &TaskVariables, path: &Path, stem: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    mod fork_tests;
     use std::num::NonZeroU32;
 
     use super::*;

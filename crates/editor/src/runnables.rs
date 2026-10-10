@@ -890,8 +890,8 @@ mod tests {
     use futures::StreamExt as _;
     use gpui::{AppContext as _, Entity, Task, TestAppContext};
     use indoc::indoc;
-    use language::{ContextProvider, FakeLspAdapter};
-    use languages::rust_lang;
+    use language::{ContextProvider, FakeLspAdapter, RunnableResolver};
+    use languages::{rust_lang, rust_runnable_resolver};
     use lsp::LanguageServerName;
     use multi_buffer::{MultiBuffer, PathKey};
     use project::{
@@ -939,6 +939,10 @@ mod tests {
                     ..TaskTemplate::default()
                 },
             ])))
+        }
+
+        fn runnable_resolver(&self) -> Option<Arc<dyn RunnableResolver>> {
+            Some(rust_runnable_resolver())
         }
     }
 
