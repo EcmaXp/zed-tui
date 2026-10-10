@@ -1,4 +1,5 @@
 pub mod active_file_name;
+mod cell_layout;
 pub mod dock;
 pub mod history_manager;
 pub mod invalid_item_view;
@@ -9729,36 +9730,35 @@ impl Render for Workspace {
                                             workspace.previous_dock_drag_coordinates =
                                                 Some(e.event.position);
 
-                                            match e.drag(cx).0 {
-                                                DockPosition::Left => {
-                                                    workspace.resize_left_dock(
-                                                        e.event.position.x
-                                                            - workspace.bounds.left(),
-                                                        window,
-                                                        cx,
-                                                    );
-                                                }
-                                                DockPosition::Right => {
-                                                    workspace.resize_right_dock(
-                                                        workspace.bounds.right()
-                                                            - e.event.position.x,
-                                                        window,
-                                                        cx,
-                                                    );
-                                                }
-                                                DockPosition::Bottom => {
-                                                    workspace.resize_bottom_dock(
-                                                        workspace.bounds.bottom()
-                                                            - e.event.position.y,
-                                                        window,
-                                                        cx,
-                                                    );
-                                                }
-                                            };
+                                            let position = e.drag(cx).0;
+                                            let size = cell_layout::dock_size_for_pointer(
+                                                position,
+                                                e.event.position,
+                                                workspace.bounds,
+                                                window.text_system().cell_size(),
+                                            );
+                                            workspace.resize_dock(position, size, window, cx);
                                             workspace.serialize_workspace(window, cx);
                                         }
                                     },
                                 ))
+                                .when(
+                                    window.text_system().cell_size().is_some(),
+                                    |this| {
+                                        this.on_drop(cx.listener(
+                                            |workspace, dock: &DraggedDock, window, cx| {
+                                                let size = cell_layout::dock_size_for_pointer(
+                                                    dock.0,
+                                                    window.mouse_position(),
+                                                    workspace.bounds,
+                                                    window.text_system().cell_size(),
+                                                );
+                                                workspace.resize_dock(dock.0, size, window, cx);
+                                                workspace.serialize_workspace(window, cx);
+                                            },
+                                        ))
+                                    },
+                                )
                             })
                             .child({
                                 match bottom_dock_layout {
