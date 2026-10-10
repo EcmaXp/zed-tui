@@ -10,6 +10,25 @@ pub(super) fn enable_sticky_scroll(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn test_repeated_blink_pauses_leave_a_single_pending_resume(cx: &mut TestAppContext) {
+    let blink_manager = cx.new(|cx| BlinkManager::new(Duration::from_millis(500), |_| true, cx));
+    for _ in 0..5 {
+        blink_manager.update(cx, BlinkManager::pause_blinking);
+        cx.run_until_parked();
+    }
+
+    let executor = cx.executor().scheduler_executor();
+    let scheduler = executor
+        .scheduler()
+        .as_test()
+        .expect("gpui tests run on the test scheduler");
+    scheduler.clock().advance(Duration::from_millis(500));
+    assert!(scheduler.tick());
+    let (foreground, background) = scheduler.pending_task_counts();
+    assert_eq!(foreground + background, 1);
+}
+
+#[gpui::test]
 async fn test_highlight_background_without_ranges_before_or_after_does_not_notify(
     cx: &mut TestAppContext,
 ) {
