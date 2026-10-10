@@ -158,6 +158,7 @@ mod unix {
     pub struct Startup {
         platform: Rc<TuiPlatform>,
         started: server::Started,
+        database_dir: Option<PathBuf>,
     }
 
     pub fn start() -> Option<(TuiServer, Startup)> {
@@ -279,6 +280,7 @@ mod unix {
             Some(Command::Server { root, paths }) => {
                 let name = cli.session.unwrap_or_else(|| "default".to_owned());
                 let session_paths = server::SessionPaths::new(&name)?;
+                let database_dir = session_paths.directory.join("db");
                 let platform = TuiPlatform::new(DEFAULT_COLS, DEFAULT_ROWS);
                 let root = root.map(|root| root.canonicalize().unwrap_or(root));
                 let (session, started) =
@@ -288,7 +290,11 @@ mod unix {
                         _session: Some(session),
                         paths: absolute_paths(paths)?,
                     },
-                    Startup { platform, started },
+                    Startup {
+                        platform,
+                        started,
+                        database_dir: Some(database_dir),
+                    },
                 ))
             }
             Some(Command::Snapshot {
@@ -312,7 +318,11 @@ mod unix {
                         _session: None,
                         paths: absolute_paths(paths)?,
                     },
-                    Startup { platform, started },
+                    Startup {
+                        platform,
+                        started,
+                        database_dir: None,
+                    },
                 ))
             }
         }
@@ -472,7 +482,13 @@ mod unix {
         }
 
         pub fn database(&self) -> db::AppDatabase {
-            db::AppDatabase::new()
+            match &self.database_dir {
+                Some(directory) => db::AppDatabase(gpui::block_on(db::open_db::<db::AppMigrator>(
+                    directory,
+                    *db::RELEASE_CHANNEL,
+                ))),
+                None => db::AppDatabase::new(),
+            }
         }
 
         pub fn init(self, cx: &mut App) {
@@ -483,6 +499,7 @@ mod unix {
                         mut on_frame,
                         after_start,
                     },
+                ..
             } = self;
 
             CommandPaletteFilter::update_global(cx, |filter, _| {
