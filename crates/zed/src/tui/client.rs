@@ -44,12 +44,20 @@ const KEYBOARD_FLAGS_QUERY: &str = "\x1b[?u";
 const VERSION_QUERY: &str = "\x1b[>0q";
 const DEVICE_ATTRIBUTES_QUERY: &str = "\x1b[c";
 const FIRST_PALETTE_SLOT: u8 = 16;
+const GRAY_SLOTS_BY_LIGHTNESS: [u8; 4] = [0, 8, 7, 15];
+const COLORED_ANSI_SLOTS: [u8; 12] = [1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14];
+const MAX_GRAY_SPREAD: u8 = 24;
+const MAX_ANSI_MATCH_DISTANCE: f32 = 0.08;
+const MAX_ANSI_MATCH_HUE_DEGREES: f32 = 20.0;
+const ANSI_SWITCH_GAIN_DIVISOR: u32 = 4;
+const MIN_ANSI_SWITCH_USES: u32 = 32;
 const PALETTE_SLOTS: u8 = u8::MAX - FIRST_PALETTE_SLOT + 1;
 const MAX_OSC_PARAMS: usize = 16;
 const MAX_VERSION_REPLY: usize = 64;
 const GHOSTTY_VERSION_PREFIXES: [&[u8]; 2] = [b"ghostty", b"libghostty"];
 const OSC_PALETTE_PAIRS: usize = (MAX_OSC_PARAMS - 1) / 2;
 const OSC_RESET_SLOTS: usize = MAX_OSC_PARAMS - 1;
+const BRIGHT_ANSI_OFFSET: u8 = 60;
 const SYNCHRONIZED_FRAME_BYTES: usize = 512;
 const QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 const HANGUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -298,7 +306,9 @@ fn signal_restore(original: &HashMap<u8, String>, margin_mode: bool, ghostty: bo
 }
 
 fn palette_restore(slots_used: u8, original: &HashMap<u8, String>) -> String {
-    let slots = (FIRST_PALETTE_SLOT..=u8::MAX).take(usize::from(slots_used));
+    let slots = (0..FIRST_PALETTE_SLOT)
+        .filter(|slot| original.contains_key(slot))
+        .chain((FIRST_PALETTE_SLOT..=u8::MAX).take(usize::from(slots_used)));
     let (mut known, mut unknown) = (Vec::new(), Vec::new());
     for slot in slots {
         match original.get(&slot) {
@@ -342,12 +352,67 @@ impl std::fmt::Display for RgbSpec {
     }
 }
 
+fn parse_rgb_spec(spec: &str) -> Option<Rgb> {
+    let mut channels = spec.strip_prefix("rgb:")?.split('/').map(|hex| {
+        let digits = u32::try_from(hex.len())
+            .ok()
+            .filter(|digits| (1..=4).contains(digits))?;
+        let max = (1u32 << (4 * digits)) - 1;
+        let value = u32::from_str_radix(hex, 16).ok()?;
+        u8::try_from((value * 255 + max / 2) / max).ok()
+    });
+    let rgb = Rgb::new(channels.next()??, channels.next()??, channels.next()??);
+    channels.next().is_none().then_some(rgb)
+}
+
+fn is_gray(color: Rgb) -> bool {
+    let max = color.r.max(color.g).max(color.b);
+    let min = color.r.min(color.g).min(color.b);
+    max - min <= MAX_GRAY_SPREAD
+}
+
+#[derive(Clone, Copy)]
+struct Perceptual {
+    lab: theme::Oklab,
+    lch: theme::Oklch,
+}
+
+impl Perceptual {
+    fn of(color: Rgb) -> Self {
+        let hsla: gpui::Hsla = gpui::rgb(u32::from(color)).into();
+        Self {
+            lab: theme::hsla_to_oklab(hsla),
+            lch: theme::hsla_to_oklch(hsla),
+        }
+    }
+
+    fn near_match_distance(&self, terminal: &Perceptual) -> Option<f32> {
+        let (a, b) = (self.lab, terminal.lab);
+        let distance = ((a.l - b.l).powi(2) + (a.a - b.a).powi(2) + (a.b - b.b).powi(2)).sqrt();
+        let hue_difference = (self.lch.hue - terminal.lch.hue).abs();
+        let hue_difference = hue_difference.min(360.0 - hue_difference);
+        (distance < MAX_ANSI_MATCH_DISTANCE && hue_difference < MAX_ANSI_MATCH_HUE_DEGREES)
+            .then_some(distance)
+    }
+}
+
+struct ColorUse {
+    count: u32,
+    lightness: f32,
+    nearest_ansi_slots: Vec<u8>,
+}
+
 #[derive(Default)]
 struct Palette {
     enabled: bool,
     slots: HashMap<Rgb, u8>,
     slots_used: Arc<AtomicU8>,
     definitions: Vec<(u8, Rgb)>,
+    reported_ansi: [Option<Perceptual>; FIRST_PALETTE_SLOT as usize],
+    defined_ansi: [Option<Rgb>; FIRST_PALETTE_SLOT as usize],
+    ansi: HashMap<Rgb, u8>,
+    uses: HashMap<Rgb, ColorUse>,
+    uses_changed: bool,
 }
 
 impl Palette {
@@ -355,15 +420,125 @@ impl Palette {
         Self {
             enabled: !original.is_empty(),
             slots_used,
+            reported_ansi: std::array::from_fn(|slot| {
+                let spec = original.get(&u8::try_from(slot).ok()?)?;
+                Some(Perceptual::of(parse_rgb_spec(spec)?))
+            }),
             ..Self::default()
         }
+    }
+
+    fn count_use(&mut self, color: PenColor) {
+        let PenColor::Color(color) = color else {
+            return;
+        };
+        if !self.enabled {
+            return;
+        }
+        self.uses_changed = true;
+        let reported_ansi = &self.reported_ansi;
+        self.uses
+            .entry(color)
+            .or_insert_with(|| {
+                let perceptual = Perceptual::of(color);
+                let mut nearest: Vec<(f32, u8)> = if is_gray(color) {
+                    Vec::new()
+                } else {
+                    COLORED_ANSI_SLOTS
+                        .into_iter()
+                        .filter_map(|slot| {
+                            let reported = reported_ansi[usize::from(slot)].as_ref()?;
+                            Some((perceptual.near_match_distance(reported)?, slot))
+                        })
+                        .collect()
+                };
+                nearest.sort_by(|a, b| a.0.total_cmp(&b.0));
+                ColorUse {
+                    count: 0,
+                    lightness: perceptual.lab.l,
+                    nearest_ansi_slots: nearest.into_iter().map(|(_, slot)| slot).collect(),
+                }
+            })
+            .count += 1;
+    }
+
+    fn best_ansi(&self) -> HashMap<Rgb, u8> {
+        let mut by_use: Vec<(&Rgb, &ColorUse)> = self.uses.iter().collect();
+        by_use.sort_by_key(|(color, usage)| {
+            (std::cmp::Reverse(usage.count), color.r, color.g, color.b)
+        });
+        let is_reported = |slot: &u8| self.reported_ansi[usize::from(*slot)].is_some();
+
+        let gray_slots: Vec<u8> = GRAY_SLOTS_BY_LIGHTNESS
+            .into_iter()
+            .filter(is_reported)
+            .collect();
+        let mut grays: Vec<(Rgb, f32)> = by_use
+            .iter()
+            .filter(|(color, _)| is_gray(**color))
+            .take(gray_slots.len())
+            .map(|(color, usage)| (**color, usage.lightness))
+            .collect();
+        grays.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let mut best: HashMap<Rgb, u8> = grays
+            .into_iter()
+            .map(|(color, _)| color)
+            .zip(gray_slots)
+            .collect();
+
+        let mut taken = [false; FIRST_PALETTE_SLOT as usize];
+        for (color, usage) in &by_use {
+            if let Some(slot) = usage
+                .nearest_ansi_slots
+                .iter()
+                .find(|slot| !taken[usize::from(**slot)])
+            {
+                taken[usize::from(*slot)] = true;
+                best.insert(**color, *slot);
+            }
+        }
+        best
+    }
+
+    fn rebalance_ansi(&mut self) -> Vec<Rgb> {
+        if !std::mem::take(&mut self.uses_changed) {
+            return Vec::new();
+        }
+        let best = self.best_ansi();
+        let uses_of = |assignment: &HashMap<Rgb, u8>| -> u32 {
+            assignment
+                .keys()
+                .filter_map(|color| self.uses.get(color))
+                .map(|usage| usage.count)
+                .sum()
+        };
+        let (current_uses, best_uses) = (uses_of(&self.ansi), uses_of(&best));
+        if best_uses < current_uses + current_uses / ANSI_SWITCH_GAIN_DIVISOR + MIN_ANSI_SWITCH_USES
+        {
+            return Vec::new();
+        }
+        let moved: Vec<Rgb> = self
+            .ansi
+            .iter()
+            .filter(|(color, slot)| best.get(color) != Some(slot))
+            .map(|(color, _)| *color)
+            .collect();
+        for (color, slot) in &best {
+            let defined = &mut self.defined_ansi[usize::from(*slot)];
+            if *defined != Some(*color) {
+                *defined = Some(*color);
+                self.definitions.push((*slot, *color));
+            }
+        }
+        self.ansi = best;
+        moved
     }
 
     fn slot_for(&mut self, color: Rgb) -> Option<u8> {
         if !self.enabled {
             return None;
         }
-        if let Some(slot) = self.slots.get(&color) {
+        if let Some(slot) = self.ansi.get(&color).or_else(|| self.slots.get(&color)) {
             return Some(*slot);
         }
         let slot = u8::try_from(FIRST_PALETTE_SLOT as usize + self.slots.len()).ok()?;
@@ -393,9 +568,13 @@ impl Palette {
         let PenColor::Color(rgb) = color else {
             return SgrParam::Code(layer.default_code());
         };
-        match self.slot_for(rgb) {
-            Some(slot) => SgrParam::Indexed(layer.extended_code(), slot),
-            None => SgrParam::Color(layer.extended_code(), rgb),
+        match (self.slot_for(rgb), layer.ansi_base()) {
+            (Some(slot), Some(base)) if slot < 8 => SgrParam::Ansi(base + slot),
+            (Some(slot), Some(base)) if slot < FIRST_PALETTE_SLOT => {
+                SgrParam::Ansi(base + BRIGHT_ANSI_OFFSET + slot - 8)
+            }
+            (Some(slot), _) => SgrParam::Indexed(layer.extended_code(), slot),
+            (None, _) => SgrParam::Color(layer.extended_code(), rgb),
         }
     }
 }
@@ -408,6 +587,14 @@ enum Layer {
 }
 
 impl Layer {
+    fn ansi_base(self) -> Option<u8> {
+        match self {
+            Self::Foreground => Some(30),
+            Self::Background => Some(40),
+            Self::Underline => None,
+        }
+    }
+
     fn extended_code(self) -> &'static str {
         match self {
             Self::Foreground => "38",
@@ -654,13 +841,27 @@ impl Pen {
         let Some(plan) = self.plan(&style, &mut color) else {
             return Ok(());
         };
-        self.write_plan(output, &style, &plan, &mut color)
+        let counted_fg = if plan.resets {
+            style.fg
+        } else {
+            style.fg.filter(|fg| self.fg != Some(*fg))
+        };
+        let counts_bg = plan.resets || self.bg != style.bg;
+        self.write_plan(output, &style, &plan, &mut color)?;
+        if let Some(fg) = counted_fg {
+            palette.count_use(fg);
+        }
+        if counts_bg {
+            palette.count_use(style.bg);
+        }
+        Ok(())
     }
 }
 
 #[derive(Clone, Copy)]
 enum SgrParam {
     Code(&'static str),
+    Ansi(u8),
     Indexed(&'static str, u8),
     Color(&'static str, Rgb),
 }
@@ -676,6 +877,7 @@ impl SgrParam {
     fn len(self) -> usize {
         match self {
             Self::Code(code) => code.len(),
+            Self::Ansi(code) => decimal_len(usize::from(code)),
             Self::Indexed(code, slot) => code.len() + 3 + decimal_len(usize::from(slot)),
             Self::Color(code, Rgb { r, g, b }) => {
                 code.len()
@@ -690,6 +892,7 @@ impl SgrParam {
     fn write(self, output: &mut impl Write) -> io::Result<()> {
         match self {
             Self::Code(code) => output.write_all(code.as_bytes()),
+            Self::Ansi(code) => write_decimal(output, usize::from(code)),
             Self::Indexed(code, slot) => {
                 output.write_all(code.as_bytes())?;
                 output.write_all(b";5;")?;
@@ -828,6 +1031,24 @@ fn assume_erased(shown: &mut [Cell], wanted: &[Cell]) {
     for (shown, wanted) in shown.iter_mut().zip(wanted) {
         if wanted.is_plain_blank() && wanted.attrs.contains(CellAttrs::DEFAULT_BACKGROUND) {
             *shown = *wanted;
+        }
+    }
+}
+
+fn forget_cells_drawn_with(screen: &mut CellGrid, colors: &[Rgb]) {
+    let is_recolored =
+        |color: PenColor| matches!(color, PenColor::Color(color) if colors.contains(&color));
+    for cell in &mut screen.cells {
+        let underline_recolored = cell.attrs.contains(CellAttrs::UNDERLINE)
+            && cell
+                .underline
+                .rgb()
+                .is_some_and(|color| colors.contains(&color));
+        if is_recolored(PenColor::background(cell))
+            || (!cell.is_plain_blank() && is_recolored(PenColor::foreground(cell)))
+            || underline_recolored
+        {
+            *cell = unknown_cell();
         }
     }
 }
@@ -1104,6 +1325,12 @@ impl<W: Write> Terminal<W> {
         self.move_to(shift.start, row)?;
         let final_byte = if shift.shift > 0 { '@' } else { 'P' };
         CursorStep::Relative(final_byte, shift.shift.unsigned_abs()).write(&mut self.body)
+    }
+
+    fn reset_pen(&mut self) -> io::Result<()> {
+        self.body.write_all(b"\x1b[m")?;
+        self.pen = Pen::default();
+        Ok(())
     }
 
     fn flush_frame(&mut self, force_synchronize: bool) -> io::Result<()> {
@@ -1663,7 +1890,12 @@ impl<W: Write> Renderer<W> {
                 (cleared, false)
             }
         };
-        let force_synchronize = !was_in_sync;
+        let recolored = terminal.palette.rebalance_ansi();
+        if !recolored.is_empty() {
+            forget_cells_drawn_with(&mut screen, &recolored);
+            terminal.reset_pen()?;
+        }
+        let force_synchronize = !was_in_sync || !recolored.is_empty();
         let visible_cols = (grid.cols.min(terminal.cols)) as usize;
         let visible_rows = grid.rows.min(terminal.rows) as usize;
         let shows_whole_grid =
@@ -3984,6 +4216,23 @@ mod tests {
     }
 
     #[test]
+    fn recolored_underlines_are_redrawn() {
+        let red = Rgb::new(224, 108, 117);
+        let mut screen = CellGrid::new(3, 1, Rgb::new(40, 44, 52));
+        for cell in screen.row_mut(0) {
+            cell.glyph = 'x'.into();
+            cell.fg = Rgb::new(200, 200, 200);
+            cell.attrs = CellAttrs::UNDERLINE | CellAttrs::CURLY_UNDERLINE;
+            cell.underline = UnderlineColor::of(red);
+        }
+        screen.row_mut(0)[2].attrs = CellAttrs::empty();
+        forget_cells_drawn_with(&mut screen, &[red]);
+        let row = screen.row(0);
+        assert_eq!((row[0], row[1]), (unknown_cell(), unknown_cell()));
+        assert_eq!(row[2].glyph, 'x');
+    }
+
+    #[test]
     fn ghostty_does_not_repeat_clusters() {
         let mut grid = CellGrid::new(20, 1, Rgb::new(40, 44, 52));
         for cell in grid.row_mut(0).iter_mut().take(8) {
@@ -4237,6 +4486,214 @@ mod tests {
             original.insert(*slot, (*spec).to_owned());
         }
         original
+    }
+
+    fn assigned(palette: &Palette, color: Rgb) -> Option<u8> {
+        palette.ansi.get(&color).copied()
+    }
+
+    fn rebalance_after_uses(palette: &mut Palette, uses: &[(Rgb, u32)]) -> Vec<Rgb> {
+        for (color, count) in uses {
+            for _ in 0..count * MIN_ANSI_SWITCH_USES {
+                palette.count_use(PenColor::Color(*color));
+            }
+        }
+        palette.rebalance_ansi()
+    }
+
+    #[test]
+    fn rgb_specs_parse_at_any_precision() {
+        assert_eq!(
+            parse_rgb_spec("rgb:ffff/8080/0000"),
+            Some(Rgb::new(255, 128, 0))
+        );
+        assert_eq!(parse_rgb_spec("rgb:f/8/0"), Some(Rgb::new(255, 136, 0)));
+        assert_eq!(parse_rgb_spec("rgb:ff/80"), None);
+        assert_eq!(parse_rgb_spec("#ff8000"), None);
+    }
+
+    #[test]
+    fn most_used_grays_take_the_ansi_gray_slots_in_lightness_order() {
+        let mut palette = Palette::new(&reported_palette(&[]), Default::default());
+        let (darkest, dark, light, lightest, rare) = (
+            Rgb::new(30, 33, 40),
+            Rgb::new(78, 90, 95),
+            Rgb::new(178, 185, 198),
+            Rgb::new(220, 224, 229),
+            Rgb::new(120, 120, 120),
+        );
+        rebalance_after_uses(
+            &mut palette,
+            &[
+                (light, 9),
+                (lightest, 8),
+                (darkest, 7),
+                (dark, 6),
+                (rare, 1),
+            ],
+        );
+        assert_eq!(assigned(&palette, darkest), Some(0));
+        assert_eq!(assigned(&palette, dark), Some(8));
+        assert_eq!(assigned(&palette, light), Some(7));
+        assert_eq!(assigned(&palette, lightest), Some(15));
+        assert_eq!(assigned(&palette, rare), None);
+        assert_eq!(palette.definitions.len(), 4);
+    }
+
+    #[test]
+    fn near_matching_colors_redefine_the_stock_slot_with_the_same_meaning() {
+        let mut palette = Palette::new(
+            &reported_palette(&[
+                (1, "rgb:e0/6c/75"),
+                (2, "rgb:98/c3/79"),
+                (4, "rgb:61/af/ef"),
+                (5, "rgb:c6/78/dd"),
+            ]),
+            Default::default(),
+        );
+        let (red, green, blue, purple) = (
+            Rgb::new(208, 114, 119),
+            Rgb::new(161, 193, 129),
+            Rgb::new(115, 173, 233),
+            Rgb::new(180, 119, 207),
+        );
+        rebalance_after_uses(
+            &mut palette,
+            &[(red, 4), (green, 3), (blue, 2), (purple, 1)],
+        );
+        assert_eq!(assigned(&palette, red), Some(1));
+        assert_eq!(assigned(&palette, green), Some(2));
+        assert_eq!(assigned(&palette, blue), Some(4));
+        assert_eq!(assigned(&palette, purple), Some(5));
+        assert!(palette.definitions.contains(&(1, red)));
+    }
+
+    #[test]
+    fn colors_without_a_near_match_stay_in_high_slots() {
+        let mut palette = Palette::new(
+            &reported_palette(&[(1, "rgb:e0/6c/75"), (4, "rgb:61/af/ef")]),
+            Default::default(),
+        );
+        let orange = Rgb::new(191, 149, 106);
+        let green = Rgb::new(161, 193, 129);
+        rebalance_after_uses(&mut palette, &[(orange, 2), (green, 1)]);
+        assert_eq!(assigned(&palette, orange), None);
+        assert_eq!(assigned(&palette, green), None);
+        assert_eq!(palette.slot_for(orange), Some(FIRST_PALETTE_SLOT));
+    }
+
+    #[test]
+    fn grays_stay_in_high_slots_when_the_terminal_did_not_report_them() {
+        let mut original = reported_palette(&[]);
+        for slot in GRAY_SLOTS_BY_LIGHTNESS {
+            original.remove(&slot);
+        }
+        let mut palette = Palette::new(&original, Default::default());
+        let gray = Rgb::new(178, 185, 198);
+        rebalance_after_uses(&mut palette, &[(gray, 3)]);
+        assert_eq!(assigned(&palette, gray), None);
+    }
+
+    #[test]
+    fn every_reported_ansi_slot_is_restored_on_exit_and_signal() {
+        let original = reported_palette(&[(3, "rgb:e5/c0/7b")]);
+        let restore = palette_restore(0, &original);
+        for slot in 0..FIRST_PALETTE_SLOT {
+            assert!(
+                restore.contains(&format!(";{slot};rgb:")),
+                "slot {slot} missing from {restore:?}"
+            );
+        }
+        assert!(restore.contains(";3;rgb:e5/c0/7b"));
+        assert!(!restore.contains(";16;"));
+        assert_eq!(
+            signal_restore(&original, false, false),
+            [
+                palette_restore(PALETTE_SLOTS, &original).as_bytes(),
+                CURSOR_SHAPE_RESET
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn ansi_slots_render_with_short_codes() {
+        let mut renderer = Renderer::new(Vec::new(), 60, 14);
+        renderer.terminal.palette = Palette::new(
+            &reported_palette(&[(1, "rgb:e0/6c/75")]),
+            Default::default(),
+        );
+        let mut emulator = Emulator::new(60, 14);
+        let mut grid = editor_frame(0);
+        for (index, cell) in grid.cells.iter_mut().enumerate() {
+            if index % 3 == 0 {
+                cell.fg = Rgb::new(208, 114, 119);
+            }
+        }
+        renderer.grid = Some(grid.clone());
+        emulator.feed(&mut renderer);
+        renderer.resize(60, 14);
+        renderer.render().unwrap();
+        let output = output_text(&renderer);
+        assert!(output.contains(";1;rgb:d0/72/77"), "{output:?}");
+        assert!(
+            output.contains("\x1b[31m") || output.contains(";31m"),
+            "{output:?}"
+        );
+        assert!(!output.contains("38;5;"), "{output:?}");
+        emulator.feed(&mut renderer);
+        emulator.assert_shows(&grid, 60);
+    }
+
+    #[test]
+    fn reassigning_a_slot_redraws_cells_drawn_with_its_old_color() {
+        let mut renderer = Renderer::new(Vec::new(), 60, 14);
+        renderer.terminal.palette = Palette::new(&reported_palette(&[]), Default::default());
+        let mut emulator = Emulator::new(60, 14);
+        let early = [Rgb::new(120, 120, 120), Rgb::new(255, 255, 255)];
+        let late = [
+            Rgb::new(30, 30, 30),
+            Rgb::new(60, 60, 60),
+            Rgb::new(200, 200, 200),
+            Rgb::new(230, 230, 230),
+        ];
+        let mut grid = CellGrid::new(60, 14, Rgb::new(0, 0, 0));
+        for (index, cell) in grid.cells.iter_mut().enumerate().take(6 * 60) {
+            cell.glyph = 'a'.into();
+            cell.fg = early[index % early.len()];
+        }
+        renderer.grid = Some(grid.clone());
+        emulator.feed(&mut renderer);
+        emulator.feed(&mut renderer);
+        assert!(
+            early
+                .iter()
+                .all(|color| renderer.terminal.palette.ansi.contains_key(color))
+        );
+        renderer.resize(60, 14);
+        renderer.render().unwrap();
+        let output = output_text(&renderer);
+        assert!(output.contains("\x1b[37m"), "{output:?}");
+        emulator.feed(&mut renderer);
+
+        for step in 0..12 {
+            for (index, cell) in grid.cells.iter_mut().enumerate().skip(6 * 60) {
+                cell.glyph = if step % 2 == 0 { 'x' } else { 'y' }.into();
+                cell.fg = late[index % late.len()];
+            }
+            renderer.grid = Some(grid.clone());
+            emulator.feed(&mut renderer);
+            emulator.assert_shows(&grid, 60);
+        }
+        assert!(
+            early
+                .iter()
+                .all(|color| !renderer.terminal.palette.ansi.contains_key(color))
+        );
+        assert!(
+            late.iter()
+                .all(|color| renderer.terminal.palette.ansi.contains_key(color))
+        );
     }
 
     #[test]
