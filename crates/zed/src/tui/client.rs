@@ -22,6 +22,7 @@ const RESIZE_FRAME_WAIT: Duration = Duration::from_millis(100);
 const ATTRIBUTE_CODES: [(CellAttrs, &str); 2] = [(CellAttrs::BOLD, "1"), (CellAttrs::ITALIC, "3")];
 
 pub enum Exit {
+    Detached,
     ServerShutdown,
     Disconnected,
     Rejected(String),
@@ -440,6 +441,7 @@ pub fn attach(socket: &Path) -> Result<Exit> {
                 .ok();
         })?;
 
+    let mut detach_pending = false;
     while let Ok(first) = events.recv() {
         let mut inputs = Vec::new();
         let mut resize = None;
@@ -452,6 +454,19 @@ pub fn attach(socket: &Path) -> Result<Exit> {
                 event::Event::Key(key) => {
                     if key.kind == event::KeyEventKind::Release {
                         continue;
+                    }
+                    let was_pending = std::mem::take(&mut detach_pending);
+                    if !was_pending && is_detach_prefix(&key) {
+                        detach_pending = true;
+                        continue;
+                    }
+                    if was_pending && key.code == event::KeyCode::Char('d') {
+                        let mut socket = socket_writer.lock();
+                        for input in inputs {
+                            write_message(&mut *socket, &ClientMessage::Input(input)).ok();
+                        }
+                        write_message(&mut *socket, &ClientMessage::Detach).ok();
+                        return Ok(Exit::Detached);
                     }
                     inputs.extend(term_key(&key));
                 }
@@ -520,6 +535,14 @@ fn render_messages<W: Write>(
             return Exit::Disconnected;
         }
     }
+}
+
+fn is_detach_prefix(key: &event::KeyEvent) -> bool {
+    key.modifiers.contains(event::KeyModifiers::CONTROL)
+        && matches!(
+            key.code,
+            event::KeyCode::Char('\\') | event::KeyCode::Char('4')
+        )
 }
 
 fn term_modifiers(modifiers: event::KeyModifiers) -> Modifiers {

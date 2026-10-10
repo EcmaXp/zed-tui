@@ -41,6 +41,7 @@ pub enum ClientMessage {
     Hello { version: u32, cols: u16, rows: u16 },
     Input(TermEvent),
     Resize { cols: u16, rows: u16 },
+    Detach,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,6 +246,7 @@ mod tests {
                 cols: 100,
                 rows: 30,
             },
+            ClientMessage::Detach,
         ];
         let mut buffer = Vec::new();
         for message in &messages {

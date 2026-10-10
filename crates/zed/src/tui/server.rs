@@ -356,12 +356,12 @@ fn serve_client(
     thread::Builder::new()
         .name(format!("ClientReader-{id}"))
         .spawn(move || {
-            read_from_client(id, reader, &events);
+            let detached = read_from_client(id, reader, &events);
             hub.remove(id);
             events
                 .unbounded_send(ServerEvent::Disconnected { id })
                 .log_err();
-            log::info!("client {id} disconnected");
+            log::info!("client {id} disconnected (detached: {detached})");
         })?;
     Ok(())
 }
@@ -376,19 +376,20 @@ fn read_from_client(
     id: u64,
     mut reader: BufReader<UnixStream>,
     events: &UnboundedSender<ServerEvent>,
-) {
+) -> bool {
     loop {
         let event = match read_message(&mut reader) {
             Ok(ClientMessage::Input(event)) => ServerEvent::Input(event),
             Ok(ClientMessage::Resize { cols, rows }) => ServerEvent::Resized { id, cols, rows },
+            Ok(ClientMessage::Detach) => return true,
             Ok(ClientMessage::Hello { .. }) => continue,
             Err(error) => {
                 log::debug!("client {id} disconnected: {error:#}");
-                return;
+                return false;
             }
         };
         if events.unbounded_send(event).is_err() {
-            return;
+            return false;
         }
     }
 }
@@ -569,6 +570,12 @@ mod tests {
         };
         write_message(&mut client_writer, &ClientMessage::Input(key.clone())).unwrap();
         assert!(matches!(next_event(&mut events), ServerEvent::Input(event) if event == key));
+
+        write_message(&mut client_writer, &ClientMessage::Detach).unwrap();
+        assert!(matches!(
+            next_event(&mut events),
+            ServerEvent::Disconnected { .. }
+        ));
     }
 
     fn attach(hub: &Arc<ClientHub>) -> (u64, UnixStream, UnboundedReceiver<ServerEvent>) {

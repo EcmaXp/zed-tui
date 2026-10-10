@@ -160,6 +160,7 @@ mod unix {
 
     fn describe(session: &str, exit: client::Exit) -> Result<String> {
         Ok(match exit {
+            client::Exit::Detached => format!("detached from session {session:?}"),
             client::Exit::ServerShutdown => format!("session {session:?} has ended"),
             client::Exit::Disconnected => format!("lost connection to session {session:?}"),
             client::Exit::Rejected(error) => anyhow::bail!(error),
