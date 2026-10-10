@@ -205,19 +205,28 @@ pub struct Span(u32, u32, u8, String, Option<u32>);
 pub struct RowPatch(u16, u16, Vec<Span>);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WireScroll(u16, u16, i16);
+pub struct WireScroll(u16, u16, i16, Option<(u16, u16)>);
 
 impl WireScroll {
     fn from_grid(scroll: &GridScroll) -> Self {
-        Self(scroll.top as u16, scroll.bottom as u16, scroll.shift as i16)
+        Self(
+            scroll.top as u16,
+            scroll.bottom as u16,
+            scroll.shift as i16,
+            scroll
+                .columns
+                .as_ref()
+                .map(|columns| (columns.start as u16, columns.end as u16)),
+        )
     }
 
     pub(crate) fn to_grid(&self) -> GridScroll {
-        let WireScroll(top, bottom, shift) = self;
+        let WireScroll(top, bottom, shift, columns) = self;
         GridScroll {
             top: *top as usize,
             bottom: *bottom as usize,
             shift: *shift as isize,
+            columns: columns.map(|(start, end)| start as usize..end as usize),
         }
     }
 }
@@ -541,6 +550,7 @@ impl FrameEncoder {
             next,
             next.rows as usize,
             next.cols as usize,
+            true,
             &mut self.scrolled,
             |scroll, grid| scroll.apply(grid, scroll_fill()),
         );
@@ -631,7 +641,7 @@ impl FrameDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::test_support::{Random, source_lines, text_row};
+    use crate::tui::test_support::{Random, source_lines, split_panes, text_row};
     use gpui_tui::Rgb;
 
     #[test]
@@ -942,6 +952,12 @@ mod tests {
         assert_eq!(moves.len(), 1, "{moves:?}");
         let scroll = moves[0].to_grid();
         assert_eq!((scroll.top, scroll.bottom, scroll.shift), (1, 13, 3));
+        assert!(
+            scroll
+                .columns
+                .as_ref()
+                .is_some_and(|columns| columns.end <= 48)
+        );
 
         let mut buffer = Vec::new();
         write_message(&mut buffer, &update).unwrap();
@@ -951,6 +967,29 @@ mod tests {
             buffer.len()
         );
 
+        decoder.apply(&mut client, &update);
+        assert_looks_like(client.as_ref().unwrap(), &second);
+    }
+
+    #[test]
+    fn split_panes_scrolling_apart_send_two_moves() {
+        let lines = source_lines(200, 11);
+        let first = split_panes(&lines, 0, 0);
+        let second = split_panes(&lines, 3, 5);
+        let mut encoder = FrameEncoder::default();
+        let mut decoder = FrameDecoder::default();
+        let mut client = None;
+        decoder.apply(&mut client, &encoder.update(None, &first).unwrap());
+        let update = encoder.update(Some(&first), &second).unwrap();
+        let ServerMessage::Diff(_, moves, _, _) = &update else {
+            panic!("expected a diff, got {update:?}");
+        };
+        let mut shifts: Vec<i16> = moves
+            .iter()
+            .map(|WireScroll(_, _, shift, _)| *shift)
+            .collect();
+        shifts.sort();
+        assert_eq!(shifts, [3, 5], "{moves:?}");
         decoder.apply(&mut client, &update);
         assert_looks_like(client.as_ref().unwrap(), &second);
     }

@@ -1,4 +1,4 @@
-use gpui_tui::CellGrid;
+use gpui_tui::{CellGrid, Rgb};
 use rand::{Rng as _, SeedableRng as _, rngs::StdRng};
 
 pub struct Random(StdRng);
@@ -51,4 +51,23 @@ pub fn text_row(grid: &mut CellGrid, row: u16, col: u16, text: &str) {
             cell.glyph = ch.into();
         }
     }
+}
+
+pub fn split_panes(lines: &[String], left_first: usize, right_first: usize) -> CellGrid {
+    let mut grid = CellGrid::new(60, 14, Rgb::new(40, 44, 52));
+    for row in 0..14u16 {
+        let line = |first: usize| {
+            lines
+                .get(first + row as usize)
+                .map(String::as_str)
+                .unwrap_or("")
+                .chars()
+                .take(29)
+                .collect::<String>()
+        };
+        text_row(&mut grid, row, 0, &line(left_first));
+        text_row(&mut grid, row, 29, "|");
+        text_row(&mut grid, row, 30, &line(right_first + 100));
+    }
+    grid
 }

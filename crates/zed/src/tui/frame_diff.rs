@@ -36,27 +36,39 @@ const MIN_SCROLL_GAIN: usize = 32;
 const MIN_SCROLL_ROWS: usize = 3;
 const SCROLL_BLOCK: usize = 8;
 const SCROLL_CANDIDATES: usize = 3;
+const MIN_SCROLL_COLUMNS: usize = 2;
+const MAX_MOVES: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GridScroll {
     pub top: usize,
     pub bottom: usize,
     pub shift: isize,
+    pub columns: Option<Range<usize>>,
 }
 
 impl GridScroll {
-    pub fn fits(&self, rows: usize) -> bool {
-        self.shift != 0 && self.top + self.shift.unsigned_abs() < self.bottom && self.bottom <= rows
+    pub fn fits(&self, rows: usize, cols: usize) -> bool {
+        let columns = self.columns.clone().unwrap_or(0..cols);
+        self.shift != 0
+            && self.top + self.shift.unsigned_abs() < self.bottom
+            && self.bottom <= rows
+            && columns.len() >= MIN_SCROLL_COLUMNS
+            && columns.end <= cols
     }
 
     pub fn apply(&self, grid: &mut CellGrid, fill: Cell) {
         let cols = grid.cols as usize;
-        if !self.fits(grid.rows as usize) {
+        if !self.fits(grid.rows as usize, cols) {
             return;
         }
         self.copy(grid);
+        let columns = self.columns.clone().unwrap_or(0..cols);
         for row in self.exposed_rows() {
-            if let Some(cells) = grid.cells.get_mut(row * cols..(row + 1) * cols) {
+            if let Some(cells) = grid
+                .cells
+                .get_mut(row * cols + columns.start..row * cols + columns.end)
+            {
                 cells.fill(fill);
             }
         }
@@ -64,14 +76,17 @@ impl GridScroll {
 
     pub fn copy(&self, grid: &mut CellGrid) {
         let cols = grid.cols as usize;
-        if !self.fits(grid.rows as usize) {
+        if !self.fits(grid.rows as usize, cols) {
             return;
         }
+        let columns = self.columns.clone().unwrap_or(0..cols);
         let exposed = self.exposed_rows();
         let mut copy_row = |row: usize| {
             let source = (row as isize + self.shift) as usize;
-            grid.cells
-                .copy_within(source * cols..(source + 1) * cols, row * cols);
+            grid.cells.copy_within(
+                source * cols + columns.start..source * cols + columns.end,
+                row * cols + columns.start,
+            );
         };
         if self.shift > 0 {
             (self.top..exposed.start).for_each(&mut copy_row);
@@ -145,12 +160,14 @@ fn best_band(
             top: first,
             bottom: last + 1 + distance,
             shift,
+            columns: None,
         }
     } else {
         GridScroll {
             top: first - distance,
             bottom: last + 1,
             shift,
+            columns: None,
         }
     };
     let lost: isize = scroll.exposed_rows().map(&kept_in_place).sum();
@@ -210,8 +227,19 @@ pub fn find_scroll(
     target: &CellGrid,
     rows: usize,
     cols: usize,
+    allow_column_window: bool,
 ) -> Option<GridScroll> {
-    let window = 0..cols;
+    find_scroll_in(shown, target, rows, cols, 0..cols, allow_column_window)
+}
+
+fn find_scroll_in(
+    shown: &CellGrid,
+    target: &CellGrid,
+    rows: usize,
+    cols: usize,
+    window: Range<usize>,
+    allow_column_window: bool,
+) -> Option<GridScroll> {
     let width = window.len();
     let row_cells = |grid, row| window_row(grid, row, window.clone());
     let in_place: Vec<usize> = (0..rows)
@@ -246,7 +274,7 @@ pub fn find_scroll(
         .collect();
     candidates.sort_by_key(|(estimate, _)| std::cmp::Reverse(*estimate));
 
-    let (gain, scroll) = candidates
+    let (gain, mut scroll) = candidates
         .iter()
         .take(SCROLL_CANDIDATES)
         .filter_map(|(_, shift)| {
@@ -261,7 +289,20 @@ pub fn find_scroll(
             )
         })
         .max_by_key(|(gain, _)| *gain)?;
-    (gain > MIN_SCROLL_GAIN as isize).then_some(scroll)
+    if gain <= MIN_SCROLL_GAIN as isize {
+        return None;
+    }
+    let whole_width = 0..cols;
+    if allow_column_window {
+        let columns = margin_columns(shown, target, &scroll, window.clone())
+            .into_iter()
+            .chain([window])
+            .find(|columns| !splits_wide_character(shown, &scroll, columns))?;
+        scroll.columns = (columns != whole_width).then_some(columns);
+    } else if window != whole_width {
+        return None;
+    }
+    Some(scroll)
 }
 
 pub fn find_moves(
@@ -269,16 +310,101 @@ pub fn find_moves(
     target: &CellGrid,
     rows: usize,
     cols: usize,
+    allow_column_window: bool,
     moved: &mut Option<CellGrid>,
     apply: impl Fn(&GridScroll, &mut CellGrid),
 ) -> Vec<GridScroll> {
-    let Some(first) = find_scroll(shown, target, rows, cols) else {
+    let Some(first) = find_scroll(shown, target, rows, cols, allow_column_window) else {
         return Vec::new();
     };
     let moved = moved.get_or_insert_with(|| CellGrid::new(0, 0, Rgb::default()));
     moved.clone_from(shown);
-    apply(&first, moved);
-    vec![first]
+    let mut moves = vec![first];
+    while let Some(last) = moves.last() {
+        apply(last, moved);
+        if moves.len() == MAX_MOVES {
+            break;
+        }
+        let next = unmoved_columns(&moves, cols)
+            .into_iter()
+            .filter(|_| allow_column_window)
+            .chain([0..cols])
+            .find_map(|window| {
+                find_scroll_in(moved, target, rows, cols, window, allow_column_window)
+            });
+        match next {
+            Some(next) => moves.push(next),
+            None => break,
+        }
+    }
+    moves
+}
+
+fn unmoved_columns(moves: &[GridScroll], cols: usize) -> Vec<Range<usize>> {
+    let mut moved: Vec<Range<usize>> = moves
+        .iter()
+        .map(|scroll| scroll.columns.clone().unwrap_or(0..cols))
+        .collect();
+    moved.sort_by_key(|columns| columns.start);
+    let mut free = Vec::new();
+    let mut start = 0;
+    for columns in moved {
+        if columns.start >= start + MIN_SCROLL_COLUMNS {
+            free.push(start..columns.start);
+        }
+        start = start.max(columns.end);
+    }
+    if cols >= start + MIN_SCROLL_COLUMNS {
+        free.push(start..cols);
+    }
+    free
+}
+
+fn splits_wide_character(shown: &CellGrid, scroll: &GridScroll, columns: &Range<usize>) -> bool {
+    (scroll.top..scroll.bottom).any(|row| {
+        [columns.start, columns.end].iter().any(|col| {
+            shown
+                .cell(*col as i32, row as i32)
+                .is_some_and(|cell| cell.is_wide_continuation())
+        })
+    })
+}
+
+fn margin_columns(
+    shown: &CellGrid,
+    target: &CellGrid,
+    scroll: &GridScroll,
+    window: Range<usize>,
+) -> Option<Range<usize>> {
+    let mut gains = vec![0isize; window.len()];
+    let exposed = scroll.exposed_rows();
+    for row in scroll.top..scroll.bottom {
+        let shown_row = window_row(shown, row, window.clone());
+        let target_row = window_row(target, row, window.clone());
+        let source_row = (!exposed.contains(&row)).then(|| {
+            window_row(
+                shown,
+                (row as isize + scroll.shift) as usize,
+                window.clone(),
+            )
+        });
+        for (col, gain) in gains.iter_mut().enumerate() {
+            let Some(wanted) = target_row.get(col) else {
+                continue;
+            };
+            let in_place = shown_row
+                .get(col)
+                .is_some_and(|cell| cell.looks_like(wanted));
+            let moved = source_row
+                .and_then(|source| source.get(col))
+                .is_some_and(|cell| cell.looks_like(wanted));
+            *gain += moved as isize - in_place as isize;
+        }
+    }
+
+    let (columns, _) = best_run(gains.into_iter().enumerate())?;
+    (columns.len() >= MIN_SCROLL_COLUMNS)
+        .then(|| window.start + columns.start..window.start + columns.end)
 }
 
 fn is_continuation(cells: &[Cell], col: usize) -> bool {
@@ -359,14 +485,34 @@ mod tests {
     }
 
     #[test]
+    fn margin_windows_are_at_least_two_columns_wide() {
+        let shown = grid_of(&["a---", "b---", "c---"]);
+        let target = grid_of(&["b---", "c---", "x---"]);
+        let scroll = GridScroll {
+            top: 0,
+            bottom: 3,
+            shift: 1,
+            columns: None,
+        };
+        assert_eq!(margin_columns(&shown, &target, &scroll, 0..4), None);
+    }
+
+    #[test]
     fn scrolls_the_terminal_would_ignore_do_not_fit() {
-        let scroll = |top, bottom, shift| GridScroll { top, bottom, shift };
-        assert!(scroll(1, 13, 3).fits(14));
-        assert!(scroll(1, 13, -3).fits(14));
-        assert!(!scroll(2, 3, 1).fits(14));
-        assert!(!scroll(1, 4, 3).fits(14));
-        assert!(!scroll(1, 13, 0).fits(14));
-        assert!(!scroll(1, 15, 3).fits(14));
+        let scroll = |top, bottom, shift, columns| GridScroll {
+            top,
+            bottom,
+            shift,
+            columns,
+        };
+        assert!(scroll(1, 13, 3, None).fits(14, 60));
+        assert!(scroll(1, 13, -3, Some(0..2)).fits(14, 60));
+        assert!(!scroll(2, 3, 1, None).fits(14, 60));
+        assert!(!scroll(1, 4, 3, None).fits(14, 60));
+        assert!(!scroll(1, 13, 0, None).fits(14, 60));
+        assert!(!scroll(1, 15, 3, None).fits(14, 60));
+        assert!(!scroll(1, 13, 3, Some(5..6)).fits(14, 60));
+        assert!(!scroll(1, 13, 3, Some(50..61)).fits(14, 60));
     }
 
     fn line_text(line: usize, width: usize) -> String {
@@ -390,10 +536,31 @@ mod tests {
 
     fn moves_between(shown: &CellGrid, target: &CellGrid) -> (Vec<GridScroll>, CellGrid) {
         let mut moved = None;
-        let moves = find_moves(shown, target, 20, 60, &mut moved, |scroll, grid| {
+        let moves = find_moves(shown, target, 20, 60, true, &mut moved, |scroll, grid| {
             scroll.copy(grid)
         });
         (moves, moved.unwrap_or_else(|| shown.clone()))
+    }
+
+    #[test]
+    fn split_panes_scrolling_apart_move_separately() {
+        for right_shift in [-2, 10] {
+            let target = split_panes(3, right_shift);
+            let (moves, moved) = moves_between(&split_panes(0, 0), &target);
+            let mut shifts: Vec<isize> = moves.iter().map(|scroll| scroll.shift).collect();
+            shifts.sort();
+            let mut expected = [3, right_shift];
+            expected.sort();
+            assert_eq!(shifts, expected, "{moves:?}");
+            assert!(
+                moves.iter().all(|scroll| scroll.columns.is_some()),
+                "{moves:?}"
+            );
+            let still_wrong = matching_cells(&target.cells, &target.cells)
+                - matching_cells(&moved.cells, &target.cells);
+            let exposed = (3 + right_shift.unsigned_abs()) * 30;
+            assert!(still_wrong <= exposed, "{still_wrong} cells left to draw");
+        }
     }
 
     #[test]
@@ -401,5 +568,6 @@ mod tests {
         let (moves, _) = moves_between(&split_panes(0, 0), &split_panes(3, 3));
         assert_eq!(moves.len(), 1, "{moves:?}");
         assert_eq!(moves[0].shift, 3);
+        assert!(moves[0].columns.is_none());
     }
 }

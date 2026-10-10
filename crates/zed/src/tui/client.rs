@@ -30,6 +30,9 @@ const REDRAW_MERGE_GAP: usize = 4;
 const MIN_ERASE_RUN: usize = 8;
 const MIN_ERASE_RUN_BEFORE_MOVE: usize = 5;
 const MIN_ERASE_TAIL: usize = 4;
+const MARGIN_QUERY: &str = "\x1b[?69$p";
+const MARGIN_MODE_ON: &[u8] = b"\x1b[?69h";
+const MARGIN_MODE_OFF: &[u8] = b"\x1b[?69l";
 const POINTER_RESET: &[u8] = b"\x1b]22;text\x1b\\";
 const CURSOR_SHAPE_RESET: &[u8] = b"\x1b[0 q";
 const KEYBOARD_FLAGS_QUERY: &str = "\x1b[?u";
@@ -56,7 +59,9 @@ pub enum Exit {
 
 #[derive(Clone, Copy, Default)]
 struct TerminalFeatures {
+    left_right_margins: bool,
     ghostty: bool,
+    margin_mode: bool,
 }
 
 #[derive(Default)]
@@ -83,6 +88,11 @@ impl TerminalSetup {
         )?;
         let replies = query(output)?;
         self.features = replies.features;
+        if replies.features.ghostty && replies.features.left_right_margins {
+            self.features.margin_mode = true;
+            output.write_all(MARGIN_MODE_ON)?;
+            output.flush()?;
+        }
         if replies.keyboard_flags {
             crossterm::execute!(
                 output,
@@ -98,6 +108,9 @@ impl TerminalSetup {
     fn undo(&self, output: &mut impl Write) {
         if self.keyboard_enhanced {
             crossterm::execute!(output, event::PopKeyboardEnhancementFlags).ok();
+        }
+        if self.features.margin_mode {
+            output.write_all(MARGIN_MODE_OFF).ok();
         }
         if self.features.ghostty {
             output.write_all(POINTER_RESET).ok();
@@ -139,7 +152,8 @@ impl Drop for TerminalGuard {
 }
 
 fn query_terminal(stdout: &mut impl Write) -> io::Result<QueryReplies> {
-    let mut query = KEYBOARD_FLAGS_QUERY.to_owned();
+    let mut query = MARGIN_QUERY.to_owned();
+    query.push_str(KEYBOARD_FLAGS_QUERY);
     query.push_str(VERSION_QUERY);
     query.push_str(DEVICE_ATTRIBUTES_QUERY);
     stdout.write_all(query.as_bytes())?;
@@ -178,7 +192,7 @@ impl vte::Perform for QueryReplies {
 
     fn csi_dispatch(
         &mut self,
-        _params: &vte::Params,
+        params: &vte::Params,
         intermediates: &[u8],
         ignore: bool,
         action: char,
@@ -186,9 +200,14 @@ impl vte::Perform for QueryReplies {
         if ignore {
             return;
         }
+        let mut values = params.iter().map(|param| param.first().copied());
         match (intermediates, action) {
             (b"?", 'c') => self.device_attributes = true,
             (b"?", 'u') => self.keyboard_flags = true,
+            (b"?$", 'y') => {
+                self.features.left_right_margins |=
+                    values.next() == Some(Some(69)) && matches!(values.next(), Some(Some(1..=3)));
+            }
             _ => {}
         }
     }
@@ -197,7 +216,7 @@ impl vte::Perform for QueryReplies {
 static RESTORE_ON_SIGNAL: OnceLock<Vec<u8>> = OnceLock::new();
 
 fn restore_on_signal(setup: &TerminalSetup) {
-    let restore = signal_restore(setup.features.ghostty);
+    let restore = signal_restore(setup.features.margin_mode, setup.features.ghostty);
     if restore.is_empty() || RESTORE_ON_SIGNAL.set(restore).is_err() {
         return;
     }
@@ -223,8 +242,11 @@ extern "C" fn write_restore_and_reraise(signal: libc::c_int) {
     }
 }
 
-fn signal_restore(ghostty: bool) -> Vec<u8> {
+fn signal_restore(margin_mode: bool, ghostty: bool) -> Vec<u8> {
     let mut restore = Vec::new();
+    if margin_mode {
+        restore.extend_from_slice(MARGIN_MODE_OFF);
+    }
     if ghostty {
         restore.extend_from_slice(POINTER_RESET);
     }
@@ -826,12 +848,25 @@ impl<W: Write> Terminal<W> {
     fn scroll(&mut self, scroll: &GridScroll) -> io::Result<()> {
         self.pen
             .write_style(&mut self.body, Style::blank(PenColor::Default))?;
-        let whole_screen = scroll.top == 0 && scroll.bottom == self.rows as usize;
+        let whole_screen =
+            scroll.top == 0 && scroll.bottom == self.rows as usize && scroll.columns.is_none();
+        if scroll.columns.is_some() && !self.features.margin_mode {
+            self.body.write_all(MARGIN_MODE_ON)?;
+        }
         if !whole_screen {
             write!(self.body, "\x1b[{};{}r", scroll.top + 1, scroll.bottom)?;
         }
+        if let Some(columns) = &scroll.columns {
+            write!(self.body, "\x1b[{};{}s", columns.start + 1, columns.end)?;
+        }
         let final_byte = if scroll.shift > 0 { 'S' } else { 'T' };
         CursorStep::Relative(final_byte, scroll.shift.unsigned_abs()).write(&mut self.body)?;
+        if scroll.columns.is_some() {
+            self.body.write_all(b"\x1b[s")?;
+            if !self.features.margin_mode {
+                self.body.write_all(MARGIN_MODE_OFF)?;
+            }
+        }
         if !whole_screen {
             self.body.write_all(b"\x1b[r")?;
             self.cursor = Some((0, 0));
@@ -1368,7 +1403,7 @@ impl<W: Write> Renderer<W> {
 
     fn render(&mut self) -> io::Result<()> {
         let frames_since_render = std::mem::take(&mut self.frames_since_render);
-        let server_moves = std::mem::take(&mut self.server_moves);
+        let mut server_moves = std::mem::take(&mut self.server_moves);
         let Some(grid) = &self.grid else {
             return Ok(());
         };
@@ -1389,14 +1424,26 @@ impl<W: Write> Renderer<W> {
         let shows_whole_grid =
             visible_cols == grid.cols as usize && visible_rows == grid.rows as usize;
         let trusts_server_moves = was_in_sync && shows_whole_grid && frames_since_render == 1;
+        let column_windows = terminal.features.left_right_margins;
         let move_screen = |scroll: &GridScroll, screen: &mut CellGrid| {
             scroll.apply(screen, unknown_cell());
+            let columns = scroll.columns.clone().unwrap_or(0..screen.cols as usize);
             for row in scroll.exposed_rows() {
                 let row = row as u16;
-                assume_erased(screen.row_mut(row), grid.row(row));
+                if let (Some(shown), Some(wanted)) = (
+                    screen.row_mut(row).get_mut(columns.clone()),
+                    grid.row(row).get(columns.clone()),
+                ) {
+                    assume_erased(shown, wanted);
+                }
             }
         };
-        let server_moves_fit = server_moves.iter().all(|scroll| scroll.fits(visible_rows));
+        if !column_windows && let [scroll] = server_moves.as_mut_slice() {
+            scroll.columns = None;
+        }
+        let server_moves_fit = server_moves.iter().all(|scroll| {
+            scroll.fits(visible_rows, visible_cols) && (column_windows || scroll.columns.is_none())
+        });
         let moves = if trusts_server_moves && server_moves_fit {
             for scroll in &server_moves {
                 move_screen(scroll, &mut screen);
@@ -1408,6 +1455,7 @@ impl<W: Write> Renderer<W> {
                 grid,
                 visible_rows,
                 visible_cols,
+                column_windows,
                 &mut self.moved,
                 move_screen,
             );
@@ -1963,6 +2011,7 @@ fn term_mouse(mouse: &event::MouseEvent) -> TermEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::frame_diff::find_scroll;
     use crate::tui::test_support::{Random, source_lines, text_row};
     use alacritty_terminal::{
         Term,
@@ -2156,7 +2205,12 @@ mod tests {
             -distance
         };
         let before = grid.clone();
-        let scroll = GridScroll { top, bottom, shift };
+        let scroll = GridScroll {
+            top,
+            bottom,
+            shift,
+            columns: None,
+        };
         scroll.apply(grid, Cell::blank(Rgb::new(40, 44, 52)));
         for row in scroll.exposed_rows() {
             for col in 0..cols {
@@ -2244,6 +2298,115 @@ mod tests {
             scrolled * 2 < full,
             "scrolling took {scrolled} bytes, a full frame took {full}"
         );
+    }
+
+    #[test]
+    fn margins_keep_a_static_sidebar_out_of_the_scroll() {
+        let scroll = find_scroll(&editor_frame(0), &editor_frame(3), 14, 60, true).unwrap();
+        assert_eq!((scroll.top, scroll.bottom, scroll.shift), (1, 13, 3));
+        let columns = scroll.columns.unwrap();
+        assert!(columns.start == 0 && columns.end <= 48, "{columns:?}");
+        assert!(
+            find_scroll(&editor_frame(0), &editor_frame(3), 14, 60, false)
+                .is_some_and(|scroll| scroll.columns.is_none())
+        );
+
+        let mut renderer = Renderer::new(Vec::new(), 60, 14);
+        renderer.terminal.features.left_right_margins = true;
+        renderer.grid = Some(editor_frame(0));
+        renderer.render().unwrap();
+        let full_width = {
+            let mut plain = Renderer::new(Vec::new(), 60, 14);
+            plain.grid = Some(editor_frame(0));
+            plain.render().unwrap();
+            plain.terminal.output.clear();
+            plain.grid = Some(editor_frame(3));
+            plain.render().unwrap();
+            plain.terminal.output.len()
+        };
+        renderer.terminal.output.clear();
+        renderer.grid = Some(editor_frame(3));
+        renderer.render().unwrap();
+        let output = output_text(&renderer);
+        let expected = format!(
+            "\x1b[?69h\x1b[2;13r\x1b[{};{}s\x1b[3S\x1b[s\x1b[?69l\x1b[r",
+            columns.start + 1,
+            columns.end
+        );
+        assert!(output.contains(&expected), "{output:?}");
+        assert!(!output.contains("file_"), "{output:?}");
+        assert!(
+            output.len() < full_width,
+            "{} >= {full_width}",
+            output.len()
+        );
+    }
+
+    #[test]
+    fn kept_margin_mode_scrolls_without_toggling_it() {
+        let scroll = find_scroll(&editor_frame(0), &editor_frame(3), 14, 60, true).unwrap();
+        let columns = scroll.columns.unwrap();
+        let mut renderer = Renderer::new(Vec::new(), 60, 14);
+        renderer.terminal.features.left_right_margins = true;
+        renderer.terminal.features.margin_mode = true;
+        renderer.grid = Some(editor_frame(0));
+        renderer.render().unwrap();
+        renderer.terminal.output.clear();
+        renderer.grid = Some(editor_frame(3));
+        renderer.render().unwrap();
+        let output = output_text(&renderer);
+        let expected = format!(
+            "\x1b[2;13r\x1b[{};{}s\x1b[3S\x1b[s\x1b[r",
+            columns.start + 1,
+            columns.end
+        );
+        assert!(output.contains(&expected), "{output:?}");
+        assert!(!output.contains("?69"), "{output:?}");
+    }
+
+    #[test]
+    fn ghostty_margin_mode_stays_on_until_undo() {
+        let run = |ghostty: bool, left_right_margins: bool| {
+            let mut setup = TerminalSetup::default();
+            let mut output = FailingWriter::failing_on_flush(0);
+            setup
+                .run(&mut output, |_| {
+                    Ok(QueryReplies {
+                        features: TerminalFeatures {
+                            ghostty,
+                            left_right_margins,
+                            ..TerminalFeatures::default()
+                        },
+                        ..QueryReplies::default()
+                    })
+                })
+                .unwrap();
+            let mut undo = Vec::new();
+            setup.undo(&mut undo);
+            (
+                String::from_utf8(output.written).unwrap(),
+                String::from_utf8(undo).unwrap(),
+                setup.features.margin_mode,
+            )
+        };
+        let (output, undo, margin_mode) = run(true, true);
+        assert!(margin_mode);
+        assert_eq!(output.matches("\x1b[?69h").count(), 1, "{output:?}");
+        let mode_off = undo.find("\x1b[?69l").unwrap();
+        assert!(
+            mode_off < undo.find(LEAVE_ALTERNATE_SCREEN).unwrap(),
+            "{undo:?}"
+        );
+        for (ghostty, left_right_margins) in [(true, false), (false, true)] {
+            let (output, undo, margin_mode) = run(ghostty, left_right_margins);
+            assert!(!margin_mode);
+            assert!(!output.contains("?69") && !undo.contains("?69"));
+        }
+        assert_eq!(
+            signal_restore(true, false),
+            [MARGIN_MODE_OFF, CURSOR_SHAPE_RESET].concat()
+        );
+        assert_eq!(signal_restore(false, false), CURSOR_SHAPE_RESET);
     }
 
     #[test]
@@ -2750,23 +2913,40 @@ mod tests {
 
     #[test]
     fn server_scrolls_the_terminal_would_ignore_are_redrawn_instead() {
-        let mut renderer = Renderer::new(Vec::new(), 60, 14);
-        let mut emulator = Emulator::new(60, 14);
-        renderer.grid = Some(editor_frame(0));
-        emulator.feed(&mut renderer);
+        let ignored_scrolls = [
+            GridScroll {
+                top: 2,
+                bottom: 3,
+                shift: 1,
+                columns: None,
+            },
+            GridScroll {
+                top: 1,
+                bottom: 13,
+                shift: 3,
+                columns: Some(5..6),
+            },
+        ];
+        for scroll in ignored_scrolls {
+            let uses_margins = scroll.columns.is_some();
+            let mut renderer = Renderer::new(Vec::new(), 60, 14);
+            renderer.terminal.features.left_right_margins = uses_margins;
+            let mut emulator = Emulator::new(60, 14);
+            renderer.grid = Some(editor_frame(0));
+            emulator.feed(&mut renderer);
 
-        renderer.grid = Some(editor_frame(3));
-        renderer.frames_since_render = 1;
-        renderer.server_moves = vec![GridScroll {
-            top: 2,
-            bottom: 3,
-            shift: 1,
-        }];
-        renderer.render().unwrap();
-        let output = output_text(&renderer);
-        assert!(!output.contains("\x1b[3;3r"), "{output:?}");
-        emulator.feed(&mut renderer);
-        emulator.assert_shows(&editor_frame(3), 60);
+            renderer.grid = Some(editor_frame(3));
+            renderer.frames_since_render = 1;
+            renderer.server_moves = vec![scroll];
+            renderer.render().unwrap();
+            let output = output_text(&renderer);
+            assert!(!output.contains("\x1b[3;3r"), "{output:?}");
+            assert!(!output.contains("\x1b[6;6s"), "{output:?}");
+            if !uses_margins {
+                emulator.feed(&mut renderer);
+                emulator.assert_shows(&editor_frame(3), 60);
+            }
+        }
     }
 
     #[test]
@@ -2898,7 +3078,10 @@ mod tests {
             setup
                 .run(&mut FailingWriter::failing_on_flush(0), |_| {
                     Ok(QueryReplies {
-                        features: TerminalFeatures { ghostty },
+                        features: TerminalFeatures {
+                            ghostty,
+                            ..TerminalFeatures::default()
+                        },
                         ..QueryReplies::default()
                     })
                 })
@@ -2906,7 +3089,7 @@ mod tests {
             let mut undo = Vec::new();
             setup.undo(&mut undo);
             assert_eq!(contains_reset(&undo), ghostty, "{undo:?}");
-            let restore = signal_restore(setup.features.ghostty);
+            let restore = signal_restore(setup.features.margin_mode, setup.features.ghostty);
             assert_eq!(contains_reset(&restore), ghostty, "{restore:?}");
         }
     }
@@ -2919,9 +3102,29 @@ mod tests {
     }
 
     #[test]
-    fn device_attributes_end_the_query_reply() {
+    fn margin_support_comes_from_the_mode_report() {
         assert!(parse_replies(&[b"\x1b[?62;22c"]).device_attributes);
-        assert!(!parse_replies(&[b"\x1b[?62;22"]).device_attributes);
+        assert!(!parse_replies(&[b"\x1b[?69;2$y"]).device_attributes);
+        assert!(
+            parse_replies(&[b"\x1b[?69;2$y\x1b[?62;22c"])
+                .features
+                .left_right_margins
+        );
+        assert!(
+            parse_replies(&[b"\x1b[?69;1$y\x1b[?1;2c"])
+                .features
+                .left_right_margins
+        );
+        assert!(
+            !parse_replies(&[b"\x1b[?69;0$y\x1b[?62;22c"])
+                .features
+                .left_right_margins
+        );
+        assert!(
+            !parse_replies(&[b"\x1b[?62;22c"])
+                .features
+                .left_right_margins
+        );
     }
 
     #[test]
@@ -3048,6 +3251,7 @@ mod tests {
             top,
             bottom,
             shift: 1,
+            columns: None,
         };
         terminal.scroll(&scroll(0, 6)).unwrap();
         assert_eq!(String::from_utf8(terminal.body.clone()).unwrap(), "\x1b[S");
@@ -3435,7 +3639,7 @@ mod tests {
         let mut undo = Vec::new();
         setup.undo(&mut undo);
         assert!(contains_reset(&undo), "{undo:?}");
-        let restore = signal_restore(setup.features.ghostty);
+        let restore = signal_restore(setup.features.margin_mode, setup.features.ghostty);
         assert!(contains_reset(&restore), "{restore:?}");
     }
 
