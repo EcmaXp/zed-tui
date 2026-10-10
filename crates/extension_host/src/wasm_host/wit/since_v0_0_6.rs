@@ -2,7 +2,6 @@ use super::{latest, since_v0_1_0, since_v0_6_0};
 use crate::wasm_host::WasmState;
 use anyhow::Result;
 use extension::WorktreeDelegate;
-use gpui::BackgroundExecutor;
 use semver::Version;
 use std::sync::{Arc, OnceLock};
 use wasmtime::component::{Linker, Resource};
@@ -33,12 +32,10 @@ mod settings {
 
 pub type ExtensionWorktree = Arc<dyn WorktreeDelegate>;
 
-pub fn linker(executor: &BackgroundExecutor) -> &'static Linker<WasmState> {
+pub fn linker() -> &'static Linker<WasmState> {
     static LINKER: OnceLock<Linker<WasmState>> = OnceLock::new();
     LINKER.get_or_init(|| {
-        super::new_linker(executor, |linker| {
-            Extension::add_to_linker::<_, WasmState>(linker, |s| s)
-        })
+        super::new_linker(|linker| Extension::add_to_linker::<_, WasmState>(linker, |s| s))
     })
 }
 

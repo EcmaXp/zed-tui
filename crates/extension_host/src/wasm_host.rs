@@ -21,7 +21,7 @@ use futures::{
     },
     future::BoxFuture,
 };
-use gpui::{App, AsyncApp, BackgroundExecutor, EntityId, Task};
+use gpui::{App, AsyncApp, EntityId, Task};
 use http_client::HttpClient;
 use language::LanguageName;
 use lsp::LanguageServerName;
@@ -33,11 +33,14 @@ use settings::Settings;
 use std::{
     borrow::Cow,
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock, OnceLock},
+    sync::{
+        Arc, LazyLock, Mutex, OnceLock, PoisonError,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 use task::{DebugScenario, SpawnInTerminal, TaskTemplate, ZedDebugConfig};
-use util::paths::SanitizedPath;
+use util::{ResultExt as _, paths::SanitizedPath};
 use wasmtime::{
     CacheStore, Engine, Store,
     component::{Component, ResourceTable},
@@ -47,6 +50,7 @@ use wit::Extension;
 
 pub struct WasmHost {
     engine: Engine,
+    epoch_gate: Arc<EpochGate>,
     release_channel: ReleaseChannel,
     http_client: Arc<dyn HttpClient>,
     node_runtime: NodeRuntime,
@@ -554,8 +558,71 @@ type ExtensionCall = Box<
     dyn Send + for<'a> FnOnce(&'a mut Extension, &'a mut Store<WasmState>) -> BoxFuture<'a, ()>,
 >;
 
-fn wasm_engine(executor: &BackgroundExecutor) -> wasmtime::Engine {
-    static WASM_ENGINE: OnceLock<wasmtime::Engine> = OnceLock::new();
+const EPOCH_INTERVAL: Duration = Duration::from_millis(100);
+
+struct EpochGate {
+    in_flight_calls: Arc<AtomicUsize>,
+    wake_sender: Mutex<mpsc::Sender<()>>,
+}
+
+struct InFlightCall {
+    in_flight_calls: Arc<AtomicUsize>,
+}
+
+impl EpochGate {
+    fn new<Sleep: Future<Output = ()>>(
+        mut sleep: impl FnMut() -> Sleep,
+        mut tick: impl FnMut(),
+    ) -> (Self, impl Future<Output = ()>) {
+        let in_flight_calls = Arc::new(AtomicUsize::new(0));
+        let (wake_sender, mut wake_receiver) = mpsc::channel(1);
+        let ticker = {
+            let in_flight_calls = in_flight_calls.clone();
+            async move {
+                loop {
+                    while in_flight_calls.load(Ordering::SeqCst) == 0 {
+                        if wake_receiver.next().await.is_none() {
+                            return;
+                        }
+                    }
+                    sleep().await;
+                    tick();
+                }
+            }
+        };
+        let gate = Self {
+            in_flight_calls,
+            wake_sender: Mutex::new(wake_sender),
+        };
+        (gate, ticker)
+    }
+
+    fn enter(&self) -> InFlightCall {
+        if self.in_flight_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            let mut wake_sender = self
+                .wake_sender
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Err(error) = wake_sender.try_send(())
+                && error.is_disconnected()
+            {
+                log::error!("wasm epoch ticker stopped: {error}");
+            }
+        }
+        InFlightCall {
+            in_flight_calls: self.in_flight_calls.clone(),
+        }
+    }
+}
+
+impl Drop for InFlightCall {
+    fn drop(&mut self) {
+        self.in_flight_calls.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn wasm_engine() -> (wasmtime::Engine, Arc<EpochGate>) {
+    static WASM_ENGINE: OnceLock<(wasmtime::Engine, Arc<EpochGate>)> = OnceLock::new();
     WASM_ENGINE
         .get_or_init(|| {
             let mut config = wasmtime::Config::new();
@@ -573,33 +640,28 @@ fn wasm_engine(executor: &BackgroundExecutor) -> wasmtime::Engine {
 
             let engine = wasmtime::Engine::new(&config).unwrap();
 
-            // It might be safer to do this on a non-async thread to make sure it makes progress
-            // regardless of if extensions are blocking.
-            // However, due to our current setup, this isn't a likely occurrence and we'd rather
-            // not have a dedicated thread just for this. If it becomes an issue, we can consider
-            // creating a separate thread for epoch interruption.
             let engine_ref = engine.weak();
-            let executor2 = executor.clone();
-            executor
-                .spawn(async move {
-                    // Somewhat arbitrary interval, as it isn't a guaranteed interval.
-                    // But this is a rough upper bound for how long the extension execution can block on
-                    // `Future::poll`.
-                    const EPOCH_INTERVAL: Duration = Duration::from_millis(100);
-                    loop {
-                        executor2.timer(EPOCH_INTERVAL).await;
-                        // Exit the loop and thread once the engine is dropped.
-                        let Some(engine) = engine_ref.upgrade() else {
-                            break;
-                        };
+            let (epoch_gate, epoch_ticker) = EpochGate::new(
+                || async { std::thread::sleep(EPOCH_INTERVAL) },
+                move || {
+                    if let Some(engine) = engine_ref.upgrade() {
                         engine.increment_epoch();
                     }
-                })
-                .detach();
+                },
+            );
+            std::thread::Builder::new()
+                .name("WasmEpochTicker".to_owned())
+                .spawn(move || futures::executor::block_on(epoch_ticker))
+                .log_err();
 
-            engine
+            (engine, Arc::new(epoch_gate))
         })
         .clone()
+}
+
+#[cfg(test)]
+pub(crate) fn wasm_calls_in_flight() -> usize {
+    wasm_engine().1.in_flight_calls.load(Ordering::SeqCst)
 }
 
 fn cache_store() -> Arc<IncrementalCompilationCache> {
@@ -625,9 +687,11 @@ impl WasmHost {
         });
 
         let extension_settings = ExtensionSettings::get_global(cx);
+        let (engine, epoch_gate) = wasm_engine();
 
         Arc::new(Self {
-            engine: wasm_engine(cx.background_executor()),
+            engine,
+            epoch_gate,
             fs,
             work_dir,
             http_client,
@@ -686,8 +750,8 @@ impl WasmHost {
             store.set_epoch_deadline(1);
             store.epoch_deadline_async_yield_and_update(1);
 
+            let in_flight_call = this.epoch_gate.enter();
             let mut extension = Extension::instantiate_async(
-                &executor,
                 &mut store,
                 this.release_channel,
                 zed_api_version.clone(),
@@ -700,11 +764,15 @@ impl WasmHost {
                 .await
                 .map_err(anyhow::Error::from)
                 .context("failed to initialize wasm extension")?;
+            drop(in_flight_call);
 
             let (tx, mut rx) = mpsc::unbounded::<ExtensionCall>();
+            let epoch_gate = this.epoch_gate.clone();
             let extension_task = async move {
                 while let Some(call) = rx.next().await {
+                    let in_flight_call = epoch_gate.enter();
                     (call)(&mut extension, &mut store).await;
+                    drop(in_flight_call);
                 }
             };
 
@@ -1035,6 +1103,7 @@ impl CacheStore for IncrementalCompilationCache {
 
 #[cfg(test)]
 mod tests {
+    mod fork_tests;
     use super::*;
     use extension::ExtensionHostProxy;
     use fs::FakeFs;

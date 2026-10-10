@@ -3,7 +3,6 @@ use crate::wasm_host::WasmState;
 use crate::wasm_host::wit::since_v0_0_4;
 use anyhow::Result;
 use extension::{ExtensionLanguageServerProxy, WorktreeDelegate};
-use gpui::BackgroundExecutor;
 use language::BinaryStatus;
 use semver::Version;
 use std::sync::{Arc, OnceLock};
@@ -28,12 +27,10 @@ wasmtime::component::bindgen!({
 
 pub type ExtensionWorktree = Arc<dyn WorktreeDelegate>;
 
-pub fn linker(executor: &BackgroundExecutor) -> &'static Linker<WasmState> {
+pub fn linker() -> &'static Linker<WasmState> {
     static LINKER: OnceLock<Linker<WasmState>> = OnceLock::new();
     LINKER.get_or_init(|| {
-        super::new_linker(executor, |linker| {
-            Extension::add_to_linker::<_, WasmState>(linker, |s| s)
-        })
+        super::new_linker(|linker| Extension::add_to_linker::<_, WasmState>(linker, |s| s))
     })
 }
 
