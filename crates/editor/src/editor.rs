@@ -1927,6 +1927,11 @@ impl Editor {
         if !self.mode.is_full() {
             return;
         }
+        if !EditorSettings::get_global(cx).sticky_scroll.enabled {
+            self.sticky_headers_task = Task::ready(());
+            self.sticky_headers = None;
+            return;
+        }
         let multi_buffer = display_snapshot.buffer_snapshot().clone();
         let scroll_anchor = self
             .scroll_manager
@@ -2041,6 +2046,12 @@ impl Editor {
             merge_adjacent: true,
             ..FoldPlaceholder::default()
         };
+        let renders_to_cell_grid = window.text_system().renders_to_cell_grid();
+        let file_header_height = if renders_to_cell_grid {
+            1
+        } else {
+            FILE_HEADER_HEIGHT
+        };
         let display_map = display_map.unwrap_or_else(|| {
             cx.new(|cx| {
                 DisplayMap::new(
@@ -2048,7 +2059,7 @@ impl Editor {
                     style.font(),
                     font_size,
                     None,
-                    FILE_HEADER_HEIGHT,
+                    file_header_height,
                     MULTI_BUFFER_EXCERPT_HEADER_HEIGHT,
                     fold_placeholder,
                     diagnostics_max_severity,
@@ -2388,7 +2399,11 @@ impl Editor {
                 horizontal: full_mode,
                 vertical: full_mode,
             },
-            minimap_visibility: MinimapVisibility::for_mode(&mode, cx),
+            minimap_visibility: if renders_to_cell_grid {
+                MinimapVisibility::Disabled
+            } else {
+                MinimapVisibility::for_mode(&mode, cx)
+            },
             offset_content: !matches!(mode, EditorMode::SingleLine),
             breadcrumbs_visibility: BreadcrumbsVisibility::from_settings(cx),
             show_gutter: full_mode,
@@ -3823,7 +3838,6 @@ impl Editor {
                         |_, theme| theme.colors().editor_document_highlight_write_background,
                         cx,
                     );
-                    cx.notify();
                 })
                 .log_err();
             }
@@ -3988,8 +4002,16 @@ impl Editor {
         })
     }
 
-    #[ztracing::instrument(skip_all)]
     fn refresh_outline_symbols_at_cursor(&mut self, cx: &mut Context<Editor>) {
+        self.update_outline_symbols_at_cursor(false, cx);
+    }
+
+    #[ztracing::instrument(skip_all)]
+    fn update_outline_symbols_at_cursor(
+        &mut self,
+        document_symbols_updated: bool,
+        cx: &mut Context<Editor>,
+    ) {
         if !self.lsp_data_enabled() {
             return;
         }
@@ -3997,10 +4019,8 @@ impl Editor {
         let multi_buffer_snapshot = self.buffer().read(cx).snapshot(cx);
 
         if self.uses_lsp_document_symbols(cursor, &multi_buffer_snapshot, cx) {
-            self.outline_symbols_at_cursor =
-                self.lsp_symbols_at_cursor(cursor, &multi_buffer_snapshot, cx);
-            cx.emit(EditorEvent::OutlineSymbolsChanged);
-            cx.notify();
+            let symbols = self.lsp_symbols_at_cursor(cursor, &multi_buffer_snapshot, cx);
+            self.set_outline_symbols_at_cursor(symbols, document_symbols_updated, cx);
         } else {
             let syntax = cx.theme().syntax().clone();
             let background_task = cx.background_spawn(async move {
@@ -4010,13 +4030,25 @@ impl Editor {
                 cx.spawn(async move |this, cx| {
                     let symbols = background_task.await;
                     this.update(cx, |this, cx| {
-                        this.outline_symbols_at_cursor = symbols;
-                        cx.emit(EditorEvent::OutlineSymbolsChanged);
-                        cx.notify();
+                        this.set_outline_symbols_at_cursor(symbols, document_symbols_updated, cx);
                     })
                     .ok();
                 });
         }
+    }
+
+    fn set_outline_symbols_at_cursor(
+        &mut self,
+        symbols: Option<(BufferId, Vec<OutlineItem<Anchor>>)>,
+        document_symbols_updated: bool,
+        cx: &mut Context<Editor>,
+    ) {
+        if !document_symbols_updated && symbols == self.outline_symbols_at_cursor {
+            return;
+        }
+        self.outline_symbols_at_cursor = symbols;
+        cx.emit(EditorEvent::OutlineSymbolsChanged);
+        cx.notify();
     }
 
     #[ztracing::instrument(skip_all)]
@@ -4943,10 +4975,12 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<CodeContextMenu> {
-        cx.notify();
         self.completion_tasks.clear();
         let context_menu = self.context_menu.borrow_mut().take();
-        self.stale_edit_prediction_in_menu.take();
+        let had_stale_edit_prediction = self.stale_edit_prediction_in_menu.take().is_some();
+        if context_menu.is_some() || had_stale_edit_prediction {
+            cx.notify();
+        }
         self.update_visible_edit_prediction(window, cx);
         if let Some(CodeContextMenu::Completions(_)) = &context_menu
             && let Some(completion_provider) = &self.completion_provider
@@ -8733,6 +8767,7 @@ impl Editor {
         update: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>),
     ) -> Option<TransactionId> {
         self.with_selection_effects_deferred(window, cx, |this, window, cx| {
+            this.unfold_buffers_with_selections(cx);
             this.start_transaction_at(Instant::now(), window, cx);
             update(this, window, cx);
             this.end_transaction_at(Instant::now(), cx)
@@ -8961,7 +8996,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<Self>> {
-        (minimap_settings.minimap_enabled() && self.buffer_kind(cx) == ItemBufferKind::Singleton)
+        (minimap_settings.minimap_enabled() && self.supports_minimap(cx))
             .then(|| self.initialize_new_minimap(minimap_settings, window, cx))
     }
 
@@ -9532,10 +9567,14 @@ impl Editor {
         color_fetcher: impl Fn(&usize, &Theme) -> Hsla + Send + Sync + 'static,
         cx: &mut Context<Self>,
     ) {
-        self.background_highlights
-            .insert(key, (Arc::new(color_fetcher), Arc::from(ranges)));
-        self.scrollbar_marker_state.dirty = true;
-        cx.notify();
+        let had_ranges = self
+            .background_highlights
+            .insert(key, (Arc::new(color_fetcher), Arc::from(ranges)))
+            .is_some_and(|(_, previous_ranges)| !previous_ranges.is_empty());
+        if had_ranges || !ranges.is_empty() {
+            self.scrollbar_marker_state.dirty = true;
+            cx.notify();
+        }
     }
 
     pub fn clear_background_highlights(
@@ -10391,6 +10430,12 @@ impl Editor {
                 self.colorize_brackets(true, cx);
             }
 
+            if EditorSettings::get_global(cx).sticky_scroll.enabled && self.sticky_headers.is_none()
+            {
+                let snapshot = self.snapshot(window, cx);
+                self.refresh_sticky_headers(&snapshot, cx);
+            }
+
             if language_settings_changed {
                 self.clear_disabled_lsp_folding_ranges(window, cx);
                 self.refresh_document_symbols(None, cx);
@@ -11068,8 +11113,8 @@ impl Editor {
         })
     }
 
-    pub fn file_header_size(&self) -> u32 {
-        FILE_HEADER_HEIGHT
+    pub fn file_header_size(&self, cx: &App) -> u32 {
+        self.display_map.read(cx).buffer_header_height()
     }
 
     pub fn restore(

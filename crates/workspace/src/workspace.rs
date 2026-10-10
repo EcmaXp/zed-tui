@@ -1,4 +1,5 @@
 pub mod active_file_name;
+mod cell_layout;
 pub mod dock;
 pub mod history_manager;
 pub mod invalid_item_view;
@@ -62,12 +63,12 @@ use futures::{
 };
 use gpui::{
     Action, AnyEntity, AnyView, AnyWeakView, App, AppContext, AsyncApp, AsyncWindowContext, Axis,
-    Bounds, ClipboardItem, Context, CursorStyle, Decorations, DragMoveEvent, Entity, EntityId,
-    EventEmitter, FocusHandle, Focusable, Global, HitboxBehavior, Hsla, KeyContext, Keystroke,
-    ManagedView, MouseButton, PathPromptOptions, Point, PromptLevel, Render, ResizeEdge, Size,
-    Stateful, Subscription, SystemWindowTabController, Task, TaskExt, Tiling, WeakEntity,
-    WindowBounds, WindowHandle, WindowId, WindowOptions, actions, canvas, point, relative, size,
-    transparent_black,
+    Bounds, ClipboardItem, Context, CursorStyle, Decorations, DispatchPhase, DragMoveEvent, Entity,
+    EntityId, EventEmitter, FocusHandle, Focusable, Global, HitboxBehavior, Hsla, KeyContext,
+    Keystroke, ManagedView, MouseButton, PathPromptOptions, Point, PromptLevel, Render, ResizeEdge,
+    SharedActionListener, Size, Stateful, Subscription, SystemWindowTabController, Task, TaskExt,
+    Tiling, WeakEntity, WindowBounds, WindowHandle, WindowId, WindowOptions, actions, canvas,
+    point, relative, size, transparent_black,
 };
 pub use history_manager::*;
 pub use item::{
@@ -1859,7 +1860,9 @@ impl Workspace {
 
                 _ => {}
             }
-            cx.notify()
+            if project_event_affects_workspace(event) {
+                cx.notify()
+            }
         })
         .detach();
 
@@ -1890,6 +1893,9 @@ impl Workspace {
         }
 
         cx.on_focus_lost(window, |this, window, cx| {
+            if this.reveal_focus_hidden_by_zoom(window, cx) {
+                return;
+            }
             let focus_handle = window
                 .focus_lost_restore_target(cx)
                 .unwrap_or_else(|| this.fallback_focus_handle(window, cx));
@@ -8488,13 +8494,23 @@ impl Workspace {
         &mut self,
         callback: impl Fn(&mut Self, &A, &mut Window, &mut Context<Self>) + 'static,
     ) -> &mut Self {
-        let callback = Arc::new(callback);
+        let workspace = self.weak_self.clone();
+        let listener: SharedActionListener = Rc::new(
+            move |action: &dyn std::any::Any,
+                  phase: DispatchPhase,
+                  window: &mut Window,
+                  cx: &mut App| {
+                if phase == DispatchPhase::Bubble
+                    && let Some(action) = action.downcast_ref::<A>()
+                    && let Some(workspace) = workspace.upgrade()
+                {
+                    workspace.update(cx, |workspace, cx| callback(workspace, action, window, cx));
+                }
+            },
+        );
 
-        self.workspace_actions.push(Box::new(move |div, _, _, cx| {
-            let callback = callback.clone();
-            div.on_action(cx.listener(move |workspace, event, window, cx| {
-                (callback)(workspace, event, window, cx)
-            }))
+        self.workspace_actions.push(Box::new(move |div, _, _, _| {
+            div.on_shared_action(TypeId::of::<A>(), listener.clone())
         }));
         self
     }
@@ -9090,7 +9106,7 @@ impl Workspace {
     }
 }
 
-fn project_window_title(project: &Project, cx: &App) -> String {
+pub fn project_window_title(project: &Project, cx: &App) -> String {
     let mut title = String::new();
 
     for (index, worktree) in project.visible_worktrees(cx).enumerate() {
@@ -9550,6 +9566,27 @@ impl Render for DraggedDock {
     }
 }
 
+fn project_event_affects_workspace(event: &project::Event) -> bool {
+    !matches!(
+        event,
+        project::Event::BufferEdited { .. }
+            | project::Event::DiagnosticsUpdated { .. }
+            | project::Event::LanguageServerLog(..)
+            | project::Event::LanguageServerBufferRegistered { .. }
+            | project::Event::ToggleLspLogs { .. }
+            | project::Event::RefreshInlayHints { .. }
+            | project::Event::RefreshSemanticTokens { .. }
+            | project::Event::RefreshCodeLens { .. }
+            | project::Event::RefreshDocumentColors { .. }
+            | project::Event::RefreshDocumentLinks { .. }
+            | project::Event::RefreshDocumentHighlights { .. }
+            | project::Event::RefreshFoldingRanges { .. }
+            | project::Event::RefreshDocumentSymbols { .. }
+            | project::Event::SnippetEdit(..)
+            | project::Event::WorkspaceEditApplied(..)
+    )
+}
+
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         static FIRST_PAINT: AtomicBool = AtomicBool::new(true);
@@ -9562,6 +9599,7 @@ impl Render for Workspace {
             && self.active_item(cx).is_some();
         let pad_zoomed_pane =
             self.centered_layout && self.zoomed.is_some() && self.zoomed_position.is_none();
+        let zoom_hides_layout = self.zoom_hides_layout(window);
         let render_padding = |size| {
             (size > 0.0).then(|| {
                 div()
@@ -9729,39 +9767,35 @@ impl Render for Workspace {
                                             workspace.previous_dock_drag_coordinates =
                                                 Some(e.event.position);
 
-                                            match e.drag(cx).0 {
-                                                DockPosition::Left => {
-                                                    workspace.resize_left_dock(
-                                                        e.event.position.x
-                                                            - workspace.bounds.left(),
-                                                        window,
-                                                        cx,
-                                                    );
-                                                }
-                                                DockPosition::Right => {
-                                                    workspace.resize_right_dock(
-                                                        workspace.bounds.right()
-                                                            - e.event.position.x,
-                                                        window,
-                                                        cx,
-                                                    );
-                                                }
-                                                DockPosition::Bottom => {
-                                                    workspace.resize_bottom_dock(
-                                                        workspace.bounds.bottom()
-                                                            - e.event.position.y,
-                                                        window,
-                                                        cx,
-                                                    );
-                                                }
-                                            };
-                                            workspace.serialize_workspace(window, cx);
+                                            let position = e.drag(cx).0;
+                                            workspace.resize_dock_to_pointer(
+                                                position,
+                                                e.event.position,
+                                                window,
+                                                cx,
+                                            );
                                         }
                                     },
                                 ))
+                                .when(
+                                    window.text_system().renders_to_cell_grid(),
+                                    |this| {
+                                        this.on_drop(cx.listener(
+                                            |workspace, dock: &DraggedDock, window, cx| {
+                                                workspace.resize_dock_to_pointer(
+                                                    dock.0,
+                                                    window.mouse_position(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            },
+                                        ))
+                                    },
+                                )
                             })
                             .child({
                                 match bottom_dock_layout {
+                                    _ if zoom_hides_layout => div(),
                                     BottomDockLayout::Full => div()
                                         .flex()
                                         .flex_col()
@@ -12455,6 +12489,7 @@ fn load_legacy_panel_size(
 
 #[cfg(test)]
 mod tests {
+    mod fork_tests;
     use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
 
     use super::*;

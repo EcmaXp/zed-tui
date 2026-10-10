@@ -23,7 +23,10 @@ pub struct CursorPosition {
     context: Option<FocusHandle>,
     workspace: WeakEntity<Workspace>,
     update_position: Task<()>,
+    stale_position_editor: Option<WeakEntity<Editor>>,
     _observe_active_editor: Option<Subscription>,
+    #[cfg(test)]
+    position_reads: usize,
 }
 
 /// A position in the editor, where user's caret is located at.
@@ -74,7 +77,10 @@ impl CursorPosition {
             selected_count: Default::default(),
             workspace: workspace.weak_handle(),
             update_position: Task::ready(()),
+            stale_position_editor: None,
             _observe_active_editor: None,
+            #[cfg(test)]
+            position_reads: 0,
         }
     }
 
@@ -99,51 +105,8 @@ impl CursorPosition {
             editor
                 .update(cx, |editor, cx| {
                     cursor_position.update(cx, |cursor_position, cx| {
-                        cursor_position.selected_count = SelectionStats::default();
-                        cursor_position.selected_count.selections = editor.selections.count();
-                        match editor.mode() {
-                            editor::EditorMode::AutoHeight { .. }
-                            | editor::EditorMode::SingleLine
-                            | editor::EditorMode::Minimap { .. } => {
-                                cursor_position.position = None;
-                                cursor_position.context = None;
-                            }
-                            editor::EditorMode::Full { .. } => {
-                                let mut last_selection = None::<Selection<Point>>;
-                                let snapshot = editor.display_snapshot(cx);
-                                if snapshot.buffer_snapshot().excerpts().count() > 0 {
-                                    for selection in editor.selections.all_adjusted(&snapshot) {
-                                        let selection_summary = snapshot
-                                            .buffer_snapshot()
-                                            .text_summary_for_range::<MBTextSummary, _>(
-                                            selection.start..selection.end,
-                                        );
-                                        cursor_position.selected_count.characters +=
-                                            selection_summary.chars;
-                                        if selection.end != selection.start {
-                                            cursor_position.selected_count.lines +=
-                                                (selection.end.row - selection.start.row) as usize;
-                                            if selection.end.column != 0 {
-                                                cursor_position.selected_count.lines += 1;
-                                            }
-                                        }
-                                        if last_selection.as_ref().is_none_or(|last_selection| {
-                                            selection.id > last_selection.id
-                                        }) {
-                                            last_selection = Some(selection);
-                                        }
-                                    }
-                                }
-                                cursor_position.position = last_selection.map(|s| {
-                                    UserCaretPosition::at_selection_end(
-                                        &s,
-                                        snapshot.buffer_snapshot(),
-                                    )
-                                });
-                                cursor_position.context = Some(editor.focus_handle(cx));
-                            }
-                        }
-
+                        cursor_position.stale_position_editor = None;
+                        cursor_position.read_position(editor, cx);
                         cx.notify();
                     })
                 })
@@ -152,6 +115,70 @@ impl CursorPosition {
                 .ok()
                 .flatten();
         });
+    }
+
+    fn mark_position_stale(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
+        self.update_position = Task::ready(());
+        self.stale_position_editor = Some(editor.downgrade());
+        cx.notify();
+    }
+
+    fn read_stale_position(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self
+            .stale_position_editor
+            .take()
+            .and_then(|editor| editor.upgrade())
+        else {
+            return;
+        };
+        editor.update(cx, |editor, cx| self.read_position(editor, cx));
+    }
+
+    fn read_position(&mut self, editor: &Editor, cx: &mut App) {
+        #[cfg(test)]
+        {
+            self.position_reads += 1;
+        }
+        self.selected_count = SelectionStats::default();
+        self.selected_count.selections = editor.selections.count();
+        match editor.mode() {
+            editor::EditorMode::AutoHeight { .. }
+            | editor::EditorMode::SingleLine
+            | editor::EditorMode::Minimap { .. } => {
+                self.position = None;
+                self.context = None;
+            }
+            editor::EditorMode::Full { .. } => {
+                let mut last_selection = None::<Selection<Point>>;
+                let snapshot = editor.display_snapshot(cx);
+                if snapshot.buffer_snapshot().excerpts().count() > 0 {
+                    for selection in editor.selections.all_adjusted(&snapshot) {
+                        let selection_summary = snapshot
+                            .buffer_snapshot()
+                            .text_summary_for_range::<MBTextSummary, _>(
+                                selection.start..selection.end,
+                            );
+                        self.selected_count.characters += selection_summary.chars;
+                        if selection.end != selection.start {
+                            self.selected_count.lines +=
+                                (selection.end.row - selection.start.row) as usize;
+                            if selection.end.column != 0 {
+                                self.selected_count.lines += 1;
+                            }
+                        }
+                        if last_selection
+                            .as_ref()
+                            .is_none_or(|last_selection| selection.id > last_selection.id)
+                        {
+                            last_selection = Some(selection);
+                        }
+                    }
+                }
+                self.position = last_selection
+                    .map(|s| UserCaretPosition::at_selection_end(&s, snapshot.buffer_snapshot()));
+                self.context = Some(editor.focus_handle(cx));
+            }
+        }
     }
 
     fn write_position(&self, text: &mut String, cx: &App) {
@@ -205,6 +232,11 @@ impl CursorPosition {
     pub(crate) fn position(&self) -> Option<UserCaretPosition> {
         self.position
     }
+
+    #[cfg(test)]
+    pub(crate) fn position_reads(&self) -> usize {
+        self.position_reads
+    }
 }
 
 impl Render for CursorPosition {
@@ -212,6 +244,7 @@ impl Render for CursorPosition {
         if !StatusBarSettings::get_global(cx).cursor_position_button {
             return div().hidden();
         }
+        self.read_stale_position(cx);
 
         div().when_some(self.position, |el, position| {
             let mut text = format!(
@@ -277,19 +310,26 @@ impl StatusItemView for CursorPosition {
                 &editor,
                 window,
                 |cursor_position, editor, event, window, cx| match event {
-                    EditorEvent::SelectionsChanged { .. } => Self::update_position(
-                        cursor_position,
-                        editor,
-                        Some(UPDATE_DEBOUNCE),
-                        window,
-                        cx,
-                    ),
+                    EditorEvent::SelectionsChanged { .. } => {
+                        if editor.read(cx).buffer().read(cx).is_singleton() {
+                            cursor_position.mark_position_stale(editor, cx);
+                        } else {
+                            Self::update_position(
+                                cursor_position,
+                                editor,
+                                Some(UPDATE_DEBOUNCE),
+                                window,
+                                cx,
+                            );
+                        }
+                    }
                     _ => {}
                 },
             ));
-            self.update_position(&editor, None, window, cx);
+            self.mark_position_stale(&editor, cx);
         } else {
             self.position = None;
+            self.stale_position_editor = None;
             self._observe_active_editor = None;
         }
 

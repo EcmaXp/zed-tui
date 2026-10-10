@@ -31,7 +31,14 @@ impl KeyContext {
     pub fn new_with_defaults() -> Self {
         let mut context = Self::default();
         #[cfg(target_os = "macos")]
-        context.set("os", "macos");
+        context.set(
+            "os",
+            if crate::uses_mac_key_conventions() {
+                "macos"
+            } else {
+                "linux"
+            },
+        );
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         context.set("os", "linux");
         #[cfg(target_os = "windows")]

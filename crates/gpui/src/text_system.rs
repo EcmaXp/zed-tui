@@ -424,13 +424,20 @@ impl TextSystem {
         let bounds = self
             .platform_text_system
             .typographic_bounds(font_id, glyph_id)?;
-        Ok(self.read_metrics(font_id, |metrics| {
+        let mut bounds = self.read_metrics(font_id, |metrics| {
             (bounds / metrics.units_per_em as f32 * font_size.0).map(px)
-        }))
+        });
+        if self.cell_size().is_some() {
+            bounds.size.width = self.layout_width(font_id, font_size, character);
+        }
+        Ok(bounds)
     }
 
     /// Get the advance width for the given character, in the given font and size.
     pub fn advance(&self, font_id: FontId, font_size: Pixels, ch: char) -> Result<Size<Pixels>> {
+        if self.cell_size().is_some() {
+            return Ok(Size::new(self.layout_width(font_id, font_size, ch), px(0.)));
+        }
         let glyph_id = self
             .platform_text_system
             .glyph_for_char(font_id, ch)
@@ -484,6 +491,16 @@ impl TextSystem {
     /// Uses the advance width of the `0` character in the given font and size.
     pub fn ch_advance(&self, font_id: FontId, font_size: Pixels) -> Result<Pixels> {
         Ok(self.advance(font_id, font_size, '0')?.width)
+    }
+
+    #[expect(missing_docs)]
+    pub fn cell_size(&self) -> Option<Size<Pixels>> {
+        self.platform_text_system.cell_size()
+    }
+
+    /// Whether text lays out on a terminal cell grid instead of in pixels.
+    pub fn renders_to_cell_grid(&self) -> bool {
+        self.cell_size().is_some()
     }
 
     /// Get the number of font size units per 'em square',

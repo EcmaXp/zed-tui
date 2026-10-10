@@ -1636,7 +1636,9 @@ pub mod test {
 
     impl Render for TestItem {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            let parent = gpui::div().track_focus(&self.focus_handle(cx));
+            let parent = gpui::div()
+                .debug_selector(|| "test_item".into())
+                .track_focus(&self.focus_handle(cx));
             self.child_focus_handles
                 .iter()
                 .fold(parent, |parent, child_handle| {

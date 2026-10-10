@@ -235,6 +235,14 @@ zlog.workspace = true
 zlog_settings.workspace = true
 ztracing.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+ciborium.workspace = true
+command_palette_hooks.workspace = true
+crossterm = { workspace = true, features = ["osc52"] }
+gpui_tui.workspace = true
+libc.workspace = true
+vte.workspace = true
+
 [target.'cfg(target_os = "windows")'.dependencies]
 etw_tracing.workspace = true
 windows.workspace = true
@@ -276,6 +284,10 @@ image.workspace = true
 agent_ui = { workspace = true, features = ["test-support"] }
 search = { workspace = true, features = ["test-support"] }
 repl = { workspace = true, features = ["test-support"] }
+alacritty_terminal.workspace = true
+rand.workspace = true
+tempfile.workspace = true
+unicode-width.workspace = true
 
 
 [package.metadata.bundle-dev]

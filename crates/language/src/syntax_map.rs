@@ -1102,7 +1102,7 @@ impl SyntaxSnapshot {
         range: Range<usize>,
         buffer: &'a BufferSnapshot,
         options: TreeSitterOptions,
-        query: fn(&Grammar) -> Option<&Query>,
+        query: impl FnMut(&'a Grammar) -> Option<&'a Query>,
     ) -> SyntaxMapMatches<'a> {
         SyntaxMapMatches::new(
             range.clone(),
@@ -1331,6 +1331,7 @@ impl<'a> SyntaxMapCaptures<'a> {
 pub struct TreeSitterOptions {
     pub max_start_depth: Option<u32>,
     pub max_bytes_to_query: Option<usize>,
+    pub match_limit: Option<u32>,
 }
 
 impl TreeSitterOptions {
@@ -1338,6 +1339,7 @@ impl TreeSitterOptions {
         Self {
             max_start_depth: Some(max_start_depth),
             max_bytes_to_query: None,
+            match_limit: None,
         }
     }
 }
@@ -1347,7 +1349,7 @@ impl<'a> SyntaxMapMatches<'a> {
         range: Range<usize>,
         text: &'a Rope,
         layers: impl Iterator<Item = SyntaxLayer<'a>>,
-        query: fn(&Grammar) -> Option<&Query>,
+        mut query: impl FnMut(&'a Grammar) -> Option<&'a Query>,
         options: TreeSitterOptions,
     ) -> Self {
         let mut result = Self::default();
@@ -1370,6 +1372,9 @@ impl<'a> SyntaxMapMatches<'a> {
                 )
             };
             cursor.set_max_start_depth(options.max_start_depth);
+            if let Some(match_limit) = options.match_limit {
+                cursor.set_match_limit(match_limit);
+            }
 
             if let Some(max_bytes_to_query) = options.max_bytes_to_query {
                 let midpoint = (range.start + range.end) / 2;
@@ -2263,10 +2268,12 @@ impl<'a> Iterator for ByteChunks<'a> {
     }
 }
 
+const DEFAULT_QUERY_MATCH_LIMIT: u32 = 64;
+
 impl QueryCursorHandle {
     pub fn new() -> Self {
         let mut cursor = QUERY_CURSORS.lock().pop().unwrap_or_default();
-        cursor.set_match_limit(64);
+        cursor.set_match_limit(DEFAULT_QUERY_MATCH_LIMIT);
         QueryCursorHandle(Some(cursor))
     }
 }
@@ -2288,6 +2295,11 @@ impl DerefMut for QueryCursorHandle {
 impl Drop for QueryCursorHandle {
     fn drop(&mut self) {
         let mut cursor = self.0.take().unwrap();
+        let capture_lists_may_exceed_default_limit =
+            cursor.match_limit() > DEFAULT_QUERY_MATCH_LIMIT;
+        if capture_lists_may_exceed_default_limit {
+            return;
+        }
         cursor.set_byte_range(0..usize::MAX);
         cursor.set_point_range(Point::zero().to_ts_point()..Point::MAX.to_ts_point());
         cursor.set_containing_byte_range(0..usize::MAX);

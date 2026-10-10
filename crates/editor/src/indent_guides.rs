@@ -4,7 +4,8 @@ use collections::HashSet;
 use gpui::{App, AppContext as _, Context, Task, Window};
 use language::language_settings::LanguageSettings;
 use multi_buffer::{IndentGuide, MultiBufferRow, ToPoint};
-use text::{LineIndent, Point};
+use smallvec::SmallVec;
+use text::{BufferId, LineIndent, Point};
 use util::ResultExt;
 
 use crate::{DisplaySnapshot, Editor};
@@ -173,9 +174,16 @@ pub fn indent_guides_in_range(
         fold_ranges.push(start..end);
     }
 
+    let excerpt_starts = snapshot
+        .buffer_snapshot()
+        .excerpt_boundaries_in_range(start_offset..=end_offset)
+        .map(|boundary| (boundary.row, boundary.next.buffer_id()))
+        .collect::<Vec<_>>();
+
     snapshot
         .buffer_snapshot()
         .indent_guides_in_range(start_anchor..end_anchor, ignore_disabled_for_language, cx)
+        .flat_map(|indent_guide| split_at_excerpt_starts(indent_guide, &excerpt_starts))
         .filter(|indent_guide| {
             if editor.has_indent_guides_disabled_for_buffer(indent_guide.buffer_id) {
                 return false;
@@ -200,6 +208,25 @@ pub fn indent_guides_in_range(
             !has_containing_fold
         })
         .collect()
+}
+
+fn split_at_excerpt_starts(
+    mut indent_guide: IndentGuide,
+    excerpt_starts: &[(MultiBufferRow, BufferId)],
+) -> SmallVec<[IndentGuide; 1]> {
+    let mut pieces = SmallVec::new();
+    for &(excerpt_start, buffer_id) in excerpt_starts {
+        if indent_guide.start_row < excerpt_start && excerpt_start <= indent_guide.end_row {
+            pieces.push(IndentGuide {
+                end_row: MultiBufferRow(excerpt_start.0 - 1),
+                ..indent_guide.clone()
+            });
+            indent_guide.start_row = excerpt_start;
+            indent_guide.buffer_id = buffer_id;
+        }
+    }
+    pieces.push(indent_guide);
+    pieces
 }
 
 async fn resolve_indented_range(
