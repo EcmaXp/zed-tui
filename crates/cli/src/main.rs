@@ -8,6 +8,7 @@
 )]
 
 mod completions;
+mod tui;
 
 use crate::completions::Shell;
 
@@ -508,6 +509,10 @@ fn run() -> Result<()> {
     if let Ok(socket) = std::env::var("ZED_ASKPASS_SOCKET") {
         askpass::main_from_args(&socket, std::env::args().skip(1));
         return Ok(());
+    }
+
+    if let Some(launch) = tui::launch(env::args_os()) {
+        return tui::run(launch);
     }
 
     let args = Args::parse();
@@ -1088,13 +1093,20 @@ mod flatpak {
         }
     }
 
-    pub fn set_bin_if_no_escape(mut args: super::Args) -> super::Args {
+    pub fn bin_if_no_escape() -> Option<PathBuf> {
         if env::var(NO_ESCAPE_ENV_NAME).is_ok()
             && env::var("FLATPAK_ID").is_ok_and(|id| id.starts_with("dev.zed.Zed"))
-            && args.zed.is_none()
         {
-            args.zed = Some("/app/libexec/zed-editor".into());
             unsafe { env::set_var("ZED_UPDATE_EXPLANATION", "Please use flatpak to update zed") };
+            Some("/app/libexec/zed-editor".into())
+        } else {
+            None
+        }
+    }
+
+    pub fn set_bin_if_no_escape(mut args: super::Args) -> super::Args {
+        if args.zed.is_none() {
+            args.zed = bin_if_no_escape();
         }
         args
     }
