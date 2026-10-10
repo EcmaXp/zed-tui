@@ -17,8 +17,9 @@ impl ModeIndicator {
     /// Construct a new mode indicator in this window.
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         cx.observe_pending_input(window, |this: &mut Self, window, cx| {
-            this.update_pending_keys(window, cx);
-            cx.notify();
+            if this.update_pending_keys(window, cx) {
+                cx.notify();
+            }
         })
         .detach();
 
@@ -52,10 +53,13 @@ impl ModeIndicator {
         }
     }
 
-    fn update_pending_keys(&mut self, window: &mut Window, cx: &App) {
-        self.pending_keys = window
+    fn update_pending_keys(&mut self, window: &mut Window, cx: &App) -> bool {
+        let pending_keys = window
             .pending_input_keystrokes()
             .map(|keystrokes| text_for_keystrokes(keystrokes, cx));
+        let changed = pending_keys != self.pending_keys;
+        self.pending_keys = pending_keys;
+        changed
     }
 
     fn vim(&self) -> Option<Entity<Vim>> {
@@ -194,3 +198,6 @@ impl StatusItemView for ModeIndicator {
         None
     }
 }
+
+#[cfg(test)]
+mod tests;
