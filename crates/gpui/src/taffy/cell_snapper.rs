@@ -11,6 +11,7 @@ pub(super) struct CellSnapper {
     cell_size: Size<f32>,
     viewport_width: f32,
     cell_nodes: FxHashMap<LayoutId, CellNode>,
+    hairline_widths: FxHashMap<LayoutId, f32>,
     nested_rule_spacing_owners: FxHashMap<(LayoutId, Side), LayoutId>,
 }
 
@@ -22,7 +23,6 @@ struct CellNode {
     right: Edge,
     rounds_up_left_margin: bool,
     rounds_up_right_margin: bool,
-    hairline_width: Option<f32>,
 }
 
 impl CellNode {
@@ -82,6 +82,7 @@ enum Spacing {
 
 struct Snapped {
     node: CellNode,
+    hairline_width: Option<f32>,
     nested_rule_spacing_owners: SmallVec<[(Side, LayoutId); 2]>,
     dropped_spacings: SmallVec<[(LayoutId, Side, Spacing); 2]>,
     gap_closers: SmallVec<[(LayoutId, Side); 2]>,
@@ -93,6 +94,7 @@ impl CellSnapper {
             cell_size,
             viewport_width: f32::INFINITY,
             cell_nodes: FxHashMap::default(),
+            hairline_widths: FxHashMap::default(),
             nested_rule_spacing_owners: FxHashMap::default(),
         }
     }
@@ -103,6 +105,7 @@ impl CellSnapper {
 
     pub(super) fn clear(&mut self) {
         self.cell_nodes.clear();
+        self.hairline_widths.clear();
         self.nested_rule_spacing_owners.clear();
     }
 
@@ -144,6 +147,9 @@ impl CellSnapper {
         .expect(EXPECT_MESSAGE)
         .into();
         self.cell_nodes.insert(id, snapped.node);
+        if let Some(hairline_width) = snapped.hairline_width {
+            self.hairline_widths.insert(id, hairline_width);
+        }
         for (side, owner) in snapped.nested_rule_spacing_owners {
             self.nested_rule_spacing_owners.insert((id, side), owner);
         }
@@ -246,7 +252,6 @@ impl CellSnapper {
                 taffy_style.margin.right,
                 keeps_right_rule_padding,
             ),
-            hairline_width,
             ..node
         };
         let nested_rule_spacing_owners =
@@ -259,6 +264,7 @@ impl CellSnapper {
                 .collect();
         Snapped {
             node,
+            hairline_width,
             nested_rule_spacing_owners,
             dropped_spacings,
             gap_closers,
@@ -301,11 +307,7 @@ impl CellSnapper {
         let (mut x, mut width) =
             snap_axis(origin.x..far.x, self.cell_size.width, layout_size.width);
         let (y, height) = snap_axis(origin.y..far.y, self.cell_size.height, layout_size.height);
-        if let Some(hairline_width) = self
-            .cell_nodes
-            .get(&id)
-            .and_then(|node| node.hairline_width)
-        {
+        if let Some(hairline_width) = self.hairline_widths.get(&id).copied() {
             x += (width - hairline_width) / 2.0;
             width = hairline_width;
         }
@@ -530,7 +532,6 @@ impl CellSnapper {
             right: edge(style.padding.right, content.last(), Side::Right),
             rounds_up_left_margin: rounds_up(unsnapped.margin_left),
             rounds_up_right_margin: rounds_up(unsnapped.margin_right),
-            hairline_width: None,
         }
     }
 
@@ -1122,6 +1123,15 @@ mod tests {
     }
 
     #[test]
+    fn cell_nodes_take_at_most_twelve_bytes() {
+        assert!(
+            std::mem::size_of::<CellNode>() <= 12,
+            "{} bytes",
+            std::mem::size_of::<CellNode>()
+        );
+    }
+
+    #[test]
     fn columns_keep_symmetric_padding_when_only_one_side_is_blank() {
         use taffy::style::LengthPercentage;
         let mut snapper = CellSnapper::new(size(8., 16.));
@@ -1136,7 +1146,6 @@ mod tests {
                 right: Edge::Blank,
                 rounds_up_left_margin: false,
                 rounds_up_right_margin: false,
-                hairline_width: None,
             },
         );
         let padded = |direction| {
@@ -1474,7 +1483,6 @@ mod tests {
                 right: Edge::Blank,
                 rounds_up_left_margin: false,
                 rounds_up_right_margin: false,
-                hairline_width: None,
             },
         );
         let snapped = snapped_box(
