@@ -478,7 +478,7 @@ fn render_modifiers_with_style(
             Modifier {
                 enabled: modifiers.platform,
                 mac: mac_modifier(IconName::Command, "⌘"),
-                linux: Key("Super"),
+                linux: Key(linux_platform_key_name(false)),
                 windows: Key("Win"),
             },
             Modifier {
@@ -687,6 +687,16 @@ pub fn text_for_keystroke(modifiers: &Modifiers, key: &str, cx: &App) -> String 
     keystroke_text(modifiers, key, platform_style, KeyBinding::is_vim_mode(cx))
 }
 
+fn linux_platform_key_name(vim_mode: bool) -> &'static str {
+    let is_mac_keyboard = cfg!(target_os = "macos") && !gpui::uses_mac_key_conventions();
+    match (is_mac_keyboard, vim_mode) {
+        (true, false) => "Cmd",
+        (true, true) => "cmd",
+        (false, false) => "Super",
+        (false, true) => "super",
+    }
+}
+
 /// Returns a textual representation of the given [`Keystroke`].
 fn keystroke_text(
     modifiers: &Modifiers,
@@ -720,8 +730,7 @@ fn keystroke_text(
         match (platform_style, vim_mode) {
             (PlatformStyle::Mac, false) => text.push_str("Command"),
             (PlatformStyle::Mac, true) => text.push_str("cmd"),
-            (PlatformStyle::Linux, false) => text.push_str("Super"),
-            (PlatformStyle::Linux, true) => text.push_str("super"),
+            (PlatformStyle::Linux, _) => text.push_str(linux_platform_key_name(vim_mode)),
             (PlatformStyle::Windows, false) => text.push_str("Win"),
             (PlatformStyle::Windows, true) => text.push_str("win"),
         }

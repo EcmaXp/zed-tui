@@ -26,6 +26,7 @@ impl ActiveBufferLanguage {
     }
 
     fn update_language(&mut self, editor: Entity<Editor>, _: &mut Window, cx: &mut Context<Self>) {
+        let previous_language = self.active_language.take();
         self.active_language = Some(None);
 
         let editor = editor.read(cx);
@@ -35,7 +36,9 @@ impl ActiveBufferLanguage {
             self.active_language = Some(Some(language.name()));
         }
 
-        cx.notify();
+        if self.active_language != previous_language {
+            cx.notify();
+        }
     }
 }
 

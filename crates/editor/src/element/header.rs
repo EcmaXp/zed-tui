@@ -31,9 +31,9 @@ use super::{
     render_breadcrumb_text,
 };
 use crate::{
-    BUFFER_HEADER_PADDING, DisplayRow, Editor, EditorSettings, EditorSnapshot, FILE_HEADER_HEIGHT,
-    GutterDimensions, JumpData, MULTI_BUFFER_EXCERPT_HEADER_HEIGHT, OpenExcerpts, Point, RowExt,
-    SelectionEffects, StickyHeaderExcerpt, ToPoint, ToggleFold, ToggleFoldAll,
+    BUFFER_HEADER_PADDING, DisplayRow, Editor, EditorSettings, EditorSnapshot, GutterDimensions,
+    JumpData, MULTI_BUFFER_EXCERPT_HEADER_HEIGHT, OpenExcerpts, Point, RowExt, SelectionEffects,
+    StickyHeaderExcerpt, ToPoint, ToggleFold, ToggleFoldAll,
     display_map::ToDisplayPoint,
     scroll::{Autoscroll, ScrollOffset, ScrollPixelOffset},
 };
@@ -154,7 +154,7 @@ impl EditorElement {
         let jump_data = header_jump_data(
             snapshot,
             DisplayRow(scroll_position.y as u32),
-            FILE_HEADER_HEIGHT + MULTI_BUFFER_EXCERPT_HEADER_HEIGHT,
+            snapshot.buffer_header_height() + MULTI_BUFFER_EXCERPT_HEADER_HEIGHT,
             excerpt,
             latest_selection_anchors,
         );
@@ -171,7 +171,7 @@ impl EditorElement {
             .child(
                 div()
                     .w(available_width)
-                    .h(FILE_HEADER_HEIGHT as f32 * line_height)
+                    .h(snapshot.buffer_header_height() as f32 * line_height)
                     .bg(linear_gradient(
                         0.,
                         linear_color_stop(editor_bg_color.opacity(0.), 0.),
@@ -206,7 +206,9 @@ impl EditorElement {
                 continue;
             };
 
-            let max_row = display_row.0.saturating_sub(FILE_HEADER_HEIGHT);
+            let max_row = display_row
+                .0
+                .saturating_sub(snapshot.buffer_header_height());
             let offset = scroll_position.y - max_row as f64;
 
             if offset > 0.0 {
@@ -642,6 +644,8 @@ pub(crate) fn render_buffer_header(
     );
     let header_hovered = *header_hovered_state.read(cx);
     let editor_read = editor.read(cx);
+    let header_height = editor_read.file_header_size(cx);
+    let is_single_row = header_height == 1;
     let multi_buffer = editor_read.buffer.read(cx);
     let is_read_only = editor_read.read_only(cx);
     let editor_handle: &dyn ItemHandle = editor;
@@ -673,6 +677,11 @@ pub(crate) fn render_buffer_header(
         };
         indicator_color.map(|indicator_color| Indicator::dot().color(indicator_color))
     });
+    let (indicator, indicator_after_name) = if is_single_row {
+        (None, indicator.filter(|_| !is_read_only))
+    } else {
+        (indicator, None)
+    };
 
     let include_root = editor_read
         .project
@@ -694,6 +703,8 @@ pub(crate) fn render_buffer_header(
         (None, None)
     };
     let focus_handle = editor_read.focus_handle(cx);
+    let highlights_folded_row =
+        is_single_row && is_selected && is_folded && focus_handle.contains_focused(window, cx);
     let colors = cx.theme().colors();
     // On transparent windows, only render an opaque `editor_subheader_background` so it masks
     // the editor content beneath it without creating a darker bar. Sticky shadows still require
@@ -717,7 +728,7 @@ pub(crate) fn render_buffer_header(
         })
         .p(BUFFER_HEADER_PADDING)
         .w_full()
-        .h(FILE_HEADER_HEIGHT as f32 * window.line_height())
+        .h(header_height as f32 * window.line_height())
         .child(
             h_flex()
                 .group("buffer-header-group")
@@ -727,7 +738,7 @@ pub(crate) fn render_buffer_header(
                 .pr_2()
                 .rounded_sm()
                 .gap_1p5()
-                .border_1()
+                .when(!is_single_row, |header| header.border_1())
                 .map(|border| {
                     let border_color =
                         if is_selected && is_folded && focus_handle.contains_focused(window, cx) {
@@ -740,6 +751,11 @@ pub(crate) fn render_buffer_header(
                 .when(is_sticky && opaque_window, |s| s.shadow_md())
                 .when(show_header_background, |s| {
                     s.bg(colors.editor_subheader_background)
+                })
+                .when(highlights_folded_row, |s| {
+                    s.bg(colors
+                        .editor_subheader_background
+                        .blend(cx.theme().players().local().selection))
                 })
                 .hover(|s| s.bg(colors.element_hover))
                 .map(|header| {
@@ -757,6 +773,9 @@ pub(crate) fn render_buffer_header(
                                 ButtonLike::new("toggle-buffer-fold")
                                     .style(ButtonStyle::Transparent)
                                     .height(button_size.into())
+                                    .when(is_single_row, |this| {
+                                        this.height(window.line_height().into())
+                                    })
                                     .width(button_size)
                                     .children(toggle_chevron_icon)
                                     .tooltip({
@@ -812,7 +831,7 @@ pub(crate) fn render_buffer_header(
                         })
                         .take(1),
                 )
-                .when(!is_read_only, |this| {
+                .when(!is_read_only && !is_single_row, |this| {
                     this.child(
                         h_flex()
                             .size_3()
@@ -885,6 +904,7 @@ pub(crate) fn render_buffer_header(
                                                 }
                                             })),
                                     )
+                                    .children(indicator_after_name)
                                     .when_some(parent_path, |then, path| {
                                         then.child(
                                             Label::new(path)
@@ -939,6 +959,9 @@ pub(crate) fn render_buffer_header(
                                             .style(ButtonStyle::OutlinedCustom(
                                                 cx.theme().colors().border.opacity(0.6),
                                             ))
+                                            .when(is_single_row, |this| {
+                                                this.style(ButtonStyle::Subtle)
+                                            })
                                             .layer(ui::ElevationIndex::ElevatedSurface)
                                             .when(is_selected, |this| {
                                                 this.key_binding(KeyBinding::for_action_in(

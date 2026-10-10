@@ -17,8 +17,8 @@ pub struct LineEndingIndicator {
 
 impl LineEndingIndicator {
     fn update(&mut self, editor: Entity<Editor>, _: &mut Window, cx: &mut Context<Self>) {
-        self.line_ending = None;
-        self.active_editor = None;
+        let previous_line_ending = self.line_ending.take();
+        let previous_editor = self.active_editor.take();
 
         if let Some(buffer) = editor.read(cx).active_buffer(cx) {
             let line_ending = buffer.read(cx).line_ending();
@@ -26,7 +26,9 @@ impl LineEndingIndicator {
             self.active_editor = Some(editor.downgrade());
         }
 
-        cx.notify();
+        if self.line_ending != previous_line_ending || self.active_editor != previous_editor {
+            cx.notify();
+        }
     }
 }
 

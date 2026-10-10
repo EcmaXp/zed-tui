@@ -2,11 +2,14 @@ use std::{cmp::Reverse, iter, ops::Range, sync::Arc};
 
 use collections::HashMap;
 use smallvec::SmallVec;
-use text::BufferId;
+use text::{BufferId, Rope};
 use tree_sitter::QueryCapture;
 use util::RangeExt;
 
-use crate::{BufferSnapshot, Language, Runnable, RunnableCapture, RunnableConfig, RunnableTag};
+use crate::{
+    BufferSnapshot, Language, Runnable, RunnableCapture, RunnableConfig, RunnableTag,
+    TreeSitterOptions,
+};
 
 pub struct RunnableRange {
     pub buffer_id: BufferId,
@@ -49,6 +52,7 @@ impl RunnableMatchCapture {
 pub struct ResolvedRunnable {
     pub run_range: Range<usize>,
     pub extra_captures: SmallVec<[(String, String); 2]>,
+    pub full_range: Option<Range<usize>>,
 }
 
 pub trait RunnableResolver: Send + Sync {
@@ -64,9 +68,33 @@ pub(crate) fn runnable_ranges(
     buffer: &BufferSnapshot,
     offset_range: Range<usize>,
 ) -> impl Iterator<Item = RunnableRange> + '_ {
-    let mut syntax_matches = buffer.matches(offset_range.clone(), |grammar| {
-        grammar.runnable_config.as_ref().map(|config| &config.query)
-    });
+    let gate_on_buffer_text = offset_range
+        .len()
+        .saturating_mul(TEXT_GATING_MIN_RANGE_FRACTION)
+        >= buffer.len();
+    let mut text_presence = HashMap::<String, bool>::default();
+    let mut syntax_matches = buffer.syntax.matches_with_options(
+        offset_range.clone(),
+        buffer,
+        TreeSitterOptions {
+            match_limit: Some(RUNNABLES_MATCH_LIMIT),
+            ..TreeSitterOptions::default()
+        },
+        |grammar| {
+            let config = grammar.runnable_config.as_ref()?;
+            if !gate_on_buffer_text {
+                return Some(&config.query);
+            }
+            Some(config.query_for_text(|text| {
+                if let Some(present) = text_presence.get(text) {
+                    return *present;
+                }
+                let present = rope_contains(buffer.as_rope(), text);
+                text_presence.insert(text.to_string(), present);
+                present
+            }))
+        },
+    );
 
     let runnable_configs = syntax_matches
         .grammars()
@@ -114,6 +142,39 @@ pub(crate) fn runnable_ranges(
         Some(ranges)
     })
     .flatten()
+}
+
+const TEXT_GATING_MIN_RANGE_FRACTION: usize = 16;
+
+const RUNNABLES_MATCH_LIMIT: u32 = 256;
+
+fn rope_contains(rope: &Rope, needle: &str) -> bool {
+    let needle_bytes = needle.as_bytes();
+    let Some(overlap) = needle_bytes.len().checked_sub(1) else {
+        return true;
+    };
+    let mut tail = Vec::<u8>::with_capacity(overlap);
+    for chunk in rope.chunks() {
+        if chunk.contains(needle) {
+            return true;
+        }
+        let chunk_bytes = chunk.as_bytes();
+        let tail_len = tail.len();
+        if tail_len > 0 {
+            tail.extend_from_slice(&chunk_bytes[..overlap.min(chunk_bytes.len())]);
+            if tail
+                .windows(needle_bytes.len())
+                .any(|window| window == needle_bytes)
+            {
+                return true;
+            }
+            tail.truncate(tail_len);
+        }
+        tail.extend_from_slice(&chunk_bytes[chunk_bytes.len().saturating_sub(overlap)..]);
+        let keep_from = tail.len().saturating_sub(overlap);
+        tail.drain(..keep_from);
+    }
+    false
 }
 
 type RunnableMatchCaptures = SmallVec<[RunnableMatchCapture; 4]>;
@@ -165,7 +226,11 @@ fn group_runnable_matches(
     let mut sorted: SmallVec<[&QueryCapture<'_>; 16]> = captures.iter().collect();
     sorted.sort_by_key(|capture| {
         let range = capture.node.byte_range();
-        (range.start, Reverse(range.end))
+        let is_run_item = matches!(
+            runnable_config.extra_captures.get(capture.index as usize),
+            Some(RunnableCapture::RunItem)
+        );
+        (range.start, Reverse(range.end), !is_run_item)
     });
 
     let mut groups = SmallVec::new();
@@ -243,18 +308,6 @@ fn runnable_ranges_from_grouped_matches(
         shared_captures,
     } = group_runnable_matches(captures, runnable_config, offset_range);
 
-    let shared_extras: SmallVec<[(String, String); 4]> = shared_captures
-        .iter()
-        .filter_map(|capture| {
-            capture.name().map(|name| {
-                (
-                    name.to_string(),
-                    buffer.text_for_range(capture.range()).collect::<String>(),
-                )
-            })
-        })
-        .collect();
-
     let Some(resolver) = language
         .context_provider()
         .and_then(|provider| provider.runnable_resolver())
@@ -262,6 +315,7 @@ fn runnable_ranges_from_grouped_matches(
         return SmallVec::new();
     };
     let mut runnable_ranges = SmallVec::with_capacity(groups.len());
+    let mut shared_extras: Option<SmallVec<[(String, String); 4]>> = None;
 
     let tags = runnable_tags_from_pattern(&runnable_config.query, pattern_index);
     let buffer_id = buffer.remote_id();
@@ -269,16 +323,30 @@ fn runnable_ranges_from_grouped_matches(
         let Some(ResolvedRunnable {
             run_range,
             extra_captures: local_extras,
+            full_range,
         }) = resolver.resolve(&group.captures, &shared_captures, buffer)
         else {
             continue;
         };
 
+        let shared_extras = shared_extras.get_or_insert_with(|| {
+            shared_captures
+                .iter()
+                .filter_map(|capture| {
+                    capture.name().map(|name| {
+                        (
+                            name.to_string(),
+                            buffer.text_for_range(capture.range()).collect::<String>(),
+                        )
+                    })
+                })
+                .collect()
+        });
         let extra_captures = shared_extras.iter().cloned().chain(local_extras).collect();
 
         runnable_ranges.push(RunnableRange {
             run_range,
-            full_range: group.range,
+            full_range: full_range.unwrap_or(group.range),
             runnable: Runnable {
                 tags: tags.clone(),
                 language: language.clone(),
@@ -360,6 +428,7 @@ fn runnable_range_from_captures(
 
 #[cfg(test)]
 mod tests {
+    mod fork_tests;
     use super::*;
     use crate::{
         Buffer, ContextProvider, Language, LanguageConfig, LanguageMatcher, LanguageQueries,
@@ -449,6 +518,7 @@ mod tests {
             Some(ResolvedRunnable {
                 run_range: run.range(),
                 extra_captures: SmallVec::new(),
+                full_range: None,
             })
         }
     }
@@ -475,6 +545,7 @@ mod tests {
             Some(ResolvedRunnable {
                 run_range: run.range(),
                 extra_captures: extras,
+                full_range: None,
             })
         }
     }
@@ -498,6 +569,7 @@ mod tests {
             Some(ResolvedRunnable {
                 run_range: run.range(),
                 extra_captures: SmallVec::new(),
+                full_range: None,
             })
         }
     }
@@ -518,6 +590,7 @@ mod tests {
             Some(ResolvedRunnable {
                 run_range: run.range(),
                 extra_captures: extras,
+                full_range: None,
             })
         }
     }

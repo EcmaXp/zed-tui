@@ -437,6 +437,8 @@ mod tests {
 
         open_file(&workspace, "index.html", cx).await;
         assert_eq!(notification_ids(&workspace, cx), Vec::new());
+        cx.executor().advance_clock(fs::fs_watcher::poll_interval());
+        cx.run_until_parked();
 
         app_state
             .fs

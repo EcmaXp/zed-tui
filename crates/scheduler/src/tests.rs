@@ -193,6 +193,25 @@ fn test_timer_ordering() {
 }
 
 #[test]
+fn test_timer_task_becomes_ready_when_its_timer_fires() {
+    TestScheduler::once(async |scheduler| {
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut task = Task::from_timer(scheduler.timer(Duration::from_millis(10)));
+        assert!(task.poll_unpin(&mut cx).is_pending());
+        assert!(!task.is_ready());
+
+        scheduler.advance_clock(Duration::from_millis(10));
+        assert!(task.poll_unpin(&mut cx).is_ready());
+        assert!(task.is_ready());
+
+        let fallible = Task::from_timer(scheduler.timer(Duration::from_millis(10))).fallible();
+        scheduler.advance_clock(Duration::from_millis(10));
+        assert_eq!(fallible.await, Some(()));
+    });
+}
+
+#[test]
 fn test_foreground_task_can_hold_mut_borrow_across_await() {
     TestScheduler::once(async |scheduler| {
         let foreground = scheduler.foreground();

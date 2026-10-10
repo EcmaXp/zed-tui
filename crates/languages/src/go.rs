@@ -629,6 +629,7 @@ impl RunnableResolver for GoRunnableResolver {
                 TABLE_TEST_CASE_NAME.to_string(),
                 buffer.text_for_range(run_capture.range()).collect(),
             )],
+            full_range: None,
         })
     }
 }

@@ -31,13 +31,15 @@ pub enum PlatformStyle {
 
 impl PlatformStyle {
     /// Returns the [`PlatformStyle`] for the current platform.
-    pub const fn platform() -> Self {
+    pub fn platform() -> Self {
         if cfg!(any(target_os = "linux", target_os = "freebsd")) {
             Self::Linux
         } else if cfg!(target_os = "windows") {
             Self::Windows
-        } else {
+        } else if gpui::uses_mac_key_conventions() {
             Self::Mac
+        } else {
+            Self::Linux
         }
     }
 }

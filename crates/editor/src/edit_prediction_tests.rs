@@ -1,3 +1,4 @@
+mod fork_tests;
 use edit_prediction_types::{
     EditPredictionDelegate, EditPredictionIconSet, EditPredictionRequestTrigger,
     PredictedCursorPosition,

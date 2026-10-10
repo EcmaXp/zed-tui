@@ -575,7 +575,9 @@ impl Render for NewProcessModal {
                 key_context.add("RunModal");
                 key_context
             })
-            .size_full()
+            .when(!window.text_system().renders_to_cell_grid(), |this| {
+                this.size_full()
+            })
             .w(rems(34.))
             .elevation_3(cx)
             .overflow_hidden()

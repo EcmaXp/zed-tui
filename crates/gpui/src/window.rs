@@ -1580,6 +1580,9 @@ impl Window {
         let capslock = platform_window.capslock();
         let content_size = platform_window.content_size();
         let scale_factor = platform_window.scale_factor();
+        let mut layout_engine = TaffyLayoutEngine::new();
+        layout_engine.set_cell_size(cx.text_system().cell_size(), scale_factor);
+        layout_engine.set_viewport_width(content_size.width, scale_factor);
         let appearance = platform_window.appearance();
         let text_system = Arc::new(WindowTextSystem::new(cx.text_system().clone()));
         let invalidator = WindowInvalidator::new(handle.window_id());
@@ -2032,7 +2035,7 @@ impl Window {
             rem_size: px(16.),
             rem_size_override_stack: SmallVec::new(),
             viewport_size: content_size,
-            layout_engine: Some(TaffyLayoutEngine::new()),
+            layout_engine: Some(layout_engine),
             root: None,
             element_id_stack: SmallVec::default(),
             text_style_stack: Vec::new(),
@@ -2688,6 +2691,9 @@ impl Window {
         self.scale_factor = self.platform_window.scale_factor();
         self.viewport_size = self.platform_window.content_size();
         self.display_id = self.platform_window.display().map(|display| display.id());
+        if let Some(layout_engine) = &mut self.layout_engine {
+            layout_engine.set_viewport_width(self.viewport_size.width, self.scale_factor);
+        }
         self.mouse_position = self.platform_window.mouse_position();
 
         self.refresh();
@@ -3003,7 +3009,7 @@ impl Window {
 
     /// The line height associated with the current text style.
     pub fn line_height(&self) -> Pixels {
-        self.text_style().line_height_in_pixels(self.rem_size())
+        self.cell_line_height(self.text_style().line_height_in_pixels(self.rem_size()))
     }
 
     /// Rounds a logical value to the nearest device pixel.
@@ -5101,6 +5107,7 @@ impl Window {
             .layout_bounds(layout_id, scale_factor)
             .map(Into::into);
         let snapped_offset = self.pixel_snap_point(self.element_offset());
+        let snapped_offset = self.snap_to_cells(snapped_offset);
         bounds.origin += snapped_offset;
         bounds
     }
@@ -5422,7 +5429,10 @@ impl Window {
             PlatformInput::Touch(_) => InputModality::Touch,
             _ => self.last_input_modality,
         };
-        if self.last_input_modality != old_modality {
+        let modality_changed = self.last_input_modality != old_modality;
+        let refresh_after_key_dispatch =
+            modality_changed && self.last_input_modality == InputModality::Keyboard;
+        if modality_changed && !refresh_after_key_dispatch {
             self.refresh();
         }
 
@@ -5548,6 +5558,9 @@ impl Window {
             self.dispatch_key_event(any_key_event, cx);
         } else if let Some(touch_event) = event.touch_event() {
             self.dispatch_touch_event(touch_event, cx);
+        }
+        if refresh_after_key_dispatch {
+            self.refresh();
         }
         if let PlatformInput::LongPress(long_press) = &event {
             match long_press.phase {

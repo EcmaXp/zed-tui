@@ -39,6 +39,7 @@ impl ActiveBufferEncoding {
     }
 
     fn update_encoding(&mut self, editor: Entity<Editor>, _: &mut Window, cx: &mut Context<Self>) {
+        let previous_state = self.state();
         self.active_encoding = None;
         self.has_bom = false;
         self.is_dirty = false;
@@ -54,7 +55,19 @@ impl ActiveBufferEncoding {
             self.is_dirty = buffer.is_dirty();
         }
 
-        cx.notify();
+        if self.state() != previous_state {
+            cx.notify();
+        }
+    }
+
+    fn state(&self) -> (Option<&'static Encoding>, bool, bool, bool, bool) {
+        (
+            self.active_encoding,
+            self.has_bom,
+            self.is_dirty,
+            self.is_shared,
+            self.is_via_remote_server,
+        )
     }
 }
 

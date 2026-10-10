@@ -72,16 +72,17 @@ use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
 use rope::Rope;
 use search::project_search::ProjectSearchBar;
 use settings::{
-    BaseKeymap, DEFAULT_KEYMAP_PATH, DefaultOpenBehavior, InvalidSettingsError, KeybindSource,
-    KeymapFile, KeymapFileLoadResult, MigrationStatus, SPECIFIC_OVERRIDES_KEYMAP_PATH, Settings,
-    SettingsFile, SettingsStore, VIM_KEYMAP_PATH, initial_local_debug_tasks_content,
-    initial_project_settings_content, initial_tasks_content, update_settings_file,
+    BaseKeymap, DefaultOpenBehavior, InvalidSettingsError, KeybindSource, KeymapFile,
+    KeymapFileLoadResult, MigrationStatus, Settings, SettingsFile, SettingsStore, VIM_KEYMAP_PATH,
+    default_keymap_path, initial_local_debug_tasks_content, initial_project_settings_content,
+    initial_tasks_content, specific_overrides_keymap_path, update_settings_file,
 };
 use sidebar::Sidebar;
 #[cfg(debug_assertions)]
 use workspace::workspace_error::{ErrorAction, ErrorSeverity, WorkspaceError};
 
 use std::{
+    any::TypeId,
     borrow::Cow,
     path::{Path, PathBuf},
     sync::Arc,
@@ -2332,7 +2333,7 @@ fn reload_keymaps(cx: &mut App, mut user_key_bindings: Vec<KeyBinding>) {
     for key_binding in &mut user_key_bindings {
         key_binding.set_meta(KeybindSource::User.meta());
     }
-    cx.bind_keys(filter_disabled_ai_bindings(user_key_bindings, cx));
+    cx.bind_keys(filter_disabled_bindings(user_key_bindings, cx));
     reload_menus(cx);
     // On Windows, this is set in the `update_jump_list` method of the `HistoryManager`.
     #[cfg(not(target_os = "windows"))]
@@ -2350,20 +2351,20 @@ pub fn load_default_keymap(cx: &mut App) {
         return;
     }
 
-    cx.bind_keys(filter_disabled_ai_bindings(
-        KeymapFile::load_asset(DEFAULT_KEYMAP_PATH, Some(KeybindSource::Default), cx).unwrap(),
+    cx.bind_keys(filter_disabled_bindings(
+        KeymapFile::load_asset(default_keymap_path(), Some(KeybindSource::Default), cx).unwrap(),
         cx,
     ));
 
     if let Some(asset_path) = base_keymap.asset_path() {
-        cx.bind_keys(filter_disabled_ai_bindings(
+        cx.bind_keys(filter_disabled_bindings(
             KeymapFile::load_asset(asset_path, Some(KeybindSource::Base), cx).unwrap(),
             cx,
         ));
     }
 
     if VimModeSetting::get_global(cx).0 || vim_mode_setting::HelixModeSetting::get_global(cx).0 {
-        cx.bind_keys(filter_disabled_ai_bindings(
+        cx.bind_keys(filter_disabled_bindings(
             KeymapFile::load_asset(VIM_KEYMAP_PATH, Some(KeybindSource::Vim), cx).unwrap(),
             cx,
         ));
@@ -2371,7 +2372,7 @@ pub fn load_default_keymap(cx: &mut App) {
 
     cx.bind_keys(
         KeymapFile::load_asset(
-            SPECIFIC_OVERRIDES_KEYMAP_PATH,
+            specific_overrides_keymap_path(),
             Some(KeybindSource::Default),
             cx,
         )
@@ -2400,13 +2401,35 @@ fn is_ai_keybinding(binding: &KeyBinding) -> bool {
         .any(|namespace| name.starts_with(namespace))
 }
 
-fn filter_disabled_ai_bindings(bindings: Vec<KeyBinding>, cx: &App) -> Vec<KeyBinding> {
-    if !DisableAiSettings::get_global(cx).disable_ai {
+pub(crate) fn font_size_actions() -> [TypeId; 8] {
+    [
+        TypeId::of::<zed_actions::IncreaseBufferFontSize>(),
+        TypeId::of::<zed_actions::DecreaseBufferFontSize>(),
+        TypeId::of::<zed_actions::ResetBufferFontSize>(),
+        TypeId::of::<zed_actions::IncreaseUiFontSize>(),
+        TypeId::of::<zed_actions::DecreaseUiFontSize>(),
+        TypeId::of::<zed_actions::ResetUiFontSize>(),
+        TypeId::of::<zed_actions::ResetAllZoom>(),
+        TypeId::of::<zed_actions::agent::ResetAgentZoom>(),
+    ]
+}
+
+fn is_font_size_keybinding(binding: &KeyBinding) -> bool {
+    font_size_actions().contains(&binding.action().as_any().type_id())
+}
+
+fn filter_disabled_bindings(bindings: Vec<KeyBinding>, cx: &App) -> Vec<KeyBinding> {
+    let disable_ai = DisableAiSettings::get_global(cx).disable_ai;
+    let renders_to_cell_grid = cx.text_system().renders_to_cell_grid();
+    if !disable_ai && !renders_to_cell_grid {
         return bindings;
     }
     bindings
         .into_iter()
-        .filter(|binding| !is_ai_keybinding(binding))
+        .filter(|binding| {
+            !(disable_ai && is_ai_keybinding(binding))
+                && !(renders_to_cell_grid && is_font_size_keybinding(binding))
+        })
         .collect()
 }
 
@@ -2866,6 +2889,7 @@ pub(crate) fn eager_load_active_theme_and_icon_theme(fs: Arc<dyn Fs>, cx: &mut A
 
 #[cfg(test)]
 mod tests {
+    mod fork_tests;
     use super::*;
     use assets::Assets;
     use collections::HashSet;

@@ -1157,6 +1157,9 @@ mod element {
     use crate::WorkspaceSettings;
 
     use super::{HANDLE_HITBOX_SIZE, HORIZONTAL_MIN_SIZE, VERTICAL_MIN_SIZE};
+    use crate::cell_layout::{
+        cell_start, child_bounds, resize_handle_span, resize_metrics, separator_row,
+    };
 
     const DIVIDER_SIZE: f32 = 1.0;
 
@@ -1195,6 +1198,7 @@ mod element {
 
     pub struct PaneAxisLayout {
         dragged_handle: Rc<RefCell<Option<usize>>>,
+        cell_size: Option<Size<Pixels>>,
         children: Vec<PaneAxisChildLayout>,
     }
 
@@ -1227,16 +1231,46 @@ mod element {
             ix: usize,
             axis: Axis,
             child_start: Point<Pixels>,
-            container_size: Size<Pixels>,
+            axis_bounds: Bounds<Pixels>,
+            cell_size: Option<Size<Pixels>>,
             workspace: WeakEntity<Workspace>,
             window: &mut Window,
             cx: &mut App,
         ) {
+            if !Self::resize_flexes(
+                &mut flexes.lock(),
+                ix,
+                axis,
+                e.position,
+                child_start,
+                axis_bounds,
+                cell_size,
+            ) {
+                return;
+            }
+
+            workspace
+                .update(cx, |this, cx| this.serialize_workspace(window, cx))
+                .log_err();
+            cx.stop_propagation();
+            window.refresh();
+        }
+
+        fn resize_flexes(
+            flexes: &mut Vec<f32>,
+            ix: usize,
+            axis: Axis,
+            pointer: Point<Pixels>,
+            child_start: Point<Pixels>,
+            bounds: Bounds<Pixels>,
+            cell_size: Option<Size<Pixels>>,
+        ) -> bool {
             let min_size = match axis {
                 Axis::Horizontal => px(HORIZONTAL_MIN_SIZE),
                 Axis::Vertical => px(VERTICAL_MIN_SIZE),
             };
-            let mut flexes = flexes.lock();
+            let (container_size, pixels_per_flex, proposed_change) =
+                resize_metrics(flexes, ix, pointer, child_start, bounds, axis, cell_size);
             debug_assert!(flex_values_in_bounds(flexes.as_slice()));
 
             // Math to convert a flex value to a pixel value
@@ -1246,18 +1280,17 @@ mod element {
 
             // Don't allow resizing to less than the minimum size, if elements are already too small
             if min_size - px(1.) > size(ix, flexes.as_slice()) {
-                return;
+                return false;
             }
 
             // This is basically a "bucket" of pixel changes that need to be applied in response to this
             // mouse event. Probably a small, fractional number like 0.5 or 1.5 pixels
-            let mut proposed_current_pixel_change =
-                (e.position - child_start).along(axis) - size(ix, flexes.as_slice());
+            let mut proposed_current_pixel_change = proposed_change;
 
             // This takes a pixel change, and computes the flex changes that correspond to this pixel change
             // as well as the next one, for some reason
             let flex_changes = |pixel_dx, target_ix, next: isize, flexes: &[f32]| {
-                let flex_change = pixel_dx / container_size.along(axis);
+                let flex_change = pixel_dx / pixels_per_flex;
                 let current_target_flex = flexes[target_ix] + flex_change;
                 let next_target_flex = flexes[(target_ix as isize + next) as usize] - flex_change;
                 (current_target_flex, next_target_flex)
@@ -1312,26 +1345,25 @@ mod element {
                 proposed_current_pixel_change -= current_pixel_change;
             }
 
-            workspace
-                .update(cx, |this, cx| this.serialize_workspace(window, cx))
-                .log_err();
-            cx.stop_propagation();
-            window.refresh();
+            true
         }
 
         fn layout_handle(
             axis: Axis,
             pane_bounds: Bounds<Pixels>,
+            cell_size: Option<Size<Pixels>>,
             window: &mut Window,
             _cx: &mut App,
         ) -> PaneAxisHandleLayout {
+            let boundary = pane_bounds.origin.along(axis) + pane_bounds.size.along(axis);
+            let cell = cell_size.map(|cell_size| cell_size.along(axis));
+            let (offset, extent) = resize_handle_span(cell, px(HANDLE_HITBOX_SIZE));
+            let line_start = cell.map_or(boundary, |cell| cell_start(boundary, cell));
             let handle_bounds = Bounds {
-                origin: pane_bounds.origin.apply_along(axis, |origin| {
-                    origin + pane_bounds.size.along(axis) - px(HANDLE_HITBOX_SIZE / 2.)
-                }),
-                size: pane_bounds
-                    .size
-                    .apply_along(axis, |_| px(HANDLE_HITBOX_SIZE)),
+                origin: pane_bounds
+                    .origin
+                    .apply_along(axis, |_| line_start + offset),
+                size: pane_bounds.size.apply_along(axis, |_| extent),
             };
             let divider_bounds = Bounds {
                 origin: pane_bounds
@@ -1405,36 +1437,28 @@ mod element {
             debug_assert!(flexes.len() == len);
             debug_assert!(flex_values_in_bounds(flexes.as_slice()));
 
-            let total_flex = len as f32;
-
-            let mut origin = bounds.origin;
-            let space_per_flex = bounds.size.along(self.axis) / total_flex;
+            let cell_size = window.text_system().cell_size();
+            let separator_row =
+                separator_row(self.axis, bounds.size.along(self.axis), len, cell_size);
+            let has_handles =
+                cell_size.is_none() || self.axis == Axis::Horizontal || separator_row.is_some();
 
             let mut bounding_boxes = self.bounding_boxes.lock();
             bounding_boxes.clear();
 
             let mut layout = PaneAxisLayout {
                 dragged_handle,
+                cell_size,
                 children: Vec::new(),
             };
-            for (ix, mut child) in mem::take(&mut self.children).into_iter().enumerate() {
-                let child_flex = flexes[ix];
-
-                let child_size = bounds
-                    .size
-                    .apply_along(self.axis, |_| space_per_flex * child_flex)
-                    .map(|d| d.round());
-
-                let child_bounds = Bounds {
-                    origin,
-                    size: child_size,
-                };
-
-                bounding_boxes.push(Some(child_bounds));
-                child.layout_as_root(child_size.into(), window, cx);
-                child.prepaint_at(origin, window, cx);
-
-                origin = origin.apply_along(self.axis, |val| val + child_size.along(self.axis));
+            for (ix, (mut child, (child_bounds, bounding_box))) in mem::take(&mut self.children)
+                .into_iter()
+                .zip(child_bounds(bounds, self.axis, &flexes, separator_row))
+                .enumerate()
+            {
+                bounding_boxes.push(Some(bounding_box));
+                child.layout_as_root(child_bounds.size.into(), window, cx);
+                child.prepaint_at(child_bounds.origin, window, cx);
 
                 let is_leaf_pane = self.is_leaf_pane_mask.get(ix).copied().unwrap_or(true);
 
@@ -1447,10 +1471,11 @@ mod element {
             }
 
             for (ix, child_layout) in layout.children.iter_mut().enumerate() {
-                if ix < len - 1 {
+                if has_handles && ix < len - 1 {
                     child_layout.handle = Some(Self::layout_handle(
                         self.axis,
                         child_layout.bounds,
+                        cell_size,
                         window,
                         cx,
                     ));
@@ -1533,26 +1558,29 @@ mod element {
                         Axis::Horizontal => CursorStyle::ResizeColumn,
                     };
 
-                    if layout
+                    let is_dragged = layout
                         .dragged_handle
                         .borrow()
-                        .is_some_and(|dragged_ix| dragged_ix == ix)
-                    {
+                        .is_some_and(|dragged_ix| dragged_ix == ix);
+                    if is_dragged {
                         window.set_window_cursor_style(cursor_style);
                     } else {
                         window.set_cursor_style(cursor_style, &handle.hitbox);
                     }
 
-                    window.paint_quad(gpui::fill(
-                        handle.divider_bounds,
-                        cx.theme().colors().pane_group_border,
-                    ));
+                    let divider_color = if is_dragged && layout.cell_size.is_some() {
+                        cx.theme().colors().border_focused
+                    } else {
+                        cx.theme().colors().pane_group_border
+                    };
+                    window.paint_quad(gpui::fill(handle.divider_bounds, divider_color));
 
                     window.on_mouse_event({
                         let dragged_handle = layout.dragged_handle.clone();
                         let flexes = self.flexes.clone();
                         let workspace = self.workspace.clone();
                         let handle_hitbox = handle.hitbox.clone();
+                        let is_cell_grid = layout.cell_size.is_some();
                         move |e: &MouseDownEvent, phase, window, cx| {
                             if phase.bubble() && handle_hitbox.is_hovered(window) {
                                 dragged_handle.replace(Some(ix));
@@ -1563,6 +1591,8 @@ mod element {
                                         .update(cx, |this, cx| this.serialize_workspace(window, cx))
                                         .log_err();
 
+                                    window.refresh();
+                                } else if is_cell_grid {
                                     window.refresh();
                                 }
                                 cx.stop_propagation();
@@ -1575,21 +1605,28 @@ mod element {
                         let flexes = self.flexes.clone();
                         let child_bounds = child.bounds;
                         let axis = self.axis;
+                        let cell_size = layout.cell_size;
                         move |e: &MouseMoveEvent, phase, window, cx| {
-                            let dragged_handle = dragged_handle.borrow();
-                            if phase.bubble() && *dragged_handle == Some(ix) {
-                                Self::compute_resize(
-                                    &flexes,
-                                    e,
-                                    ix,
-                                    axis,
-                                    child_bounds.origin,
-                                    bounds.size,
-                                    workspace.clone(),
-                                    window,
-                                    cx,
-                                )
+                            if !phase.bubble() || *dragged_handle.borrow() != Some(ix) {
+                                return;
                             }
+                            if cell_size.is_some() && e.pressed_button.is_none() {
+                                dragged_handle.replace(None);
+                                window.refresh();
+                                return;
+                            }
+                            Self::compute_resize(
+                                &flexes,
+                                e,
+                                ix,
+                                axis,
+                                child_bounds.origin,
+                                bounds,
+                                cell_size,
+                                workspace.clone(),
+                                window,
+                                cx,
+                            )
                         }
                     });
                 }
@@ -1597,9 +1634,10 @@ mod element {
 
             window.on_mouse_event({
                 let dragged_handle = layout.dragged_handle.clone();
-                move |_: &MouseUpEvent, phase, _window, _cx| {
-                    if phase.bubble() {
-                        dragged_handle.replace(None);
+                let is_cell_grid = layout.cell_size.is_some();
+                move |_: &MouseUpEvent, phase, window, _cx| {
+                    if phase.bubble() && dragged_handle.replace(None).is_some() && is_cell_grid {
+                        window.refresh();
                     }
                 }
             });
@@ -1615,4 +1653,7 @@ mod element {
     fn flex_values_in_bounds(flexes: &[f32]) -> bool {
         (flexes.iter().copied().sum::<f32>() - flexes.len() as f32).abs() < 0.001
     }
+
+    #[cfg(test)]
+    mod tests;
 }
