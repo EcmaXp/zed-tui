@@ -1670,6 +1670,7 @@ pub mod test {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             div()
                 .id("test")
+                .debug_selector(|| format!("test_panel_{:?}", self.position))
                 .track_focus(&self.focus_handle(cx))
                 .children(self.activation_focus_handle.iter().map(|focus_handle| {
                     div().id("test-activation-child").track_focus(focus_handle)

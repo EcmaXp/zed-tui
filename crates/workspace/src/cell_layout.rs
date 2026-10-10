@@ -1,6 +1,8 @@
-use gpui::{Along, Axis, Bounds, Pixels, Point, Size};
+use gpui::{
+    Along, App, Axis, Bounds, Context, FocusHandle, Focusable as _, Pixels, Point, Size, Window,
+};
 
-use crate::dock::DockPosition;
+use crate::{Event, Pane, Workspace, dock::DockPosition};
 
 pub(crate) fn resize_handle_span(cell: Option<Pixels>, gui_extent: Pixels) -> (Pixels, Pixels) {
     match cell {
@@ -131,6 +133,64 @@ pub(crate) fn dock_size_for_pointer(
         (DockPosition::Bottom, Some(cell)) => (workspace_bounds.bottom()
             - cell_start(pointer.y, cell.height))
         .min(workspace_bounds.size.height - cell.height),
+    }
+}
+
+impl Workspace {
+    pub(crate) fn zoom_hides_layout(&self, window: &Window) -> bool {
+        self.zoomed.is_some() && window.text_system().cell_size().is_some()
+    }
+
+    fn zoomed_item_focus_handle(&self, cx: &App) -> Option<FocusHandle> {
+        match self.zoomed_position {
+            Some(position) => Some(
+                self.dock_at_position(position)
+                    .read(cx)
+                    .active_panel()?
+                    .panel_focus_handle(cx),
+            ),
+            None => {
+                let pane = self.zoomed.as_ref()?.upgrade()?.downcast::<Pane>().ok()?;
+                Some(pane.read(cx).focus_handle(cx))
+            }
+        }
+    }
+
+    pub(crate) fn reveal_focus_hidden_by_zoom(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.zoom_hides_layout(window) || window.focused(cx).is_none() {
+            return false;
+        }
+        let Some(zoomed_focus) = self.zoomed_item_focus_handle(cx) else {
+            return false;
+        };
+        let focus_left_zoomed_item = window
+            .focus_lost_restore_target(cx)
+            .is_some_and(|target| zoomed_focus.contains(&target, window));
+        if !focus_left_zoomed_item {
+            return false;
+        }
+
+        cx.defer_in(window, |this, window, cx| {
+            match this.zoomed_position {
+                Some(position) => this
+                    .dock_at_position(position)
+                    .update(cx, |dock, cx| dock.set_open(false, window, cx)),
+                None => {
+                    for pane in &this.panes {
+                        pane.update(cx, |pane, cx| pane.set_zoomed(false, cx));
+                    }
+                }
+            }
+            this.zoomed = None;
+            this.zoomed_position = None;
+            cx.emit(Event::ZoomChanged);
+            cx.notify();
+        });
+        true
     }
 }
 

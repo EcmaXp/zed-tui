@@ -1891,6 +1891,9 @@ impl Workspace {
         }
 
         cx.on_focus_lost(window, |this, window, cx| {
+            if this.reveal_focus_hidden_by_zoom(window, cx) {
+                return;
+            }
             let focus_handle = window
                 .focus_lost_restore_target(cx)
                 .unwrap_or_else(|| this.fallback_focus_handle(window, cx));
@@ -9563,6 +9566,7 @@ impl Render for Workspace {
             && self.active_item(cx).is_some();
         let pad_zoomed_pane =
             self.centered_layout && self.zoomed.is_some() && self.zoomed_position.is_none();
+        let zoom_hides_layout = self.zoom_hides_layout(window);
         let render_padding = |size| {
             (size > 0.0).then(|| {
                 div()
@@ -9762,6 +9766,7 @@ impl Render for Workspace {
                             })
                             .child({
                                 match bottom_dock_layout {
+                                    _ if zoom_hides_layout => div(),
                                     BottomDockLayout::Full => div()
                                         .flex()
                                         .flex_col()
@@ -12455,6 +12460,7 @@ fn load_legacy_panel_size(
 
 #[cfg(test)]
 mod tests {
+    mod fork_tests;
     use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
 
     use super::*;
