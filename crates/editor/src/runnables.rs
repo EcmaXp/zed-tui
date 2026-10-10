@@ -1,7 +1,8 @@
-use std::{collections::BTreeMap, mem, ops::Range, sync::Arc};
+use std::{collections::BTreeMap, mem, ops::Range, sync::Arc, time::Duration};
 
 use clock::Global;
 use collections::{HashMap, HashSet};
+use futures::{FutureExt as _, channel::oneshot, future::Shared};
 use gpui::{
     App, AppContext as _, AsyncWindowContext, ClickEvent, Context, Entity, Focusable as _,
     MouseButton, Task, Window,
@@ -22,12 +23,15 @@ use crate::{
     display_map::{DisplayPoint, DisplayRow},
 };
 
+const WHOLE_BUFFER_RUNNABLES_DEBOUNCE: Duration = Duration::from_millis(250);
+
 #[derive(Debug)]
 pub(super) struct RunnableData {
     runnables: HashMap<BufferId, (Global, BTreeMap<BufferRow, RunnableTasks>)>,
     task_statuses: HashMap<(BufferId, BufferRow), RunnableTaskStatus>,
     invalidate_buffer_data: HashSet<BufferId>,
     runnables_update_task: Task<()>,
+    scan_in_flight: Option<Shared<Task<()>>>,
 }
 
 impl RunnableData {
@@ -37,6 +41,7 @@ impl RunnableData {
             task_statuses: HashMap::default(),
             invalidate_buffer_data: HashSet::default(),
             runnables_update_task: Task::ready(()),
+            scan_in_flight: None,
         }
     }
 
@@ -194,8 +199,13 @@ impl Editor {
         let project = self.project().map(Entity::downgrade);
         let lsp_task_sources = self.lsp_task_sources(true, true, cx);
         let multi_buffer = self.buffer.downgrade();
+        let debounce = if self.buffer().read(cx).is_singleton() {
+            WHOLE_BUFFER_RUNNABLES_DEBOUNCE
+        } else {
+            UPDATE_DEBOUNCE
+        };
         self.runnables.runnables_update_task = cx.spawn_in(window, async move |editor, cx| {
-            cx.background_executor().timer(UPDATE_DEBOUNCE).await;
+            cx.background_executor().timer(debounce).await;
             let Some(project) = project.and_then(|p| p.upgrade()) else {
                 return;
             };
@@ -214,6 +224,11 @@ impl Editor {
                 };
                 lsp_tasks.await
             };
+            if let Ok(Some(previous_scan)) =
+                editor.update(cx, |editor, _| editor.runnables.scan_in_flight.clone())
+            {
+                previous_scan.await;
+            }
             let new_rows = {
                 let Some((multi_buffer_snapshot, multi_buffer_query_range)) = editor
                     .update(cx, |editor, cx| {
@@ -237,14 +252,30 @@ impl Editor {
                 else {
                     return;
                 };
-                cx.background_spawn({
-                    async move {
-                        multi_buffer_snapshot
-                            .runnable_ranges(multi_buffer_query_range)
-                            .collect()
-                    }
-                })
-                .await
+                let (rows_sender, rows_receiver) = oneshot::channel();
+                let scan = cx
+                    .background_spawn(async move {
+                        rows_sender
+                            .send(
+                                multi_buffer_snapshot
+                                    .runnable_ranges(multi_buffer_query_range)
+                                    .collect::<Vec<_>>(),
+                            )
+                            .ok();
+                    })
+                    .shared();
+                if editor
+                    .update(cx, |editor, _| {
+                        editor.runnables.scan_in_flight = Some(scan);
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                let Ok(rows) = rows_receiver.await else {
+                    return;
+                };
+                rows
             };
 
             let Ok(multi_buffer_snapshot) =
@@ -853,6 +884,7 @@ impl Editor {
 
 #[cfg(test)]
 mod tests {
+    mod fork_tests;
     use std::{sync::Arc, time::Duration};
 
     use futures::StreamExt as _;
@@ -875,9 +907,11 @@ mod tests {
     use util::rel_path::rel_path;
 
     use crate::{
-        Editor, UPDATE_DEBOUNCE, editor_tests::init_test, scroll::scroll_amount::ScrollAmount,
+        Editor, editor_tests::init_test, scroll::scroll_amount::ScrollAmount,
         test::build_editor_with_project,
     };
+
+    use super::WHOLE_BUFFER_RUNNABLES_DEBOUNCE;
 
     const FAKE_LSP_NAME: &str = "the-fake-language-server";
 
@@ -1055,7 +1089,7 @@ mod tests {
                 editor.refresh_runnables(None, window, cx);
             })
             .unwrap();
-        cx.executor().advance_clock(UPDATE_DEBOUNCE);
+        cx.executor().advance_clock(WHOLE_BUFFER_RUNNABLES_DEBOUNCE);
         cx.executor().run_until_parked();
         assert_eq!(
             editor
@@ -1199,7 +1233,7 @@ mod tests {
                 editor.refresh_runnables(None, window, cx);
             })
             .expect("editor update");
-        cx.executor().advance_clock(UPDATE_DEBOUNCE);
+        cx.executor().advance_clock(WHOLE_BUFFER_RUNNABLES_DEBOUNCE);
         cx.executor().run_until_parked();
 
         let labels = editor
@@ -1221,7 +1255,7 @@ mod tests {
         fake_server
             .set_request_handler::<Runnables, _, _>(move |_, _| async move { Ok(Vec::new()) });
 
-        cx.executor().advance_clock(UPDATE_DEBOUNCE);
+        cx.executor().advance_clock(WHOLE_BUFFER_RUNNABLES_DEBOUNCE);
         cx.executor().run_until_parked();
 
         let labels = editor
@@ -1274,7 +1308,7 @@ mod tests {
                 editor.refresh_runnables(None, window, cx);
             })
             .expect("editor update");
-        cx.executor().advance_clock(UPDATE_DEBOUNCE);
+        cx.executor().advance_clock(WHOLE_BUFFER_RUNNABLES_DEBOUNCE);
         cx.executor().run_until_parked();
 
         let labels = editor
@@ -1313,7 +1347,7 @@ mod tests {
                 editor.refresh_runnables(None, window, cx);
             })
             .expect("editor update");
-        cx.executor().advance_clock(UPDATE_DEBOUNCE);
+        cx.executor().advance_clock(WHOLE_BUFFER_RUNNABLES_DEBOUNCE);
         cx.executor().run_until_parked();
 
         let labels = editor
@@ -1418,7 +1452,7 @@ mod tests {
                 editor.refresh_runnables(None, window, cx);
             })
             .expect("editor update");
-        cx.executor().advance_clock(UPDATE_DEBOUNCE);
+        cx.executor().advance_clock(WHOLE_BUFFER_RUNNABLES_DEBOUNCE);
         cx.executor().run_until_parked();
 
         let labels = editor
