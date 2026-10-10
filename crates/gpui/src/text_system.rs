@@ -486,6 +486,11 @@ impl TextSystem {
         Ok(self.advance(font_id, font_size, '0')?.width)
     }
 
+    #[expect(missing_docs)]
+    pub fn cell_size(&self) -> Option<Size<Pixels>> {
+        self.platform_text_system.cell_size()
+    }
+
     /// Get the number of font size units per 'em square',
     /// Per MDN: "an abstract square whose height is the intended distance between
     /// lines of type in the same type size"
