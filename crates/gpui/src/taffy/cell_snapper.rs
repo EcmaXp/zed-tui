@@ -1,6 +1,6 @@
 use super::{EXPECT_MESSAGE, LayoutId, NodeContext, NodeMeasureFn};
 use crate::{
-    AbsoluteLength, Bounds, DefiniteLength, Pixels, Point, Size, Style, size,
+    AbsoluteLength, Bounds, DefiniteLength, Pixels, Point, Size, Style, Window, size,
     util::round_half_toward_zero,
 };
 use taffy::TaffyTree;
@@ -145,6 +145,24 @@ fn snap_edges<T>(
     edges.right = snap_length(edges.right, snap_x);
     edges.top = snap_length(edges.top, snap_y);
     edges.bottom = snap_length(edges.bottom, snap_y);
+}
+
+impl Window {
+    pub(crate) fn snap_to_cells(&self, point: Point<Pixels>) -> Point<Pixels> {
+        let Some(cell_size) = self.text_system().cell_size() else {
+            return point;
+        };
+        Point {
+            x: Pixels(round_to_cell(point.x.0, cell_size.width.0)),
+            y: Pixels(round_to_cell(point.y.0, cell_size.height.0)),
+        }
+    }
+
+    pub(crate) fn cell_line_height(&self, line_height: Pixels) -> Pixels {
+        self.text_system()
+            .cell_size()
+            .map_or(line_height, |cell_size| cell_size.height)
+    }
 }
 
 fn round_to_cell(value: f32, cell: f32) -> f32 {

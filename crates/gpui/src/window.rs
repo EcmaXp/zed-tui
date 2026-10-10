@@ -3005,7 +3005,7 @@ impl Window {
 
     /// The line height associated with the current text style.
     pub fn line_height(&self) -> Pixels {
-        self.text_style().line_height_in_pixels(self.rem_size())
+        self.cell_line_height(self.text_style().line_height_in_pixels(self.rem_size()))
     }
 
     /// Rounds a logical value to the nearest device pixel.
@@ -5103,6 +5103,7 @@ impl Window {
             .layout_bounds(layout_id, scale_factor)
             .map(Into::into);
         let snapped_offset = self.pixel_snap_point(self.element_offset());
+        let snapped_offset = self.snap_to_cells(snapped_offset);
         bounds.origin += snapped_offset;
         bounds
     }
