@@ -742,7 +742,7 @@ impl Style {
         continuation(window, cx);
 
         if self.is_border_visible() {
-            let border_widths = self.border_widths.to_pixels(rem_size);
+            let border_widths = self.painted_border_widths(window).to_pixels(rem_size);
             let mut background = self.border_color.unwrap_or_default();
             background.a = 0.;
             window.paint_quad(quad(

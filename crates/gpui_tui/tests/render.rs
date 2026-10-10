@@ -6,8 +6,8 @@ use gpui::{
     AnyWindowHandle, App, AppContext as _, Application, BorderStyle, Bounds, Context,
     ElementInputHandler, EntityInputHandler, FocusHandle, InteractiveElement as _, IntoElement,
     KeyDownEvent, Keystroke, Modifiers, PaintQuad, ParentElement, Pixels, PlatformInput, Render,
-    Styled, UTF16Selection, Window, WindowOptions, canvas, div, fill, outline, point, px, rgb,
-    size,
+    StatefulInteractiveElement as _, Styled, UTF16Selection, Window, WindowOptions, canvas, div,
+    fill, outline, point, prelude::FluentBuilder as _, px, rgb, size,
 };
 use gpui_tui::{CellAttrs, CellGrid, CursorPosition, CursorShape, Rgb, TuiPlatform};
 
@@ -98,6 +98,232 @@ fn list_items_take_one_row_each_and_side_borders_take_a_column() {
             grid.text()
         );
     }
+}
+
+struct ElevatedMenu;
+
+impl Render for ElevatedMenu {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let menu = || {
+            div()
+                .w(px(80.))
+                .bg(rgb(0x303030))
+                .border_1()
+                .border_color(rgb(0x808080))
+                .py(px(4.))
+                .child("item")
+        };
+        div()
+            .size_full()
+            .bg(rgb(0x202020))
+            .text_color(rgb(0xffffff))
+            .text_size(px(16.))
+            .line_height(px(16.))
+            .child(menu().shadow_md())
+            .child(menu())
+    }
+}
+
+fn trimmed_rows(grid: &CellGrid, rows: Range<u16>) -> Vec<String> {
+    rows.map(|row| grid.row_text(row).trim_end().to_string())
+        .collect()
+}
+
+#[test]
+fn shadowed_bordered_surfaces_draw_only_a_wide_left_bar() {
+    let grid = view_frame(20, 6, || ElevatedMenu);
+    assert_eq!(
+        trimmed_rows(&grid, 0..2),
+        ["▌item", "│item    │"],
+        "{}",
+        grid.text()
+    );
+}
+
+struct FramedMenu {
+    padding_x: Pixels,
+    padding_y: Pixels,
+    items: &'static [&'static str],
+}
+
+impl Render for FramedMenu {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .bg(rgb(0x202020))
+            .text_color(rgb(0xffffff))
+            .text_size(px(16.))
+            .line_height(px(16.))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w(px(80.))
+                    .bg(rgb(0x303030))
+                    .border_1()
+                    .border_color(rgb(0x808080))
+                    .shadow_md()
+                    .px(self.padding_x)
+                    .py(self.padding_y)
+                    .children(self.items.iter().copied()),
+            )
+            .child("after")
+    }
+}
+
+fn framed_menu_frame(
+    padding_x: Pixels,
+    padding_y: Pixels,
+    items: &'static [&'static str],
+) -> CellGrid {
+    first_frame(TuiPlatform::new(20, 6), move |cx: &mut App| {
+        cx.open_window(WindowOptions::default(), |_, cx| {
+            cx.new(|_| FramedMenu {
+                padding_x,
+                padding_y,
+                items,
+            })
+        })
+        .expect("failed to open window");
+    })
+}
+
+#[test]
+fn framed_surfaces_draw_a_wide_left_bar_on_every_row_and_no_corners() {
+    let grid = framed_menu_frame(px(0.), px(4.), &["one", "two", "three"]);
+    assert_eq!(
+        trimmed_rows(&grid, 0..4),
+        ["▌one", "▌two", "▌three", "after"],
+        "{}",
+        grid.text()
+    );
+    assert!(
+        !grid.text().contains(['┌', '┐', '└', '┘', '─']),
+        "{}",
+        grid.text()
+    );
+}
+
+struct ModalSurface;
+
+impl Render for ModalSurface {
+    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .bg(rgb(0x202020))
+            .text_color(rgb(0xffffff))
+            .text_size(px(16.))
+            .line_height(px(16.))
+            .child(
+                div().h(px(48.)).child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .when(window.text_system().cell_size().is_none(), |this| {
+                            this.size_full()
+                        })
+                        .w(px(80.))
+                        .bg(rgb(0x303030))
+                        .border_1()
+                        .border_color(rgb(0x808080))
+                        .shadow_md()
+                        .child("run")
+                        .child("debug"),
+                ),
+            )
+    }
+}
+
+#[test]
+fn surfaces_that_keep_a_full_height_only_outside_a_cell_grid_draw_a_left_bar() {
+    let grid = view_frame(20, 4, || ModalSurface);
+    assert_eq!(
+        trimmed_rows(&grid, 0..3),
+        ["▌run", "▌debug", ""],
+        "{}",
+        grid.text()
+    );
+}
+
+#[test]
+fn framed_surface_padding_takes_no_rows() {
+    let grid = framed_menu_frame(px(24.), px(24.), &["item"]);
+    assert_eq!(
+        trimmed_rows(&grid, 0..2),
+        ["▌ item", "after"],
+        "{}",
+        grid.text()
+    );
+}
+
+struct ClickableMenu {
+    clicked: Rc<RefCell<Vec<usize>>>,
+}
+
+impl Render for ClickableMenu {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .text_size(px(16.))
+            .line_height(px(16.))
+            .child(
+                div()
+                    .w(px(80.))
+                    .border_1()
+                    .border_color(rgb(0x808080))
+                    .shadow_md()
+                    .py(px(4.))
+                    .children(
+                        ["first", "second"]
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, label)| {
+                                let clicked = self.clicked.clone();
+                                div()
+                                    .id(index)
+                                    .child(label)
+                                    .on_click(move |_, _, _| clicked.borrow_mut().push(index))
+                            }),
+                    ),
+            )
+    }
+}
+
+#[test]
+fn clicks_on_the_first_row_of_a_framed_menu_reach_its_first_item() {
+    let platform = TuiPlatform::new(20, 4);
+    let clicked: Rc<RefCell<Vec<usize>>> = Rc::default();
+    Application::with_platform(platform.clone()).run({
+        let clicked = clicked.clone();
+        move |cx: &mut App| {
+            cx.open_window(WindowOptions::default(), |_, cx| {
+                cx.new(|_| ClickableMenu { clicked })
+            })
+            .expect("failed to open window");
+            cx.spawn(async move |cx| {
+                let settle = Duration::from_millis(30);
+                cx.background_executor().timer(settle).await;
+                let position = gpui_tui::cell_center(3, 0);
+                platform.handle_input(PlatformInput::MouseDown(gpui::MouseDownEvent {
+                    button: gpui::MouseButton::Left,
+                    position,
+                    modifiers: Modifiers::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }));
+                platform.handle_input(PlatformInput::MouseUp(gpui::MouseUpEvent {
+                    button: gpui::MouseButton::Left,
+                    position,
+                    modifiers: Modifiers::default(),
+                    click_count: 1,
+                }));
+                cx.background_executor().timer(settle).await;
+                cx.update(|cx| cx.quit());
+            })
+            .detach();
+        }
+    });
+    assert_eq!(*clicked.borrow(), [0]);
 }
 
 struct CollapsedFrame;

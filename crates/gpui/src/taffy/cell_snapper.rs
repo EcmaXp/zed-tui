@@ -1,7 +1,7 @@
 use super::{EXPECT_MESSAGE, LayoutId, NodeContext, NodeMeasureFn};
 use crate::{
-    AbsoluteLength, Bounds, DefiniteLength, Length, Pixels, Point, Size, Style, Window, size,
-    util::round_half_toward_zero,
+    AbsoluteLength, Bounds, DefiniteLength, Edges, Length, Pixels, Point, Size, Style, Window,
+    size, util::round_half_toward_zero,
 };
 use collections::FxHashMap;
 use taffy::{TaffyTree, TraversePartialTree as _};
@@ -125,7 +125,11 @@ impl CellSnapper {
             .copied()
             .filter(|child| !self.cell_nodes.get(child).is_some_and(|node| node.is_empty))
             .collect();
+        let is_framed = style.is_framed_surface();
         self.avoid_doubled_blank_columns(taffy_style, unsnapped, &content);
+        if is_framed {
+            keep_left_frame_edge_only(taffy_style, self.cell_size.width);
+        }
         let mut node = self.cell_node(taffy_style, &content, false);
         if hairline_width.is_some() {
             node.left = Edge::Content;
@@ -137,6 +141,9 @@ impl CellSnapper {
 
     fn snap_measured(&self, taffy_style: &mut taffy::style::Style, style: &Style) -> CellNode {
         snap_to_cells(taffy_style, style, self.cell_size, self.viewport_width);
+        if style.is_framed_surface() {
+            keep_left_frame_edge_only(taffy_style, self.cell_size.width);
+        }
         self.cell_node(taffy_style, &[], true)
     }
 
@@ -475,6 +482,18 @@ fn snap_to_cells(
     snap_style_to_cells(taffy_style, cell_size);
 }
 
+fn keep_left_frame_edge_only(style: &mut taffy::style::Style, cell_width: f32) {
+    let zero = taffy::style::LengthPercentage::length(0.);
+    let at_most_one_cell = |value: f32| value.min(cell_width);
+    style.border.top = zero;
+    style.border.right = zero;
+    style.border.bottom = zero;
+    style.padding.top = zero;
+    style.padding.bottom = zero;
+    style.padding.left = snap_length(style.padding.left, at_most_one_cell);
+    style.padding.right = snap_length(style.padding.right, at_most_one_cell);
+}
+
 const TEXT_REM_CELLS: f32 = 2.25;
 const MIN_TEXT_WIDTH_REMS: f32 = 8.;
 
@@ -559,6 +578,30 @@ fn snap_edges<T>(
     edges.bottom = snap_length(edges.bottom, snap_y);
 }
 
+impl Style {
+    pub(crate) fn is_framed_surface(&self) -> bool {
+        !self.box_shadow.is_empty()
+            && !self.border_widths.any(|width| width.is_zero())
+            && self
+                .border_color
+                .is_some_and(|color| !color.is_transparent())
+            && self.size.height == Length::Auto
+    }
+
+    pub(crate) fn painted_border_widths(&self, window: &Window) -> Edges<AbsoluteLength> {
+        if self.is_framed_surface()
+            && let Some(cell_size) = window.text_system().cell_size()
+        {
+            Edges {
+                left: cell_size.width.into(),
+                ..Edges::<AbsoluteLength>::zero()
+            }
+        } else {
+            self.border_widths
+        }
+    }
+}
+
 impl Window {
     pub(crate) fn snap_to_cells(&self, point: Point<Pixels>) -> Point<Pixels> {
         let Some(cell_size) = self.text_system().cell_size() else {
@@ -618,9 +661,14 @@ fn ceil_to_cell(value: f32, cell: f32) -> f32 {
 }
 
 #[cfg(test)]
+mod fork_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Edges;
     use taffy::geometry::{Rect as TaffyRect, Size as TaffySize};
+    use taffy::style::LengthPercentage;
 
     fn width_style(width: AbsoluteLength) -> (Style, taffy::style::Style) {
         let mut style = Style::default();
@@ -974,5 +1022,147 @@ mod tests {
         assert_eq!(style.border.left, length(8.));
         assert_eq!(style.gap.width, length(8.));
         assert_eq!(style.gap.height, length(16.));
+    }
+
+    fn framed_style(shadowed: bool, borders: Edges<AbsoluteLength>) -> Style {
+        let mut style = Style::default();
+        style.border_widths = borders;
+        style.border_color = Some(crate::hsla(0., 0., 0.5, 1.));
+        if shadowed {
+            style.box_shadow = vec![crate::BoxShadow {
+                color: crate::hsla(0., 0., 0., 0.12),
+                offset: crate::point(Pixels::ZERO, Pixels(2.)),
+                blur_radius: Pixels(4.),
+                spread_radius: Pixels::ZERO,
+                inset: false,
+            }];
+        }
+        style
+    }
+
+    fn padding(left: f32, right: f32, top: f32, bottom: f32) -> TaffyRect<LengthPercentage> {
+        TaffyRect {
+            left: LengthPercentage::length(left),
+            right: LengthPercentage::length(right),
+            top: LengthPercentage::length(top),
+            bottom: LengthPercentage::length(bottom),
+        }
+    }
+
+    fn snapped_box(
+        snapper: &CellSnapper,
+        style: &Style,
+        padding: TaffyRect<LengthPercentage>,
+        children: &[LayoutId],
+    ) -> taffy::style::Style {
+        let border =
+            |width: AbsoluteLength| LengthPercentage::length(width.to_pixels(Pixels(16.)).0);
+        let mut taffy_style = taffy::style::Style {
+            border: TaffyRect {
+                left: border(style.border_widths.left),
+                right: border(style.border_widths.right),
+                top: border(style.border_widths.top),
+                bottom: border(style.border_widths.bottom),
+            },
+            padding,
+            ..Default::default()
+        };
+        snapper.snap(&mut taffy_style, style, children);
+        taffy_style
+    }
+
+    fn snapped_menu_box(style: &Style) -> taffy::style::Style {
+        snapped_box(
+            &CellSnapper::new(size(8., 16.)),
+            style,
+            padding(0., 0., 4., 4.),
+            &[],
+        )
+    }
+
+    fn one_pixel_borders() -> Edges<AbsoluteLength> {
+        Edges::all(AbsoluteLength::Pixels(Pixels(1.)))
+    }
+
+    #[test]
+    fn framed_surfaces_keep_only_a_left_border_column() {
+        let snapped = snapped_menu_box(&framed_style(true, one_pixel_borders()));
+        assert_eq!(snapped.border.top, LengthPercentage::length(0.));
+        assert_eq!(snapped.border.right, LengthPercentage::length(0.));
+        assert_eq!(snapped.border.bottom, LengthPercentage::length(0.));
+        assert_eq!(snapped.border.left, LengthPercentage::length(8.));
+    }
+
+    #[test]
+    fn framed_surfaces_drop_vertical_padding_and_keep_at_most_one_padding_column() {
+        let snapper = CellSnapper::new(size(8., 16.));
+        let roomy = padding(24., 4., 24., 24.);
+        let framed = snapped_box(
+            &snapper,
+            &framed_style(true, one_pixel_borders()),
+            roomy,
+            &[],
+        );
+        assert_eq!(framed.padding, padding(8., 8., 0., 0.));
+
+        let unframed = snapped_box(
+            &snapper,
+            &framed_style(false, one_pixel_borders()),
+            roomy,
+            &[],
+        );
+        assert_eq!(unframed.padding, padding(24., 8., 16., 16.));
+    }
+
+    #[test]
+    fn framed_surface_padding_stays_one_column_when_children_are_blank_at_their_edges() {
+        let mut snapper = CellSnapper::new(size(8., 16.));
+        let mut tree = TaffyTree::<NodeContext>::new();
+        let child = LayoutId::from(tree.new_leaf(taffy::style::Style::default()).unwrap());
+        snapper.cell_nodes.insert(
+            child,
+            CellNode {
+                is_empty: false,
+                left: Edge::Blank,
+                right: Edge::Blank,
+                hairline_width: None,
+            },
+        );
+        let snapped = snapped_box(
+            &snapper,
+            &framed_style(true, one_pixel_borders()),
+            padding(24., 24., 0., 0.),
+            &[child],
+        );
+        assert_eq!(snapped.padding, padding(8., 8., 0., 0.));
+    }
+
+    #[test]
+    fn bordered_boxes_without_a_shadow_keep_collapsed_top_and_bottom_borders() {
+        let snapped = snapped_menu_box(&framed_style(false, one_pixel_borders()));
+        assert_eq!(snapped.border.top, LengthPercentage::length(0.));
+        assert_eq!(snapped.border.bottom, LengthPercentage::length(0.));
+        assert_eq!(snapped.border.right, LengthPercentage::length(8.));
+    }
+
+    #[test]
+    fn framed_surfaces_with_a_fixed_height_keep_collapsed_top_and_bottom_borders() {
+        let mut style = framed_style(true, one_pixel_borders());
+        style.size.height = Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Pixels(
+            Pixels(32.),
+        )));
+        let snapped = snapped_menu_box(&style);
+        assert_eq!(snapped.border.top, LengthPercentage::length(0.));
+        assert_eq!(snapped.border.right, LengthPercentage::length(8.));
+    }
+
+    #[test]
+    fn shadowed_boxes_with_partial_borders_keep_collapsed_top_and_bottom_borders() {
+        let borders = Edges {
+            bottom: AbsoluteLength::Pixels(Pixels(1.)),
+            ..Edges::all(AbsoluteLength::Pixels(Pixels::ZERO))
+        };
+        let snapped = snapped_menu_box(&framed_style(true, borders));
+        assert_eq!(snapped.border.bottom, LengthPercentage::length(0.));
     }
 }

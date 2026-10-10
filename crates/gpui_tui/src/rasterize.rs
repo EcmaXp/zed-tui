@@ -558,6 +558,11 @@ impl Rasterizer<'_> {
         let has_bottom = edges.bottom.0 > 0. && rows.len() >= min_rows;
         let has_left = edges.left.0 > 0. && cols.len() > 1;
         let has_right = edges.right.0 > 0. && cols.len() > 1;
+        let left_edge = if edges.left.0 >= CELL_WIDTH {
+            '▌'
+        } else {
+            '│'
+        };
         let is_side_strip = clipped.size.width < CELL_WIDTH / 2.;
 
         for row in rows {
@@ -591,7 +596,8 @@ impl Rasterizer<'_> {
                     (_, true, true, _) => '└',
                     (_, true, _, true) => '┘',
                     (true, _, _, _) | (_, true, _, _) => '─',
-                    (_, _, true, _) | (_, _, _, true) => '│',
+                    (_, _, true, _) => left_edge,
+                    (_, _, _, true) => '│',
                     _ => continue,
                 };
                 self.line_char(col, row, ch, color);
@@ -1040,6 +1046,44 @@ mod tests {
         scene.finish();
         let grid = rasterize(&scene, &atlas, 4, 2).0;
         assert_eq!(grid.row_text(1), "    ");
+    }
+
+    fn left_bordered_quad(x: f32, width: f32, rows: f32, left_width: f32) -> Quad {
+        Quad {
+            bounds: scaled_bounds(x, 0., width, rows * CELL_HEIGHT),
+            content_mask: full_mask(),
+            background: gpui::opaque_grey(0.2, 1.).into(),
+            border_color: Hsla::white(),
+            border_widths: gpui::Edges {
+                left: ScaledPixels(left_width),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cell_wide_left_borders_draw_a_left_half_block_and_thinner_ones_a_line() {
+        let atlas = TuiAtlas::default();
+        for (left_width, expected) in [(1., "│   "), (4., "│   "), (8., "▌   ")] {
+            let mut scene = Scene::default();
+            scene.insert_primitive(left_bordered_quad(0., 32., 3., left_width));
+            scene.finish();
+            let grid = rasterize(&scene, &atlas, 4, 3).0;
+            for row in 0..3 {
+                assert_eq!(
+                    grid.row_text(row),
+                    expected,
+                    "width {left_width}, row {row}"
+                );
+                let edge = grid.cell(0, row.into()).unwrap();
+                assert_eq!(
+                    (edge.fg, edge.bg),
+                    (rgb(255, 255, 255), rgb(51, 51, 51)),
+                    "width {left_width}, row {row}"
+                );
+            }
+        }
     }
 
     fn hollow_cursor(x: f32, width: f32, color: Hsla) -> Quad {
