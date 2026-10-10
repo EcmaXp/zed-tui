@@ -27,6 +27,9 @@ use crate::tui::protocol::{
 const PUSH_TITLE: &str = "\x1b[22;0t";
 const POP_TITLE: &str = "\x1b[23;0t";
 const REDRAW_MERGE_GAP: usize = 4;
+const MIN_ERASE_RUN: usize = 8;
+const MIN_ERASE_RUN_BEFORE_MOVE: usize = 5;
+const MIN_ERASE_TAIL: usize = 4;
 const POINTER_RESET: &[u8] = b"\x1b]22;text\x1b\\";
 const CURSOR_SHAPE_RESET: &[u8] = b"\x1b[0 q";
 const KEYBOARD_FLAGS_QUERY: &str = "\x1b[?u";
@@ -616,6 +619,21 @@ fn assume_erased(shown: &mut [Cell], wanted: &[Cell]) {
     }
 }
 
+fn is_blank_on(cell: &Cell, background: PenColor) -> bool {
+    cell.is_plain_blank() && PenColor::background(cell) == background
+}
+
+fn blank_tail_start(cells: &[Cell], cols: usize) -> Option<usize> {
+    let cells = cells.get(..cols)?;
+    let background = PenColor::background(cells.last()?);
+    Some(
+        cells
+            .iter()
+            .rposition(|cell| !is_blank_on(cell, background))
+            .map_or(0, |last_drawn| last_drawn + 1),
+    )
+}
+
 fn unknown_cell() -> Cell {
     Cell {
         glyph: '\0'.into(),
@@ -811,14 +829,22 @@ impl<W: Write> Terminal<W> {
         Ok(())
     }
 
-    fn draw(&mut self, row: u16, cells: &[Cell], range: Range<usize>) -> io::Result<()> {
+    fn draw(
+        &mut self,
+        row: u16,
+        cells: &[Cell],
+        range: Range<usize>,
+        blank_tail_start: Option<usize>,
+    ) -> io::Result<usize> {
         let mut scratch = std::mem::take(&mut self.draw_scratch);
-        let drawn = self.plan_draw(cells, range, &mut scratch).and_then(|()| {
-            for segment in &scratch.segments {
-                self.draw_segment(row, segment, &scratch.text)?;
-            }
-            Ok(())
-        });
+        let drawn = self
+            .plan_draw(cells, range, blank_tail_start, &mut scratch)
+            .and_then(|drawn_to| {
+                for segment in &scratch.segments {
+                    self.draw_segment(row, segment, &scratch.text)?;
+                }
+                Ok(drawn_to)
+            });
         self.draw_scratch = scratch;
         drawn
     }
@@ -827,8 +853,9 @@ impl<W: Write> Terminal<W> {
         &self,
         cells: &[Cell],
         range: Range<usize>,
+        blank_tail_start: Option<usize>,
         scratch: &mut DrawScratch,
-    ) -> io::Result<()> {
+    ) -> io::Result<usize> {
         let cols = self.cols as usize;
         let visible_cols = cells.len().min(cols);
         scratch.segments.clear();
@@ -840,6 +867,39 @@ impl<W: Write> Terminal<W> {
             };
             if cell.is_wide_continuation() {
                 col += 1;
+                continue;
+            }
+            let background = PenColor::background(cell);
+            let blank_run = cells
+                .get(col..range.end)
+                .unwrap_or_default()
+                .iter()
+                .take_while(|blank| is_blank_on(blank, background))
+                .count();
+            let erases_to_edge =
+                blank_tail_start.is_some_and(|start| col >= start) && cols - col >= MIN_ERASE_TAIL;
+            let min_run = if col + blank_run == range.end {
+                MIN_ERASE_RUN_BEFORE_MOVE
+            } else {
+                MIN_ERASE_RUN
+            };
+            if erases_to_edge || blank_run >= min_run {
+                let kind = if erases_to_edge {
+                    SegmentKind::EraseToEdge
+                } else {
+                    SegmentKind::Erase(blank_run)
+                };
+                scratch.segments.push(DrawSegment {
+                    col,
+                    style: Style::blank(background),
+                    kind,
+                    is_blank_glyph: false,
+                    cursor_after: Some(col),
+                });
+                if erases_to_edge {
+                    return Ok(cols);
+                }
+                col += blank_run;
                 continue;
             }
             let is_wide = cells
@@ -866,7 +926,7 @@ impl<W: Write> Terminal<W> {
             match scratch.segments.last_mut() {
                 Some(DrawSegment {
                     style: last_style,
-                    end,
+                    kind: SegmentKind::Glyphs { end, .. },
                     is_blank_glyph: last_is_blank,
                     cursor_after: last_cursor_after,
                     ..
@@ -884,8 +944,10 @@ impl<W: Write> Terminal<W> {
                     scratch.segments.push(DrawSegment {
                         col,
                         style,
-                        start: text_start,
-                        end: text_end,
+                        kind: SegmentKind::Glyphs {
+                            start: text_start,
+                            end: text_end,
+                        },
                         is_blank_glyph,
                         cursor_after,
                     });
@@ -893,16 +955,31 @@ impl<W: Write> Terminal<W> {
             }
             col += 1;
         }
-        Ok(())
+        Ok(range.end)
     }
 
     fn draw_segment(&mut self, row: u16, segment: &DrawSegment, text: &[u8]) -> io::Result<()> {
         self.move_to(segment.col, row)?;
         self.pen.write_style(&mut self.body, segment.style)?;
-        self.body
-            .extend_from_slice(text.get(segment.start..segment.end).unwrap_or_default());
-        self.cursor = segment.cursor_after.map(|col| (col, row));
-        Ok(())
+        self.write_segment_content(row, segment, text)
+    }
+
+    fn write_segment_content(
+        &mut self,
+        row: u16,
+        segment: &DrawSegment,
+        text: &[u8],
+    ) -> io::Result<()> {
+        match segment.kind {
+            SegmentKind::Erase(count) => write_csi(&mut self.body, count, 'X'),
+            SegmentKind::EraseToEdge => self.body.write_all(b"\x1b[K"),
+            SegmentKind::Glyphs { start, end } => {
+                self.body
+                    .extend_from_slice(text.get(start..end).unwrap_or_default());
+                self.cursor = segment.cursor_after.map(|col| (col, row));
+                Ok(())
+            }
+        }
     }
 }
 
@@ -913,11 +990,17 @@ struct DrawScratch {
 }
 
 #[derive(Clone, Copy)]
+enum SegmentKind {
+    Erase(usize),
+    EraseToEdge,
+    Glyphs { start: usize, end: usize },
+}
+
+#[derive(Clone, Copy)]
 struct DrawSegment {
     col: usize,
     style: Style,
-    start: usize,
-    end: usize,
+    kind: SegmentKind,
     is_blank_glyph: bool,
     cursor_after: Option<usize>,
 }
@@ -1004,11 +1087,17 @@ impl<W: Write> Renderer<W> {
             if ranges.is_empty() {
                 continue;
             }
+            let tail_start = blank_tail_start(cells, terminal.cols as usize);
+            let mut drawn_to = 0;
             for range in ranges {
-                terminal.draw(row, cells, range.clone())?;
+                if range.end <= drawn_to {
+                    continue;
+                }
+                drawn_to = terminal.draw(row, cells, range.clone(), tail_start)?;
+                let drawn = range.start..drawn_to;
                 if let (Some(target), Some(source)) = (
-                    screen.row_mut(row).get_mut(range.clone()),
-                    visible.get(range),
+                    screen.row_mut(row).get_mut(drawn.clone()),
+                    visible.get(drawn),
                 ) {
                     target.copy_from_slice(source);
                 }
@@ -2334,6 +2423,36 @@ mod tests {
         }
     }
 
+    fn rendered_change(cols: u16, before: &str, after: &str) -> String {
+        let mut grid = CellGrid::new(cols, 2, Rgb::new(40, 44, 52));
+        text_row(&mut grid, 0, 0, before);
+        let mut renderer = Renderer::new(Vec::new(), cols, 2);
+        let mut emulator = Emulator::new(cols, 2);
+        renderer.grid = Some(grid);
+        emulator.feed(&mut renderer);
+
+        let mut changed = CellGrid::new(cols, 2, Rgb::new(40, 44, 52));
+        text_row(&mut changed, 0, 0, after);
+        render_checked(&mut renderer, &mut emulator, &changed)
+    }
+
+    #[test]
+    fn blank_tails_are_erased_to_the_end_of_the_line() {
+        let output = rendered_change(20, "abcdefghij", "ab");
+        assert!(
+            output.contains("\x1b[K") && !output.contains('X'),
+            "{output:?}"
+        );
+        let output = rendered_change(20, "abcdefghijklmnopqrst", "abcdefghijklmnopqr");
+        assert!(!output.contains("\x1b[K"), "{output:?}");
+    }
+
+    #[test]
+    fn blank_runs_ending_a_range_use_erase_characters() {
+        let output = rendered_change(20, "abcdefghijklmnopqrs|", "ab      ijklmnopqrs|");
+        assert!(output.contains("\x1b[6X"), "{output:?}");
+    }
+
     #[test]
     fn combining_marks_reach_the_terminal_with_their_base() {
         let mut grid = CellGrid::new(20, 2, Rgb::new(40, 44, 52));
@@ -2496,6 +2615,26 @@ mod tests {
         assert!(contains_reset(&undo), "{undo:?}");
         let restore = signal_restore(setup.features.ghostty);
         assert!(contains_reset(&restore), "{restore:?}");
+    }
+
+    #[test]
+    fn single_cell_changes_write_a_short_update() {
+        let grid = CellGrid::new(80, 24, Rgb::new(40, 44, 52));
+        let mut renderer = Renderer::new(Vec::new(), 80, 24);
+        let mut emulator = Emulator::new(80, 24);
+        renderer.grid = Some(grid.clone());
+        let full = emulator.feed(&mut renderer);
+        assert!(full < 500, "blank frame took {full} bytes");
+
+        let mut next = grid;
+        if let Some(cell) = next.cell_mut(10, 5) {
+            cell.glyph = 'x'.into();
+            cell.fg = Rgb::new(200, 120, 60);
+        }
+        renderer.grid = Some(next.clone());
+        let update = emulator.feed(&mut renderer);
+        assert!(update < 48, "one cell took {update} bytes");
+        emulator.assert_shows(&next, 80);
     }
 
     #[derive(Clone, Default)]
