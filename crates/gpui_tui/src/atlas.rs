@@ -5,25 +5,32 @@ use collections::HashMap;
 use gpui::{
     AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels, PlatformAtlas, Point, Size, TileId,
 };
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 
 #[derive(Default)]
 struct AtlasState {
     tiles: HashMap<AtlasKey, AtlasTile>,
-    next_tile_id: u32,
+    keys: Vec<Option<AtlasKey>>,
 }
 
 #[derive(Clone, Default)]
 pub struct TuiAtlas(Arc<Mutex<AtlasState>>);
 
+pub(crate) struct TileKeys<'a>(MutexGuard<'a, AtlasState>);
+
+impl TileKeys<'_> {
+    pub(crate) fn get(&self, tile_id: TileId) -> Option<&AtlasKey> {
+        self.0.keys.get(key_index(tile_id)?)?.as_ref()
+    }
+}
+
+fn key_index(tile_id: TileId) -> Option<usize> {
+    usize::try_from(tile_id.0).ok()?.checked_sub(1)
+}
+
 impl TuiAtlas {
-    pub(crate) fn key_for(&self, tile_id: TileId) -> Option<AtlasKey> {
-        self.0
-            .lock()
-            .tiles
-            .iter()
-            .find(|(_, tile)| tile.tile_id == tile_id)
-            .map(|(key, _)| key.clone())
+    pub(crate) fn tile_keys(&self) -> TileKeys<'_> {
+        TileKeys(self.0.lock())
     }
 }
 
@@ -33,8 +40,7 @@ impl PlatformAtlas for TuiAtlas {
         key: AtlasKey,
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>> {
-        let mut state = self.0.lock();
-        if let Some(tile) = state.tiles.get(&key) {
+        if let Some(tile) = self.0.lock().tiles.get(&key) {
             return Ok(Some(*tile));
         }
 
@@ -47,8 +53,12 @@ impl PlatformAtlas for TuiAtlas {
             AtlasKey::Image(_) => Size::new(DevicePixels(1), DevicePixels(1)),
         };
 
-        state.next_tile_id += 1;
-        let tile_id = state.next_tile_id;
+        let mut state = self.0.lock();
+        if let Some(tile) = state.tiles.get(&key) {
+            return Ok(Some(*tile));
+        }
+        state.keys.push(Some(key.clone()));
+        let tile_id = u32::try_from(state.keys.len())?;
         let tile = AtlasTile {
             texture_id: AtlasTextureId {
                 index: 0,
@@ -66,6 +76,11 @@ impl PlatformAtlas for TuiAtlas {
     }
 
     fn remove(&self, key: &AtlasKey) {
-        self.0.lock().tiles.remove(key);
+        let mut state = self.0.lock();
+        if let Some(tile) = state.tiles.remove(key)
+            && let Some(slot) = key_index(tile.tile_id).and_then(|index| state.keys.get_mut(index))
+        {
+            *slot = None;
+        }
     }
 }

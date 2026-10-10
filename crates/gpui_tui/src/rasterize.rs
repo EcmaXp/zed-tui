@@ -7,7 +7,7 @@ use gpui::{
 
 use crate::{
     CELL_HEIGHT, CELL_WIDTH,
-    atlas::TuiAtlas,
+    atlas::{TileKeys, TuiAtlas},
     caret_cell, device_cell_center,
     grid::{Cell, CellAttrs, CellGrid, CursorPosition, CursorShape, Glyph, Rgb, UnderlineColor},
     text_system::{is_bold, is_italic},
@@ -184,7 +184,7 @@ pub(crate) fn rasterize_scene(
     canvas: Rgb,
     scratch: &mut RasterScratch,
 ) -> (CellGrid, Vec<CaretCandidate>) {
-    layout_text(scene, atlas, icon_glyph, scratch);
+    layout_text(scene, &atlas.tile_keys(), icon_glyph, scratch);
     scratch.rules_by_row.iter_mut().for_each(Vec::clear);
     scratch.rules_by_row.resize_with(rows as usize, Vec::new);
     let mut rasterizer = Rasterizer {
@@ -253,18 +253,18 @@ struct TextCandidate {
 fn text_candidate(
     id: SpriteId,
     sprite: &MonochromeSprite,
-    atlas: &TuiAtlas,
+    tile_keys: &TileKeys,
     icon_glyph: &dyn Fn(&str) -> Option<char>,
     last_color: &mut Option<(Hsla, Rgba)>,
 ) -> Option<TextCandidate> {
-    let key = atlas.key_for(sprite.tile.tile_id)?;
+    let key = tile_keys.get(sprite.tile.tile_id)?;
     let bounds = to_bounds(&sprite.bounds);
     let mask = to_bounds(&sprite.content_mask.bounds);
     let center = bounds.center();
     if !mask.contains(&center) {
         return None;
     }
-    let (col, row, glyph, attrs) = match &key {
+    let (col, row, glyph, attrs) = match key {
         AtlasKey::Glyph(params) => {
             let glyph = Glyph::from_glyph_id(params.glyph_id)?;
             let (col, row) = cell_of(bounds.left() + CELL_WIDTH / 2., center.y);
@@ -313,7 +313,7 @@ fn text_candidate(
 
 fn layout_text(
     scene: &Scene,
-    atlas: &TuiAtlas,
+    tile_keys: &TileKeys,
     icon_glyph: &dyn Fn(&str) -> Option<char>,
     scratch: &mut RasterScratch,
 ) {
@@ -331,7 +331,7 @@ fn layout_text(
             .iter()
             .enumerate()
             .filter_map(|(id, sprite)| {
-                text_candidate(id, sprite, atlas, icon_glyph, &mut last_color)
+                text_candidate(id, sprite, tile_keys, icon_glyph, &mut last_color)
             }),
     );
     candidates.sort_unstable_by(|a, b| {
