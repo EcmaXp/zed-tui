@@ -50,6 +50,7 @@ pub(super) struct EditPredictionState {
     pub(super) invalidation_range: Option<Range<Anchor>>,
 }
 
+#[derive(Clone, Copy, PartialEq)]
 pub(super) enum EditPredictionSettings {
     Disabled,
     Enabled {
@@ -811,6 +812,23 @@ impl Editor {
     }
 
     pub(super) fn update_visible_edit_prediction(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<()> {
+        let key_context_inputs_before = self.edit_prediction_key_context_inputs();
+        let result = self.refresh_visible_edit_prediction(window, cx);
+        if self.edit_prediction_key_context_inputs() != key_context_inputs_before {
+            cx.notify();
+        }
+        result
+    }
+
+    fn edit_prediction_key_context_inputs(&self) -> (bool, EditPredictionSettings) {
+        (self.in_leading_whitespace, self.edit_prediction_settings)
+    }
+
+    fn refresh_visible_edit_prediction(
         &mut self,
         _window: &mut Window,
         cx: &mut Context<Self>,

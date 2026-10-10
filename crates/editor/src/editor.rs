@@ -4952,10 +4952,12 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<CodeContextMenu> {
-        cx.notify();
         self.completion_tasks.clear();
         let context_menu = self.context_menu.borrow_mut().take();
-        self.stale_edit_prediction_in_menu.take();
+        let had_stale_edit_prediction = self.stale_edit_prediction_in_menu.take().is_some();
+        if context_menu.is_some() || had_stale_edit_prediction {
+            cx.notify();
+        }
         self.update_visible_edit_prediction(window, cx);
         if let Some(CodeContextMenu::Completions(_)) = &context_menu
             && let Some(completion_provider) = &self.completion_provider

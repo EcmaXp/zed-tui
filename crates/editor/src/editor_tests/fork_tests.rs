@@ -129,6 +129,33 @@ async fn test_refreshing_document_highlights_without_any_before_or_after_does_no
 }
 
 #[gpui::test]
+async fn test_hide_context_menu_without_an_open_menu_does_not_notify(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.set_state("fn mainˇ() {}");
+    cx.run_until_parked();
+
+    let notifications = Arc::new(AtomicUsize::new(0));
+    let editor = cx.editor.clone();
+    let _subscription = cx.update(|_, cx| {
+        let notifications = notifications.clone();
+        cx.observe(&editor, move |_, _| {
+            notifications.fetch_add(1, atomic::Ordering::SeqCst);
+        })
+    });
+    let hid_a_menu =
+        cx.update_editor(|editor, window, cx| editor.hide_context_menu(window, cx).is_some());
+    cx.run_until_parked();
+
+    assert!(!hid_a_menu);
+    assert_eq!(
+        notifications.load(atomic::Ordering::SeqCst),
+        0,
+        "expected no notification when there was no menu or stale edit prediction to hide",
+    );
+}
+
+#[gpui::test]
 async fn test_indent_guides_stop_at_excerpt_boundaries(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
