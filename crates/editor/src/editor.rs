@@ -3997,8 +3997,16 @@ impl Editor {
         })
     }
 
-    #[ztracing::instrument(skip_all)]
     fn refresh_outline_symbols_at_cursor(&mut self, cx: &mut Context<Editor>) {
+        self.update_outline_symbols_at_cursor(false, cx);
+    }
+
+    #[ztracing::instrument(skip_all)]
+    fn update_outline_symbols_at_cursor(
+        &mut self,
+        document_symbols_updated: bool,
+        cx: &mut Context<Editor>,
+    ) {
         if !self.lsp_data_enabled() {
             return;
         }
@@ -4006,10 +4014,8 @@ impl Editor {
         let multi_buffer_snapshot = self.buffer().read(cx).snapshot(cx);
 
         if self.uses_lsp_document_symbols(cursor, &multi_buffer_snapshot, cx) {
-            self.outline_symbols_at_cursor =
-                self.lsp_symbols_at_cursor(cursor, &multi_buffer_snapshot, cx);
-            cx.emit(EditorEvent::OutlineSymbolsChanged);
-            cx.notify();
+            let symbols = self.lsp_symbols_at_cursor(cursor, &multi_buffer_snapshot, cx);
+            self.set_outline_symbols_at_cursor(symbols, document_symbols_updated, cx);
         } else {
             let syntax = cx.theme().syntax().clone();
             let background_task = cx.background_spawn(async move {
@@ -4019,13 +4025,25 @@ impl Editor {
                 cx.spawn(async move |this, cx| {
                     let symbols = background_task.await;
                     this.update(cx, |this, cx| {
-                        this.outline_symbols_at_cursor = symbols;
-                        cx.emit(EditorEvent::OutlineSymbolsChanged);
-                        cx.notify();
+                        this.set_outline_symbols_at_cursor(symbols, document_symbols_updated, cx);
                     })
                     .ok();
                 });
         }
+    }
+
+    fn set_outline_symbols_at_cursor(
+        &mut self,
+        symbols: Option<(BufferId, Vec<OutlineItem<Anchor>>)>,
+        document_symbols_updated: bool,
+        cx: &mut Context<Editor>,
+    ) {
+        if !document_symbols_updated && symbols == self.outline_symbols_at_cursor {
+            return;
+        }
+        self.outline_symbols_at_cursor = symbols;
+        cx.emit(EditorEvent::OutlineSymbolsChanged);
+        cx.notify();
     }
 
     #[ztracing::instrument(skip_all)]
