@@ -249,6 +249,7 @@ fn text_candidate(
     sprite: &MonochromeSprite,
     atlas: &TuiAtlas,
     icon_glyph: &dyn Fn(&str) -> Option<char>,
+    last_color: &mut Option<(Hsla, Rgba)>,
 ) -> Option<TextCandidate> {
     let key = atlas.key_for(sprite.tile.tile_id)?;
     let bounds = to_bounds(&sprite.bounds);
@@ -282,7 +283,14 @@ fn text_candidate(
     if partly_hidden && !mask.contains(&Point::new(center.x, cell_center_y)) {
         return None;
     }
-    let color = sprite.color.to_rgb();
+    let color = match *last_color {
+        Some((hsla, rgba)) if hsla == sprite.color => rgba,
+        _ => {
+            let rgba = sprite.color.to_rgb();
+            *last_color = Some((sprite.color, rgba));
+            rgba
+        }
+    };
     Some(TextCandidate {
         id,
         bounds,
@@ -309,13 +317,16 @@ fn layout_text(
         line_cursors,
         ..
     } = scratch;
+    let mut last_color = None;
     candidates.clear();
     candidates.extend(
         scene
             .monochrome_sprites
             .iter()
             .enumerate()
-            .filter_map(|(id, sprite)| text_candidate(id, sprite, atlas, icon_glyph)),
+            .filter_map(|(id, sprite)| {
+                text_candidate(id, sprite, atlas, icon_glyph, &mut last_color)
+            }),
     );
     candidates.sort_unstable_by(|a, b| {
         a.placement
@@ -416,20 +427,33 @@ impl Rasterizer<'_> {
         }
         let (first_col, end_col) = (cols.start, cols.end);
         let canvas = self.canvas;
+        let mut last_blend: Option<(Rgb, Rgb)> = None;
         for row in intersect(covered_rows(rect), &(0..self.grid.rows.into())) {
+            let Ok(row) = u16::try_from(row) else {
+                continue;
+            };
             if clears_text {
-                self.clear_char(first_col, row);
-                self.clear_char(end_col - 1, row);
+                self.clear_char(first_col, row.into());
+                self.clear_char(end_col - 1, row.into());
             }
-            for col in cols.clone() {
-                if let Some(cell) = self.grid.cell_mut(col, row) {
-                    if clears_text {
-                        cell.glyph = ' '.into();
-                        cell.attrs = CellAttrs::empty();
-                        cell.underline = UnderlineColor::default();
-                    }
-                    cell.bg = canvas_if_untouched(cell.bg, canvas).blend_rgba(rgba);
+            let cells = self.grid.row_mut(row);
+            let Some(cells) = cells.get_mut(first_col as usize..end_col as usize) else {
+                continue;
+            };
+            for cell in cells {
+                if clears_text {
+                    cell.glyph = ' '.into();
+                    cell.attrs = CellAttrs::empty();
+                    cell.underline = UnderlineColor::default();
                 }
+                cell.bg = match last_blend {
+                    Some((under, blended)) if under == cell.bg => blended,
+                    _ => {
+                        let blended = canvas_if_untouched(cell.bg, canvas).blend_rgba(rgba);
+                        last_blend = Some((cell.bg, blended));
+                        blended
+                    }
+                };
             }
         }
     }
