@@ -37,6 +37,7 @@ const VERSION_QUERY: &str = "\x1b[>0q";
 const DEVICE_ATTRIBUTES_QUERY: &str = "\x1b[c";
 const MAX_VERSION_REPLY: usize = 64;
 const GHOSTTY_VERSION_PREFIXES: [&[u8]; 2] = [b"ghostty", b"libghostty"];
+const SYNCHRONIZED_FRAME_BYTES: usize = 512;
 const QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 const HANGUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const RESIZE_FRAME_WAIT: Duration = Duration::from_millis(100);
@@ -809,14 +810,19 @@ impl<W: Write> Terminal<W> {
         Ok(())
     }
 
-    fn flush_frame(&mut self) -> io::Result<()> {
+    fn flush_frame(&mut self, force_synchronize: bool) -> io::Result<()> {
         if self.body.is_empty() {
             return Ok(());
         }
-        crossterm::queue!(self.output, terminal::BeginSynchronizedUpdate)?;
+        let synchronize = force_synchronize || self.body.len() >= SYNCHRONIZED_FRAME_BYTES;
+        if synchronize {
+            crossterm::queue!(self.output, terminal::BeginSynchronizedUpdate)?;
+        }
         self.output.write_all(&self.body)?;
         self.body.clear();
-        crossterm::queue!(self.output, terminal::EndSynchronizedUpdate)?;
+        if synchronize {
+            crossterm::queue!(self.output, terminal::EndSynchronizedUpdate)?;
+        }
         self.output.flush()
     }
 
@@ -1067,16 +1073,17 @@ impl<W: Write> Renderer<W> {
             return Ok(());
         };
         let terminal = &mut self.terminal;
-        let mut screen = match self.screen.take() {
-            Some(screen) if screen.cols == grid.cols && screen.rows == grid.rows => screen,
+        let (mut screen, was_in_sync) = match self.screen.take() {
+            Some(screen) if screen.cols == grid.cols && screen.rows == grid.rows => (screen, true),
             _ => {
                 terminal.clear()?;
                 let mut cleared = CellGrid::new(grid.cols, grid.rows, Rgb::default());
                 cleared.cells.fill(unknown_cell());
                 assume_erased(&mut cleared.cells, &grid.cells);
-                cleared
+                (cleared, false)
             }
         };
+        let force_synchronize = !was_in_sync;
         let visible_cols = (grid.cols.min(terminal.cols)) as usize;
         let visible_rows = grid.rows.min(terminal.rows) as usize;
         for row in 0..visible_rows as u16 {
@@ -1130,7 +1137,7 @@ impl<W: Write> Renderer<W> {
             None => {}
         }
         self.screen = Some(screen);
-        terminal.flush_frame()
+        terminal.flush_frame(force_synchronize)
     }
 
     fn set_title(&mut self, title: &str) -> io::Result<()> {
@@ -2520,6 +2527,26 @@ mod tests {
         assert!(!output.contains("48;2;40;44;52"), "{output:?}");
         emulator.feed(&mut renderer);
         emulator.assert_shows(&grid, 20);
+    }
+
+    #[test]
+    fn small_frames_skip_synchronized_update() {
+        let mut grid = CellGrid::new(80, 24, Rgb::new(40, 44, 52));
+        mutate(&mut grid, &mut Random::new(3), 40);
+        let mut renderer = Renderer::new(Vec::new(), 80, 24);
+        renderer.grid = Some(grid.clone());
+        renderer.render().unwrap();
+        let output = output_text(&renderer);
+        assert!(output.starts_with("\x1b[?2026h") && output.ends_with("\x1b[?2026l"));
+
+        renderer.terminal.output.clear();
+        if let Some(cell) = grid.cell_mut(10, 5) {
+            cell.glyph = 'x'.into();
+        }
+        renderer.grid = Some(grid);
+        renderer.render().unwrap();
+        let output = output_text(&renderer);
+        assert!(!output.is_empty() && !output.contains("2026"), "{output:?}");
     }
 
     #[test]
