@@ -147,7 +147,12 @@ mod unix {
             Ok(Outcome::Exit(code)) => std::process::exit(code),
             Err(error) => {
                 eprintln!("zed --tui: {error:#}");
-                std::process::exit(1);
+                let code = if error.is::<server::AlreadyRunning>() {
+                    server::ALREADY_RUNNING_EXIT_CODE
+                } else {
+                    1
+                };
+                std::process::exit(code);
             }
         }
     }

@@ -41,6 +41,18 @@ use crate::tui::{
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(30);
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_SESSION_BASENAME: usize = 32;
+pub const ALREADY_RUNNING_EXIT_CODE: i32 = 3;
+
+#[derive(Debug)]
+pub struct AlreadyRunning(String);
+
+impl std::fmt::Display for AlreadyRunning {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "session {:?} is already running", self.0)
+    }
+}
+
+impl std::error::Error for AlreadyRunning {}
 
 pub struct SessionPaths {
     pub name: String,
@@ -308,15 +320,15 @@ impl Drop for SessionGuard {
 
 fn lock_session(session_paths: &SessionPaths) -> Result<fs::File> {
     create_private_dir(&session_paths.directory)?;
-    if is_running(session_paths) {
-        bail!("session {:?} is already running", session_paths.name);
-    }
     let mut pid_lock = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(&session_paths.pid)
         .with_context(|| format!("opening {}", session_paths.pid.display()))?;
+    if pid_lock.try_lock().is_err() || is_running(session_paths) {
+        return Err(AlreadyRunning(session_paths.name.clone()).into());
+    }
     pid_lock.set_len(0)?;
     write!(pid_lock, "{}", std::process::id())?;
     Ok(pid_lock)
@@ -631,7 +643,9 @@ pub fn spawn_daemon(
         if is_running(session_paths) {
             return Ok(());
         }
-        if let Some(status) = child.try_status()? {
+        if let Some(status) = child.try_status()?
+            && status.code() != Some(ALREADY_RUNNING_EXIT_CODE)
+        {
             bail!(
                 "the session server exited ({status}); see {}",
                 session_paths.log.display()
@@ -704,6 +718,15 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         panic!("no server event arrived");
+    }
+
+    #[test]
+    fn a_second_server_for_a_session_reports_that_it_is_already_running() {
+        let directory = tempfile::tempdir().unwrap();
+        let session_paths = SessionPaths::in_directory("race", directory.path().join("session"));
+        let _first = lock_session(&session_paths).unwrap();
+        let second = lock_session(&session_paths).unwrap_err();
+        assert!(second.is::<AlreadyRunning>(), "{second:#}");
     }
 
     #[test]
