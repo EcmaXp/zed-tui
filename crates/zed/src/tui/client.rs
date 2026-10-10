@@ -898,29 +898,30 @@ fn render_messages<W: Write>(
         let timeout = resize_deadline.map_or(Duration::MAX, |deadline| {
             deadline.saturating_duration_since(Instant::now())
         });
-        let event = match events.recv_timeout(timeout) {
+        let first = match events.recv_timeout(timeout) {
             Ok(event) => Some(event),
             Err(mpsc::RecvTimeoutError::Timeout) => None,
             Err(mpsc::RecvTimeoutError::Disconnected) => return Exit::Disconnected,
         };
-        let mut is_frame = false;
-        match event {
-            Some(RenderEvent::Resized(cols, rows)) => {
-                renderer.resize(cols, rows);
-                resize_deadline = Some(Instant::now() + RESIZE_FRAME_WAIT);
-            }
-            Some(RenderEvent::Server(message)) => {
-                if let Some(exit) = exit_of(&message) {
-                    return exit;
+        let mut frames = 0;
+        for event in first.into_iter().chain(events.try_iter()) {
+            let message = match event {
+                RenderEvent::Resized(cols, rows) => {
+                    renderer.resize(cols, rows);
+                    resize_deadline = Some(Instant::now() + RESIZE_FRAME_WAIT);
+                    continue;
                 }
-                match renderer.apply(&message) {
-                    Ok(frame) => is_frame = frame,
-                    Err(_) => return Exit::Disconnected,
-                }
+                RenderEvent::Server(message) => message,
+            };
+            if let Some(exit) = exit_of(&message) {
+                return exit;
             }
-            None => {}
+            match renderer.apply(&message) {
+                Ok(is_frame) => frames += u32::from(is_frame),
+                Err(_) => return Exit::Disconnected,
+            }
         }
-        let resized_frame_arrived = is_frame && renderer.grid_fills_terminal();
+        let resized_frame_arrived = frames > 0 && renderer.grid_fills_terminal();
         resize_deadline =
             resize_deadline.filter(|deadline| !resized_frame_arrived && Instant::now() < *deadline);
         if resize_deadline.is_none() && renderer.render().is_err() {
