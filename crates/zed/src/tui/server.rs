@@ -874,7 +874,7 @@ fn write_to_client(mut stream: UnixStream, receiver: mpsc::Receiver<Outgoing>) {
 
 fn send_to_client(stream: &mut UnixStream, receiver: mpsc::Receiver<Outgoing>) {
     let mut writer = MessageWriter::default();
-    let mut encoder = FrameEncoder;
+    let mut encoder = FrameEncoder::default();
     let mut last_sent: Option<Arc<CellGrid>> = None;
     let mut newest_frame: Option<Arc<CellGrid>> = None;
     let mut frames_in_flight: u32 = 0;
@@ -1152,7 +1152,7 @@ mod tests {
         let mut client_reader = BufReader::new(client_side);
         hub.send_last_frame_to(id, (4, 2));
         let mut mirrored = None;
-        let mut decoder = FrameDecoder;
+        let mut decoder = FrameDecoder::default();
         let message: ServerMessage = read_message(&mut client_reader).unwrap();
         assert!(matches!(message, ServerMessage::FullFrame(..)));
         decoder.apply(&mut mirrored, &message);
@@ -1252,7 +1252,7 @@ mod tests {
             }
             Arc::new(grid)
         };
-        let mut decoder = FrameDecoder;
+        let mut decoder = FrameDecoder::default();
         let mut mirrored = None;
         for ch in ['a', 'b'] {
             hub.broadcast_frame(frame(ch));

@@ -4,6 +4,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
+use collections::HashMap;
 use gpui::{CursorStyle, Modifiers};
 use gpui_tui::{
     Cell, CellAttrs, CellGrid, CursorPosition, CursorShape, Glyph, Rgb, UnderlineColor,
@@ -18,6 +19,7 @@ const MAX_MESSAGE_LEN: usize = 64 * 1024 * 1024;
 const PATCH_MERGE_GAP: usize = 8;
 const CONTINUATION: char = '\0';
 const CLUSTER_EXTEND: char = '\u{1}';
+const MAX_COLOR_TABLE: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KeyCode {
@@ -120,10 +122,15 @@ pub enum ServerMessage {
     FullFrame(
         u16,
         u16,
+        Vec<u32>,
         Vec<RowPatch>,
         #[serde(with = "wire_cursor")] FrameCursor,
     ),
-    Diff(Vec<RowPatch>, #[serde(with = "wire_cursor")] FrameCursor),
+    Diff(
+        Vec<u32>,
+        Vec<RowPatch>,
+        #[serde(with = "wire_cursor")] FrameCursor,
+    ),
     Clipboard(String),
     Title(String),
     Shutdown,
@@ -330,14 +337,34 @@ fn decode_spans<'a>(
 }
 
 #[derive(Default)]
-pub struct FrameEncoder;
+pub struct FrameEncoder {
+    colors: HashMap<u32, u32>,
+}
 
 impl FrameEncoder {
-    fn full_frame(&self, grid: &CellGrid) -> ServerMessage {
-        let patches = (0..grid.rows)
+    fn index_colors(&mut self, patches: &mut [RowPatch]) -> Vec<u32> {
+        let mut added = Vec::new();
+        for RowPatch(_, _, spans) in patches {
+            for Span(fg, bg, _, _, underline) in spans {
+                for color in [fg, bg].into_iter().chain(underline.as_mut()) {
+                    let next = self.colors.len() as u32;
+                    *color = *self.colors.entry(*color).or_insert_with(|| {
+                        added.push(*color);
+                        next
+                    });
+                }
+            }
+        }
+        added
+    }
+
+    fn full_frame(&mut self, grid: &CellGrid) -> ServerMessage {
+        self.colors.clear();
+        let mut patches: Vec<RowPatch> = (0..grid.rows)
             .map(|row| RowPatch(row, 0, encode_cells(grid.row(row))))
             .collect();
-        ServerMessage::FullFrame(grid.cols, grid.rows, patches, frame_cursor(grid))
+        let colors = self.index_colors(&mut patches);
+        ServerMessage::FullFrame(grid.cols, grid.rows, colors, patches, frame_cursor(grid))
     }
 
     pub fn update(
@@ -346,7 +373,13 @@ impl FrameEncoder {
         next: &CellGrid,
     ) -> Option<ServerMessage> {
         let previous = match previous {
-            Some(previous) if previous.cols == next.cols && previous.rows == next.rows => previous,
+            Some(previous)
+                if previous.cols == next.cols
+                    && previous.rows == next.rows
+                    && self.colors.len() < MAX_COLOR_TABLE =>
+            {
+                previous
+            }
             _ => return Some(self.full_frame(next)),
         };
         let mut patches = Vec::new();
@@ -361,16 +394,24 @@ impl FrameEncoder {
         if patches.is_empty() && frame_cursor(previous) == frame_cursor(next) {
             return None;
         }
-        Some(ServerMessage::Diff(patches, frame_cursor(next)))
+        let colors = self.index_colors(&mut patches);
+        Some(ServerMessage::Diff(colors, patches, frame_cursor(next)))
     }
 }
 
 #[derive(Default)]
-pub struct FrameDecoder;
+pub struct FrameDecoder {
+    colors: Vec<u32>,
+}
 
 impl FrameDecoder {
     fn apply_patches(&self, grid: &mut CellGrid, patches: &[RowPatch]) {
-        let color = |value: u32| Rgb::from(value);
+        let color = |index: u32| {
+            self.colors
+                .get(index as usize)
+                .copied()
+                .map_or(Rgb::default(), Rgb::from)
+        };
         for RowPatch(row, col, spans) in patches {
             for (offset, cell) in decode_spans(spans, &color).enumerate() {
                 if let Some(target) = grid.cell_mut(*col as i32 + offset as i32, *row as i32) {
@@ -382,13 +423,15 @@ impl FrameDecoder {
 
     pub fn apply(&mut self, grid: &mut Option<CellGrid>, message: &ServerMessage) {
         match message {
-            ServerMessage::FullFrame(cols, rows, patches, cursor) => {
+            ServerMessage::FullFrame(cols, rows, colors, patches, cursor) => {
+                self.colors = colors.clone();
                 let mut frame = CellGrid::new(*cols, *rows, Rgb::default());
                 self.apply_patches(&mut frame, patches);
                 set_frame_cursor(&mut frame, *cursor);
                 *grid = Some(frame);
             }
-            ServerMessage::Diff(patches, cursor) => {
+            ServerMessage::Diff(colors, patches, cursor) => {
+                self.colors.extend_from_slice(colors);
                 if let Some(grid) = grid {
                     self.apply_patches(grid, patches);
                     set_frame_cursor(grid, *cursor);
@@ -479,8 +522,8 @@ mod tests {
             cell.underline = UnderlineColor::of(if col < 3 { red } else { blue });
         }
         let mut decoded = None;
-        let message = FrameEncoder.update(None, &grid).unwrap();
-        FrameDecoder.apply(&mut decoded, &message);
+        let message = FrameEncoder::default().update(None, &grid).unwrap();
+        FrameDecoder::default().apply(&mut decoded, &message);
         assert_eq!(decoded.as_ref(), Some(&grid));
     }
 
@@ -533,8 +576,8 @@ mod tests {
         }
         second.cursor = Some(CursorPosition { col: 3, row: 2 });
 
-        let mut encoder = FrameEncoder;
-        let mut decoder = FrameDecoder;
+        let mut encoder = FrameEncoder::default();
+        let mut decoder = FrameDecoder::default();
         let mut client = None;
         let initial = encoder.update(None, &first).unwrap();
         assert!(matches!(initial, ServerMessage::FullFrame(..)));
@@ -543,7 +586,7 @@ mod tests {
 
         let diff = encoder.update(Some(&first), &second).unwrap();
         match &diff {
-            ServerMessage::Diff(patches, _) => {
+            ServerMessage::Diff(_, patches, _) => {
                 assert_eq!(patches.len(), 1);
                 assert_eq!(patches[0].0, 2);
             }
@@ -567,8 +610,8 @@ mod tests {
         let mut second = first.clone();
         second.cursor_shape = CursorShape::Block;
 
-        let mut encoder = FrameEncoder;
-        let mut decoder = FrameDecoder;
+        let mut encoder = FrameEncoder::default();
+        let mut decoder = FrameDecoder::default();
         let mut client = None;
         for (previous, grid) in [(None, &first), (Some(&first), &second)] {
             let message = encoder
@@ -607,8 +650,8 @@ mod tests {
             cell.glyph = Glyph::from_cluster("o\u{308}");
         }
 
-        let mut encoder = FrameEncoder;
-        let mut decoder = FrameDecoder;
+        let mut encoder = FrameEncoder::default();
+        let mut decoder = FrameDecoder::default();
         let mut client = None;
         for (previous, grid) in [(None, &first), (Some(&first), &second)] {
             let message = encoder.update(previous, grid).unwrap();
@@ -651,8 +694,8 @@ mod tests {
         let mut next_random = |bound: usize| random.next(bound);
         let mut first_line = 0;
         let mut server = editor_grid(&lines, first_line);
-        let mut encoder = FrameEncoder;
-        let mut decoder = FrameDecoder;
+        let mut encoder = FrameEncoder::default();
+        let mut decoder = FrameDecoder::default();
         let mut client = None;
         decoder.apply(&mut client, &encoder.update(None, &server).unwrap());
         for _ in 0..300 {
@@ -684,5 +727,28 @@ mod tests {
             assert_eq!(mirrored.cursor_shape, next.cursor_shape);
             server = next;
         }
+    }
+
+    #[test]
+    fn a_full_color_table_starts_over_with_a_full_frame() {
+        let mut grid = CellGrid::new(80, 60, Rgb::default());
+        for (index, cell) in grid.cells.iter_mut().enumerate() {
+            cell.glyph = 'x'.into();
+            cell.fg = Rgb::new(index as u8, (index >> 8) as u8, 9);
+        }
+        let mut encoder = FrameEncoder::default();
+        let mut decoder = FrameDecoder::default();
+        let mut client = None;
+        decoder.apply(&mut client, &encoder.update(None, &grid).unwrap());
+        assert_looks_like(client.as_ref().unwrap(), &grid);
+
+        let mut next = grid.clone();
+        if let Some(cell) = next.cell_mut(0, 0) {
+            cell.glyph = 'y'.into();
+        }
+        let update = encoder.update(Some(&grid), &next).unwrap();
+        assert!(matches!(update, ServerMessage::FullFrame(..)));
+        decoder.apply(&mut client, &update);
+        assert_looks_like(client.as_ref().unwrap(), &next);
     }
 }

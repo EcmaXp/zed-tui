@@ -561,7 +561,7 @@ impl<W: Write> Renderer<W> {
             },
             grid: None,
             drawn_size: None,
-            decoder: FrameDecoder,
+            decoder: FrameDecoder::default(),
         }
     }
 
@@ -1825,7 +1825,7 @@ mod tests {
     fn full_frame(cols: u16, rows: u16) -> RenderEvent {
         let mut grid = CellGrid::new(cols, rows, Rgb::new(40, 44, 52));
         text_row(&mut grid, 0, 0, "hello");
-        let mut encoder = crate::tui::protocol::FrameEncoder;
+        let mut encoder = crate::tui::protocol::FrameEncoder::default();
         RenderEvent::Server(encoder.update(None, &grid).unwrap())
     }
 
