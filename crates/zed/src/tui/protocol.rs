@@ -171,30 +171,67 @@ mod wire_cursor {
     }
 }
 
+#[derive(Default)]
+pub struct MessageWriter {
+    buffer: Vec<u8>,
+}
+
+impl MessageWriter {
+    pub fn push<T: Serialize>(&mut self, message: &T) -> Result<()> {
+        let start = self.buffer.len();
+        self.buffer.extend_from_slice(&[0; 4]);
+        if let Err(error) = ciborium::into_writer(message, &mut self.buffer) {
+            self.buffer.truncate(start);
+            return Err(error).context("encoding message");
+        }
+        let len = self.buffer.len() - start - 4;
+        let Some(len) = u32::try_from(len).ok().filter(|_| len <= MAX_MESSAGE_LEN) else {
+            self.buffer.truncate(start);
+            bail!("message of {len} bytes exceeds the limit");
+        };
+        if let Some(prefix) = self.buffer.get_mut(start..start + 4) {
+            prefix.copy_from_slice(&len.to_le_bytes());
+        }
+        Ok(())
+    }
+
+    pub fn flush(&mut self, writer: &mut impl Write) -> Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let result = writer.write_all(&self.buffer);
+        self.buffer.clear();
+        Ok(result?)
+    }
+}
+
+#[derive(Default)]
+pub struct MessageReader {
+    body: Vec<u8>,
+}
+
+impl MessageReader {
+    pub fn read<T: DeserializeOwned>(&mut self, reader: &mut impl Read) -> Result<T> {
+        let mut len = [0; 4];
+        reader.read_exact(&mut len)?;
+        let len = u32::from_le_bytes(len) as usize;
+        if len > MAX_MESSAGE_LEN {
+            bail!("message of {len} bytes exceeds the limit");
+        }
+        self.body.resize(len, 0);
+        reader.read_exact(&mut self.body)?;
+        ciborium::from_reader(self.body.as_slice()).context("decoding message")
+    }
+}
+
 pub fn write_message<T: Serialize>(writer: &mut impl Write, message: &T) -> Result<()> {
-    let mut body = Vec::new();
-    ciborium::into_writer(message, &mut body).context("encoding message")?;
-    let Some(len) = u32::try_from(body.len())
-        .ok()
-        .filter(|_| body.len() <= MAX_MESSAGE_LEN)
-    else {
-        bail!("message of {} bytes exceeds the limit", body.len());
-    };
-    writer.write_all(&len.to_le_bytes())?;
-    writer.write_all(&body)?;
-    Ok(())
+    let mut message_writer = MessageWriter::default();
+    message_writer.push(message)?;
+    message_writer.flush(writer)
 }
 
 pub fn read_message<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T> {
-    let mut len = [0; 4];
-    reader.read_exact(&mut len)?;
-    let len = u32::from_le_bytes(len) as usize;
-    if len > MAX_MESSAGE_LEN {
-        bail!("message of {len} bytes exceeds the limit");
-    }
-    let mut body = vec![0; len];
-    reader.read_exact(&mut body)?;
-    ciborium::from_reader(body.as_slice()).context("decoding message")
+    MessageReader::default().read(reader)
 }
 
 fn underline_color(cell: &Cell) -> Option<u32> {

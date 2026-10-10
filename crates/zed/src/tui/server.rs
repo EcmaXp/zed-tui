@@ -36,8 +36,8 @@ use workspace::{AppState, MultiWorkspace};
 use crate::tui::{
     input::{InputTranslator, Translated},
     protocol::{
-        ClientMessage, FrameEncoder, PROTOCOL_VERSION, ServerMessage, TermEvent, WAIT_ONLY_SIZE,
-        read_message, write_message,
+        ClientMessage, FrameEncoder, MessageReader, MessageWriter, PROTOCOL_VERSION, ServerMessage,
+        TermEvent, WAIT_ONLY_SIZE, read_message, write_message,
     },
 };
 
@@ -822,8 +822,9 @@ fn read_from_client(
     hub: &ClientHub,
     events: &UnboundedSender<ServerEvent>,
 ) -> bool {
+    let mut message_reader = MessageReader::default();
     loop {
-        let event = match read_message(&mut reader) {
+        let event = match message_reader.read(&mut reader) {
             Ok(ClientMessage::Input(event)) => {
                 if matches!(event, TermEvent::Mouse { .. }) {
                     hub.claim_pointer(id);
@@ -861,14 +862,27 @@ fn write_to_client(mut stream: UnixStream, receiver: mpsc::Receiver<Outgoing>) {
 }
 
 fn send_to_client(stream: &mut UnixStream, receiver: mpsc::Receiver<Outgoing>) {
+    let mut writer = MessageWriter::default();
     let encoder = FrameEncoder;
-    while let Ok(outgoing) = receiver.recv() {
-        let message = match outgoing {
-            Outgoing::Frame(grid) => encoder.full_frame(&grid),
-            Outgoing::Message(message) => message,
-        };
-        let is_shutdown = matches!(message, ServerMessage::Shutdown);
-        if write_message(stream, &message).is_err() || is_shutdown {
+    let mut newest_frame: Option<Arc<CellGrid>> = None;
+    while let Ok(first) = receiver.recv() {
+        for outgoing in std::iter::once(first).chain(receiver.try_iter()) {
+            match outgoing {
+                Outgoing::Frame(grid) => newest_frame = Some(grid),
+                Outgoing::Message(message) => {
+                    let is_shutdown = matches!(message, ServerMessage::Shutdown);
+                    writer.push(&message).log_err();
+                    if is_shutdown {
+                        writer.flush(stream).ok();
+                        return;
+                    }
+                }
+            }
+        }
+        if let Some(grid) = newest_frame.take() {
+            writer.push(&encoder.full_frame(&grid)).log_err();
+        }
+        if writer.flush(stream).is_err() {
             return;
         }
     }

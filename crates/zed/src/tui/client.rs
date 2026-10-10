@@ -1,7 +1,11 @@
 use std::{
+    fs::File,
     io::{self, BufReader, Write},
     ops::Range,
-    os::{fd::RawFd, unix::net::UnixStream},
+    os::{
+        fd::{AsFd as _, RawFd},
+        unix::net::UnixStream,
+    },
     path::Path,
     sync::{Arc, OnceLock, mpsc},
     thread,
@@ -15,8 +19,8 @@ use gpui_tui::{Cell, CellAttrs, CellGrid, CursorShape, Glyph, Rgb};
 use parking_lot::Mutex;
 
 use crate::tui::protocol::{
-    ClientMessage, FrameDecoder, KeyCode, MouseAction, MouseButtonKind, PROTOCOL_VERSION,
-    ServerMessage, TermEvent, WAIT_ONLY_SIZE, read_message, write_message,
+    ClientMessage, FrameDecoder, KeyCode, MessageReader, MessageWriter, MouseAction,
+    MouseButtonKind, PROTOCOL_VERSION, ServerMessage, TermEvent, WAIT_ONLY_SIZE, write_message,
 };
 const PUSH_TITLE: &str = "\x1b[22;0t";
 const POP_TITLE: &str = "\x1b[23;0t";
@@ -713,6 +717,33 @@ enum ClientEvent {
     Exit(Exit),
 }
 
+struct TerminalOutput {
+    buffer: Vec<u8>,
+    terminal: File,
+}
+
+impl TerminalOutput {
+    fn stdout() -> io::Result<Self> {
+        Ok(Self {
+            buffer: Vec::with_capacity(1 << 16),
+            terminal: File::from(io::stdout().as_fd().try_clone_to_owned()?),
+        })
+    }
+}
+
+impl Write for TerminalOutput {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.buffer.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let result = self.terminal.write_all(&self.buffer);
+        self.buffer.clear();
+        result
+    }
+}
+
 fn connect(
     socket: &Path,
     (cols, rows): (u16, u16),
@@ -756,7 +787,7 @@ pub fn attach(socket: &Path, wait: Option<ClientMessage>) -> Result<Exit> {
     let mut reader = BufReader::new(stream);
 
     let guard = TerminalGuard::enter()?;
-    let mut renderer = Renderer::new(io::stdout(), cols, rows);
+    let mut renderer = Renderer::new(TerminalOutput::stdout()?, cols, rows);
     renderer.terminal.features = guard.0.features;
     let (render_sender, render_receiver) = mpsc::channel();
     thread::Builder::new()
@@ -764,7 +795,8 @@ pub fn attach(socket: &Path, wait: Option<ClientMessage>) -> Result<Exit> {
         .spawn({
             let render_sender = render_sender.clone();
             move || {
-                while let Ok(message) = read_message::<ServerMessage>(&mut reader) {
+                let mut message_reader = MessageReader::default();
+                while let Ok(message) = message_reader.read::<ServerMessage>(&mut reader) {
                     if render_sender.send(RenderEvent::Server(message)).is_err() {
                         break;
                     }
@@ -805,6 +837,7 @@ pub fn attach(socket: &Path, wait: Option<ClientMessage>) -> Result<Exit> {
         })?;
 
     let mut detach_pending = false;
+    let mut outgoing = MessageWriter::default();
     while let Ok(first) = events.recv() {
         let mut inputs = Vec::new();
         let mut resize = None;
@@ -824,11 +857,11 @@ pub fn attach(socket: &Path, wait: Option<ClientMessage>) -> Result<Exit> {
                         continue;
                     }
                     if was_pending && key.code == event::KeyCode::Char('d') {
-                        let mut socket = socket_writer.lock();
                         for input in inputs {
-                            write_message(&mut *socket, &ClientMessage::Input(input)).ok();
+                            outgoing.push(&ClientMessage::Input(input))?;
                         }
-                        write_message(&mut *socket, &ClientMessage::Detach).ok();
+                        outgoing.push(&ClientMessage::Detach)?;
+                        outgoing.flush(&mut *socket_writer.lock()).ok();
                         return Ok(Exit::Detached);
                     }
                     inputs.extend(term_key(&key));
@@ -839,16 +872,15 @@ pub fn attach(socket: &Path, wait: Option<ClientMessage>) -> Result<Exit> {
                 event::Event::FocusGained | event::Event::FocusLost => {}
             }
         }
-        let mut messages: Vec<ClientMessage> =
-            inputs.into_iter().map(ClientMessage::Input).collect();
+        for input in inputs {
+            outgoing.push(&ClientMessage::Input(input))?;
+        }
         if let Some((cols, rows)) = resize {
             render_sender.send(RenderEvent::Resized(cols, rows)).ok();
-            messages.push(ClientMessage::Resize { cols, rows });
+            outgoing.push(&ClientMessage::Resize { cols, rows })?;
         }
-        for message in &messages {
-            if write_message(&mut *socket_writer.lock(), message).is_err() {
-                return Ok(Exit::Disconnected);
-            }
+        if outgoing.flush(&mut *socket_writer.lock()).is_err() {
+            return Ok(Exit::Disconnected);
         }
     }
     Ok(Exit::Disconnected)
@@ -856,7 +888,8 @@ pub fn attach(socket: &Path, wait: Option<ClientMessage>) -> Result<Exit> {
 
 pub fn wait_without_attaching(socket: &Path, wait: ClientMessage) -> Result<Exit> {
     let mut reader = BufReader::new(connect(socket, WAIT_ONLY_SIZE, Some(wait))?);
-    while let Ok(message) = read_message::<ServerMessage>(&mut reader) {
+    let mut message_reader = MessageReader::default();
+    while let Ok(message) = message_reader.read::<ServerMessage>(&mut reader) {
         if let Some(exit) = exit_of(&message) {
             return Ok(exit);
         }
