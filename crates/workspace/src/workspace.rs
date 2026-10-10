@@ -9090,7 +9090,7 @@ impl Workspace {
     }
 }
 
-fn project_window_title(project: &Project, cx: &App) -> String {
+pub fn project_window_title(project: &Project, cx: &App) -> String {
     let mut title = String::new();
 
     for (index, worktree) in project.visible_worktrees(cx).enumerate() {

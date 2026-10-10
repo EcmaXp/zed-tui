@@ -8,6 +8,8 @@ mod protocol;
 mod server;
 #[cfg(all(unix, test))]
 mod test_support;
+#[cfg(unix)]
+mod title_bar;
 
 #[cfg(unix)]
 pub use unix::*;
@@ -59,15 +61,16 @@ mod unix {
     use anyhow::{Context as _, Result};
     use clap::{Parser, Subcommand};
     use command_palette_hooks::CommandPaletteFilter;
-    use gpui::{App, Application, UpdateGlobal as _};
+    use gpui::{App, AppContext as _, Application, UpdateGlobal as _};
     use gpui_tui::TuiPlatform;
     use settings::{
         ActiveSettingsProfileName, MergeFromTrait as _, RootUserSettings as _, SettingsAssets,
         SettingsContent, SettingsStore,
     };
     use util::{ResultExt as _, asset_str};
+    use workspace::Workspace;
 
-    use super::{client, server};
+    use super::{client, server, title_bar::TerminalTitleBar};
 
     const DEFAULT_COLS: u16 = 120;
     const DEFAULT_ROWS: u16 = 40;
@@ -232,6 +235,16 @@ mod unix {
             });
 
             platform.set_frame_sink(on_frame);
+
+            cx.observe_new(|workspace: &mut Workspace, window, cx| {
+                let Some(window) = window else {
+                    return;
+                };
+                let workspace_handle = cx.entity();
+                let title_bar = cx.new(|cx| TerminalTitleBar::new(workspace, workspace_handle, cx));
+                workspace.set_titlebar_item(title_bar.into(), window, cx);
+            })
+            .detach();
 
             after_start(cx);
         }
