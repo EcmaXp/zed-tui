@@ -19565,6 +19565,7 @@ dependencies = [
  "documented",
  "gpui",
  "gpui_macros",
+ "gpui_tui",
  "gpui_util",
  "icons",
  "itertools 0.14.0",
