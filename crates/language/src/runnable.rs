@@ -6,7 +6,10 @@ use text::BufferId;
 use tree_sitter::QueryCapture;
 use util::RangeExt;
 
-use crate::{BufferSnapshot, Language, Runnable, RunnableCapture, RunnableConfig, RunnableTag};
+use crate::{
+    BufferSnapshot, Language, Runnable, RunnableCapture, RunnableConfig, RunnableTag,
+    TreeSitterOptions,
+};
 
 pub struct RunnableRange {
     pub buffer_id: BufferId,
@@ -64,9 +67,15 @@ pub(crate) fn runnable_ranges(
     buffer: &BufferSnapshot,
     offset_range: Range<usize>,
 ) -> impl Iterator<Item = RunnableRange> + '_ {
-    let mut syntax_matches = buffer.matches(offset_range.clone(), |grammar| {
-        grammar.runnable_config.as_ref().map(|config| &config.query)
-    });
+    let mut syntax_matches = buffer.syntax.matches_with_options(
+        offset_range.clone(),
+        buffer,
+        TreeSitterOptions {
+            match_limit: Some(RUNNABLES_MATCH_LIMIT),
+            ..TreeSitterOptions::default()
+        },
+        |grammar| grammar.runnable_config.as_ref().map(|config| &config.query),
+    );
 
     let runnable_configs = syntax_matches
         .grammars()
@@ -115,6 +124,8 @@ pub(crate) fn runnable_ranges(
     })
     .flatten()
 }
+
+const RUNNABLES_MATCH_LIMIT: u32 = 256;
 
 type RunnableMatchCaptures = SmallVec<[RunnableMatchCapture; 4]>;
 
@@ -360,6 +371,7 @@ fn runnable_range_from_captures(
 
 #[cfg(test)]
 mod tests {
+    mod fork_tests;
     use super::*;
     use crate::{
         Buffer, ContextProvider, Language, LanguageConfig, LanguageMatcher, LanguageQueries,
