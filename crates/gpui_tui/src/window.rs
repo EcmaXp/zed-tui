@@ -57,6 +57,8 @@ pub(crate) struct WindowState {
 struct Floating {
     requested: Bounds<Pixels>,
     underlay: CellGrid,
+    content: Option<CellGrid>,
+    needs_composite: bool,
 }
 
 fn floating_bounds(requested: Bounds<Pixels>, display: Size<Pixels>) -> Bounds<Pixels> {
@@ -146,6 +148,8 @@ impl TuiWindow {
                     .last_delivered
                     .clone()
                     .unwrap_or_else(|| CellGrid::new(cols, rows, Rgb::default())),
+                content: None,
+                needs_composite: false,
             }
         });
         let bounds = match &floating {
@@ -264,19 +268,21 @@ impl TuiWindowHandle {
             let mut state = self.state.borrow_mut();
             let state = &mut *state;
             if let Some(floating) = &mut state.floating {
-                let mut moved = false;
                 if (floating.underlay.cols, floating.underlay.rows) != (cols, rows) {
                     floating.underlay = CellGrid::new(cols, rows, Rgb::default());
-                    moved = true;
+                    floating.needs_composite = true;
                 }
                 let bounds = floating_bounds(floating.requested, size);
                 size = bounds.size;
                 if state.bounds.origin != bounds.origin {
                     state.bounds.origin = bounds.origin;
-                    moved = true;
+                    floating.needs_composite = true;
                 }
-                if moved {
+                if floating.needs_composite {
                     self.schedule_frame();
+                }
+                if state.bounds.size != size {
+                    floating.content = None;
                 }
             }
             if state.bounds.size == size {
@@ -327,13 +333,12 @@ impl TuiWindowHandle {
     }
 
     fn draw_frame(&self) {
-        let require_presentation = self.is_floating();
         with_taken(
             &self.callbacks,
             |callbacks| &mut callbacks.request_frame,
             |callback| {
                 callback(RequestFrameOptions {
-                    require_presentation,
+                    require_presentation: false,
                     ..Default::default()
                 })
             },
@@ -353,6 +358,7 @@ impl TuiWindowHandle {
     pub(crate) fn set_underlay(&self, underlay: CellGrid) {
         if let Some(floating) = &mut self.state.borrow_mut().floating {
             floating.underlay = underlay;
+            floating.needs_composite = true;
         }
         self.schedule_frame();
     }
@@ -369,16 +375,23 @@ impl TuiWindowHandle {
                 None => return FrameOutcome::NotDrawn,
             },
             Some(floating) => {
-                let Some(content) = fresh else {
+                if fresh.is_none() && !floating.needs_composite {
+                    return FrameOutcome::NotDrawn;
+                }
+                floating.needs_composite = false;
+                if let Some(grid) = fresh {
+                    floating.content = Some(grid);
+                }
+                let Some(content) = &floating.content else {
                     return FrameOutcome::NotDrawn;
                 };
                 let origin = CursorPosition {
                     col: (state.bounds.origin.x.as_f32() / CELL_WIDTH) as u16,
                     row: (state.bounds.origin.y.as_f32() / CELL_HEIGHT) as u16,
                 };
-                let bar = floating_bar(&content, state.outputs.canvas.get());
+                let bar = floating_bar(content, state.outputs.canvas.get());
                 let mut screen = floating.underlay.clone();
-                screen.overlay_with_left_bar(&content, origin, bar);
+                screen.overlay_with_left_bar(content, origin, bar);
                 screen
             }
         };
