@@ -17,6 +17,8 @@ const OPAQUE_ALPHA: f32 = 0.9;
 const MIN_BOXED_ROWS: usize = 2;
 const MIN_RULED_ROWS: usize = 3;
 const MIN_LINE_CONTRAST: u32 = 12;
+const CONTIGUOUS_EPSILON: f32 = 0.5;
+const SAME_LINE_TOLERANCE: f32 = 3.;
 
 fn to_bounds(bounds: &Bounds<ScaledPixels>) -> Bounds<f32> {
     bounds.map(|value| value.0)
@@ -64,9 +66,19 @@ fn cell_of(x: f32, y: f32) -> (i32, i32) {
     )
 }
 
+#[derive(Default)]
+struct RasterScratch {
+    candidates: Vec<TextCandidate>,
+    placements: Vec<Option<Placement>>,
+    line_cursors: Vec<LineCursor>,
+}
+
 pub(crate) fn rasterize_scene(scene: &Scene, atlas: &TuiAtlas, cols: u16, rows: u16) -> CellGrid {
+    let scratch = &mut RasterScratch::default();
+    layout_text(scene, atlas, scratch);
     let mut rasterizer = Rasterizer {
         grid: CellGrid::new(cols, rows, Rgb::default()),
+        scratch,
     };
     for batch in scene.batches() {
         match batch {
@@ -81,8 +93,8 @@ pub(crate) fn rasterize_scene(scene: &Scene, atlas: &TuiAtlas, cols: u16, rows: 
                 }
             }
             PrimitiveBatch::MonochromeSprites { range, .. } => {
-                for sprite in scene.monochrome_sprites.get(range).unwrap_or(&[]) {
-                    rasterizer.sprite(sprite, atlas);
+                for index in range {
+                    rasterizer.sprite(index);
                 }
             }
             PrimitiveBatch::Shadows(_)
@@ -95,6 +107,8 @@ pub(crate) fn rasterize_scene(scene: &Scene, atlas: &TuiAtlas, cols: u16, rows: 
     rasterizer.grid
 }
 
+type SpriteId = usize;
+
 #[derive(Clone, Copy)]
 struct Placement {
     col: i32,
@@ -104,7 +118,24 @@ struct Placement {
     attrs: CellAttrs,
 }
 
-fn placement(sprite: &MonochromeSprite, atlas: &TuiAtlas) -> Option<Placement> {
+struct LineCursor {
+    center_y: f32,
+    right: f32,
+    next_col: i32,
+}
+
+struct TextCandidate {
+    id: SpriteId,
+    bounds: Bounds<f32>,
+    center_y: f32,
+    placement: Placement,
+}
+
+fn text_candidate(
+    id: SpriteId,
+    sprite: &MonochromeSprite,
+    atlas: &TuiAtlas,
+) -> Option<TextCandidate> {
     let key = atlas.key_for(sprite.tile.tile_id)?;
     let bounds = to_bounds(&sprite.bounds);
     let mask = to_bounds(&sprite.content_mask.bounds);
@@ -133,20 +164,87 @@ fn placement(sprite: &MonochromeSprite, atlas: &TuiAtlas) -> Option<Placement> {
         return None;
     }
     let color = sprite.color.to_rgb();
-    Some(Placement {
-        col,
-        row,
-        glyph,
-        color,
-        attrs,
+    Some(TextCandidate {
+        id,
+        bounds,
+        center_y: center.y,
+        placement: Placement {
+            col,
+            row,
+            glyph,
+            color,
+            attrs,
+        },
     })
 }
 
-struct Rasterizer {
-    grid: CellGrid,
+fn layout_text(scene: &Scene, atlas: &TuiAtlas, scratch: &mut RasterScratch) {
+    let RasterScratch {
+        candidates,
+        placements,
+        line_cursors,
+        ..
+    } = scratch;
+    candidates.extend(
+        scene
+            .monochrome_sprites
+            .iter()
+            .enumerate()
+            .filter_map(|(id, sprite)| text_candidate(id, sprite, atlas)),
+    );
+    candidates.sort_unstable_by(|a, b| {
+        a.placement
+            .row
+            .cmp(&b.placement.row)
+            .then(a.bounds.left().total_cmp(&b.bounds.left()))
+            .then(a.id.cmp(&b.id))
+    });
+
+    placements.resize(scene.monochrome_sprites.len(), None);
+    let mut current_row = None;
+    for candidate in candidates.iter() {
+        let row = candidate.placement.row;
+        if current_row != Some(row) {
+            line_cursors.clear();
+            current_row = Some(row);
+        }
+        let natural_col = candidate.placement.col;
+        let line = line_cursors
+            .iter_mut()
+            .find(|line| (line.center_y - candidate.center_y).abs() <= SAME_LINE_TOLERANCE);
+        let col = match &line {
+            Some(line) if (candidate.bounds.left() - line.right).abs() < CONTIGUOUS_EPSILON => {
+                line.next_col
+            }
+            Some(line) if candidate.bounds.left() > line.right && natural_col <= line.next_col => {
+                line.next_col + 1
+            }
+            _ => natural_col,
+        };
+        let cursor = LineCursor {
+            center_y: candidate.center_y,
+            right: candidate.bounds.right(),
+            next_col: col + candidate.placement.glyph.cells() as i32,
+        };
+        match line {
+            Some(line) => *line = cursor,
+            None => line_cursors.push(cursor),
+        }
+        if let Some(slot) = placements.get_mut(candidate.id) {
+            *slot = Some(Placement {
+                col,
+                ..candidate.placement
+            });
+        }
+    }
 }
 
-impl Rasterizer {
+struct Rasterizer<'a> {
+    grid: CellGrid,
+    scratch: &'a mut RasterScratch,
+}
+
+impl Rasterizer<'_> {
     fn quad(&mut self, quad: &Quad) {
         let Some(rect) = clipped(&quad.bounds, &quad.content_mask) else {
             return;
@@ -311,8 +409,8 @@ impl Rasterizer {
         }
     }
 
-    fn sprite(&mut self, sprite: &MonochromeSprite, atlas: &TuiAtlas) {
-        if let Some(placement) = placement(sprite, atlas) {
+    fn sprite(&mut self, id: SpriteId) {
+        if let Some(placement) = self.scratch.placements.get(id).copied().flatten() {
             self.put_char(
                 placement.col,
                 placement.row,
@@ -563,6 +661,38 @@ mod tests {
     }
 
     #[test]
+    fn small_gaps_between_text_runs_keep_a_blank_cell() {
+        let atlas = TuiAtlas::default();
+        let mut scene = Scene::default();
+        let name_start = 13.;
+        let path_start = name_start + 16. + 2.5;
+        let glyphs = [
+            ('d', path_start + 8.),
+            ('b', name_start + 8.),
+            ('c', path_start),
+            ('a', name_start),
+        ];
+        for (ch, x) in glyphs {
+            scene.insert_primitive(glyph_sprite(&atlas, ch, x));
+        }
+        scene.finish();
+        let grid = rasterize(&scene, &atlas, 8, 1);
+        assert_eq!(grid.row_text(0), "  ab cd ");
+    }
+
+    #[test]
+    fn contiguous_runs_stay_adjacent() {
+        let atlas = TuiAtlas::default();
+        let mut scene = Scene::default();
+        for (index, ch) in "abcd".chars().enumerate() {
+            scene.insert_primitive(glyph_sprite(&atlas, ch, 5. + index as f32 * 8.));
+        }
+        scene.finish();
+        let grid = rasterize(&scene, &atlas, 6, 1);
+        assert_eq!(grid.row_text(0), " abcd ");
+    }
+
+    #[test]
     fn content_mask_clips_glyphs() {
         let atlas = TuiAtlas::default();
         let mut scene = Scene::default();
@@ -577,6 +707,23 @@ mod tests {
         scene.finish();
         let grid = rasterize(&scene, &atlas, 4, 1);
         assert_eq!(grid.row_text(0), "a   ");
+    }
+
+    #[test]
+    fn overlapping_lines_on_one_row_keep_their_own_columns() {
+        let atlas = TuiAtlas::default();
+        let mut scene = Scene::default();
+        let mut scrolled = glyph_sprite(&atlas, 'x', 10.);
+        scrolled.bounds.origin.y = ScaledPixels(-2.);
+        scene.insert_primitive(scrolled);
+        scene.push_layer(scaled_bounds(0., 0., 48., 16.));
+        for (index, ch) in "zed".chars().enumerate() {
+            scene.insert_primitive(glyph_sprite(&atlas, ch, 19. + index as f32 * 8.));
+        }
+        scene.pop_layer();
+        scene.finish();
+        let grid = rasterize(&scene, &atlas, 6, 1);
+        assert_eq!(grid.row_text(0), " xzed ");
     }
 
     #[test]
