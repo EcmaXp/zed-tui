@@ -1307,6 +1307,8 @@ struct Renderer<W: Write> {
     grid: Option<CellGrid>,
     screen: Option<CellGrid>,
     decoder: FrameDecoder,
+    frames_since_render: usize,
+    server_moves: Vec<GridScroll>,
     moved: Option<CellGrid>,
 }
 
@@ -1329,6 +1331,8 @@ impl<W: Write> Renderer<W> {
             grid: None,
             screen: None,
             decoder: FrameDecoder::default(),
+            frames_since_render: 0,
+            server_moves: Vec::new(),
             moved: None,
         }
     }
@@ -1336,7 +1340,8 @@ impl<W: Write> Renderer<W> {
     fn apply(&mut self, message: &ServerMessage) -> io::Result<bool> {
         match message {
             ServerMessage::FullFrame(..) | ServerMessage::Diff(..) => {
-                self.decoder.apply(&mut self.grid, message);
+                self.server_moves = self.decoder.apply(&mut self.grid, message);
+                self.frames_since_render += 1;
                 return Ok(true);
             }
             ServerMessage::Clipboard(text) => self.copy_to_clipboard(text)?,
@@ -1362,6 +1367,8 @@ impl<W: Write> Renderer<W> {
     }
 
     fn render(&mut self) -> io::Result<()> {
+        let frames_since_render = std::mem::take(&mut self.frames_since_render);
+        let server_moves = std::mem::take(&mut self.server_moves);
         let Some(grid) = &self.grid else {
             return Ok(());
         };
@@ -1379,6 +1386,9 @@ impl<W: Write> Renderer<W> {
         let force_synchronize = !was_in_sync;
         let visible_cols = (grid.cols.min(terminal.cols)) as usize;
         let visible_rows = grid.rows.min(terminal.rows) as usize;
+        let shows_whole_grid =
+            visible_cols == grid.cols as usize && visible_rows == grid.rows as usize;
+        let trusts_server_moves = was_in_sync && shows_whole_grid && frames_since_render == 1;
         let move_screen = |scroll: &GridScroll, screen: &mut CellGrid| {
             scroll.apply(screen, unknown_cell());
             for row in scroll.exposed_rows() {
@@ -1386,19 +1396,28 @@ impl<W: Write> Renderer<W> {
                 assume_erased(screen.row_mut(row), grid.row(row));
             }
         };
-        let moves = find_moves(
-            &screen,
-            grid,
-            visible_rows,
-            visible_cols,
-            &mut self.moved,
-            move_screen,
-        );
-        if !moves.is_empty()
-            && let Some(moved) = &mut self.moved
-        {
-            std::mem::swap(&mut screen, moved);
-        }
+        let server_moves_fit = server_moves.iter().all(|scroll| scroll.fits(visible_rows));
+        let moves = if trusts_server_moves && server_moves_fit {
+            for scroll in &server_moves {
+                move_screen(scroll, &mut screen);
+            }
+            server_moves
+        } else {
+            let moves = find_moves(
+                &screen,
+                grid,
+                visible_rows,
+                visible_cols,
+                &mut self.moved,
+                move_screen,
+            );
+            if !moves.is_empty()
+                && let Some(moved) = &mut self.moved
+            {
+                std::mem::swap(&mut screen, moved);
+            }
+            moves
+        };
         for scroll in &moves {
             terminal.scroll(scroll)?;
         }
@@ -2704,6 +2723,50 @@ mod tests {
         assert!(result.is_ok());
         assert!(undo.contains(POP_KEYBOARD_FLAGS));
         assert!(undo.contains(LEAVE_ALTERNATE_SCREEN) && undo.ends_with(POP_TITLE));
+    }
+
+    #[test]
+    fn scrolls_from_the_server_are_drawn_without_a_second_search() {
+        let mut encoder = crate::tui::protocol::FrameEncoder::default();
+        let mut renderer = Renderer::new(Vec::new(), 60, 14);
+        let mut emulator = Emulator::new(60, 14);
+        let first = editor_frame(0);
+        renderer
+            .apply(&encoder.update(None, &first).unwrap())
+            .unwrap();
+        emulator.feed(&mut renderer);
+
+        let second = editor_frame(3);
+        let update = encoder.update(Some(&first), &second).unwrap();
+        assert!(matches!(&update, ServerMessage::Diff(_, moves, _, _) if moves.len() == 1));
+        renderer.apply(&update).unwrap();
+        assert_eq!(renderer.server_moves.len(), 1);
+        renderer.render().unwrap();
+        let output = output_text(&renderer);
+        assert!(output.contains("\x1b[2;13r\x1b[3S"), "{output:?}");
+        emulator.feed(&mut renderer);
+        emulator.assert_shows(&second, 60);
+    }
+
+    #[test]
+    fn server_scrolls_the_terminal_would_ignore_are_redrawn_instead() {
+        let mut renderer = Renderer::new(Vec::new(), 60, 14);
+        let mut emulator = Emulator::new(60, 14);
+        renderer.grid = Some(editor_frame(0));
+        emulator.feed(&mut renderer);
+
+        renderer.grid = Some(editor_frame(3));
+        renderer.frames_since_render = 1;
+        renderer.server_moves = vec![GridScroll {
+            top: 2,
+            bottom: 3,
+            shift: 1,
+        }];
+        renderer.render().unwrap();
+        let output = output_text(&renderer);
+        assert!(!output.contains("\x1b[3;3r"), "{output:?}");
+        emulator.feed(&mut renderer);
+        emulator.assert_shows(&editor_frame(3), 60);
     }
 
     #[test]

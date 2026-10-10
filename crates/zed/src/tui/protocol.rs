@@ -11,7 +11,7 @@ use gpui_tui::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::tui::frame_diff::changed_ranges;
+use crate::tui::frame_diff::{GridScroll, changed_ranges, find_moves};
 
 pub const PROTOCOL_VERSION: u32 = 15;
 pub const WAIT_ONLY_SIZE: (u16, u16) = (0, 0);
@@ -204,6 +204,28 @@ pub struct Span(u32, u32, u8, String, Option<u32>);
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RowPatch(u16, u16, Vec<Span>);
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireScroll(u16, u16, i16);
+
+impl WireScroll {
+    fn from_grid(scroll: &GridScroll) -> Self {
+        Self(scroll.top as u16, scroll.bottom as u16, scroll.shift as i16)
+    }
+
+    pub(crate) fn to_grid(&self) -> GridScroll {
+        let WireScroll(top, bottom, shift) = self;
+        GridScroll {
+            top: *top as usize,
+            bottom: *bottom as usize,
+            shift: *shift as isize,
+        }
+    }
+}
+
+fn scroll_fill() -> Cell {
+    Cell::blank(Rgb::default())
+}
+
 pub type FrameCursor = Option<(CursorPosition, CursorShape)>;
 
 fn frame_cursor(grid: &CellGrid) -> FrameCursor {
@@ -228,6 +250,7 @@ pub enum ServerMessage {
     #[serde(rename = "d")]
     Diff(
         Vec<u32>,
+        Vec<WireScroll>,
         Vec<RowPatch>,
         #[serde(with = "wire_cursor")] FrameCursor,
     ),
@@ -469,6 +492,7 @@ fn decode_spans<'a>(
 #[derive(Default)]
 pub struct FrameEncoder {
     colors: HashMap<u32, u32>,
+    scrolled: Option<CellGrid>,
 }
 
 impl FrameEncoder {
@@ -512,20 +536,37 @@ impl FrameEncoder {
             }
             _ => return Some(self.full_frame(next)),
         };
+        let moves = find_moves(
+            previous,
+            next,
+            next.rows as usize,
+            next.cols as usize,
+            &mut self.scrolled,
+            |scroll, grid| scroll.apply(grid, scroll_fill()),
+        );
+        let base = match &self.scrolled {
+            Some(scrolled) if !moves.is_empty() => scrolled,
+            _ => previous,
+        };
         let mut patches = Vec::new();
         for row in 0..next.rows {
             let cells = next.row(row);
-            for range in changed_ranges(previous.row(row), cells, PATCH_MERGE_GAP) {
+            for range in changed_ranges(base.row(row), cells, PATCH_MERGE_GAP) {
                 if let Some(changed) = cells.get(range.clone()) {
                     patches.push(RowPatch(row, range.start as u16, encode_cells(changed)));
                 }
             }
         }
-        if patches.is_empty() && frame_cursor(previous) == frame_cursor(next) {
+        if moves.is_empty() && patches.is_empty() && frame_cursor(previous) == frame_cursor(next) {
             return None;
         }
         let colors = self.index_colors(&mut patches);
-        Some(ServerMessage::Diff(colors, patches, frame_cursor(next)))
+        Some(ServerMessage::Diff(
+            colors,
+            moves.iter().map(WireScroll::from_grid).collect(),
+            patches,
+            frame_cursor(next),
+        ))
     }
 }
 
@@ -551,7 +592,11 @@ impl FrameDecoder {
         }
     }
 
-    pub fn apply(&mut self, grid: &mut Option<CellGrid>, message: &ServerMessage) {
+    pub fn apply(
+        &mut self,
+        grid: &mut Option<CellGrid>,
+        message: &ServerMessage,
+    ) -> Vec<GridScroll> {
         match message {
             ServerMessage::FullFrame(cols, rows, colors, patches, cursor) => {
                 self.colors = colors.clone();
@@ -559,20 +604,26 @@ impl FrameDecoder {
                 self.apply_patches(&mut frame, patches);
                 set_frame_cursor(&mut frame, *cursor);
                 *grid = Some(frame);
+                Vec::new()
             }
-            ServerMessage::Diff(colors, patches, cursor) => {
+            ServerMessage::Diff(colors, moves, patches, cursor) => {
                 self.colors.extend_from_slice(colors);
+                let moves: Vec<GridScroll> = moves.iter().map(WireScroll::to_grid).collect();
                 if let Some(grid) = grid {
+                    for scroll in &moves {
+                        scroll.apply(grid, scroll_fill());
+                    }
                     self.apply_patches(grid, patches);
                     set_frame_cursor(grid, *cursor);
                 }
+                moves
             }
             ServerMessage::Clipboard(_)
             | ServerMessage::Title(_)
             | ServerMessage::Pointer(_)
             | ServerMessage::Shutdown
             | ServerMessage::Error(_)
-            | ServerMessage::WaitFinished { .. } => {}
+            | ServerMessage::WaitFinished { .. } => Vec::new(),
         }
     }
 }
@@ -757,7 +808,7 @@ mod tests {
 
         let diff = encoder.update(Some(&first), &second).unwrap();
         match &diff {
-            ServerMessage::Diff(_, patches, _) => {
+            ServerMessage::Diff(_, _, patches, _) => {
                 assert_eq!(patches.len(), 1);
                 assert_eq!(patches[0].0, 2);
             }
@@ -870,6 +921,41 @@ mod tests {
     }
 
     #[test]
+    fn scrolled_frames_send_a_scroll_instead_of_every_row() {
+        let lines = source_lines(200, 11);
+        let first = editor_grid(&lines, 0);
+        let second = editor_grid(&lines, 3);
+        let full_size = {
+            let mut buffer = Vec::new();
+            write_message(&mut buffer, &FrameEncoder::default().full_frame(&second)).unwrap();
+            buffer.len()
+        };
+
+        let mut encoder = FrameEncoder::default();
+        let mut decoder = FrameDecoder::default();
+        let mut client = None;
+        decoder.apply(&mut client, &encoder.update(None, &first).unwrap());
+        let update = encoder.update(Some(&first), &second).unwrap();
+        let ServerMessage::Diff(_, moves, _, _) = &update else {
+            panic!("expected a diff, got {update:?}");
+        };
+        assert_eq!(moves.len(), 1, "{moves:?}");
+        let scroll = moves[0].to_grid();
+        assert_eq!((scroll.top, scroll.bottom, scroll.shift), (1, 13, 3));
+
+        let mut buffer = Vec::new();
+        write_message(&mut buffer, &update).unwrap();
+        assert!(
+            buffer.len() * 3 < full_size,
+            "{} bytes vs {full_size}",
+            buffer.len()
+        );
+
+        decoder.apply(&mut client, &update);
+        assert_looks_like(client.as_ref().unwrap(), &second);
+    }
+
+    #[test]
     fn random_scrolls_and_edits_reproduce_every_frame() {
         let lines = source_lines(200, 11);
         let mut random = Random::new(7);
@@ -879,6 +965,7 @@ mod tests {
         let mut encoder = FrameEncoder::default();
         let mut decoder = FrameDecoder::default();
         let mut client = None;
+        let mut sent_scrolls = 0;
         decoder.apply(&mut client, &encoder.update(None, &server).unwrap());
         for _ in 0..300 {
             first_line = (first_line + next_random(9))
@@ -898,6 +985,9 @@ mod tests {
             next.cursor_shape =
                 [CursorShape::Bar, CursorShape::Block, CursorShape::Underline][next_random(3)];
             if let Some(update) = encoder.update(Some(&server), &next) {
+                if matches!(&update, ServerMessage::Diff(_, moves, _, _) if !moves.is_empty()) {
+                    sent_scrolls += 1;
+                }
                 let mut buffer = Vec::new();
                 write_message(&mut buffer, &update).unwrap();
                 let update: ServerMessage = read_message(&mut buffer.as_slice()).unwrap();
@@ -909,6 +999,7 @@ mod tests {
             assert_eq!(mirrored.cursor_shape, next.cursor_shape);
             server = next;
         }
+        assert!(sent_scrolls > 50, "only {sent_scrolls} scrolls were sent");
     }
 
     #[test]
