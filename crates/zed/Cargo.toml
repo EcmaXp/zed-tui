@@ -287,6 +287,7 @@ repl = { workspace = true, features = ["test-support"] }
 alacritty_terminal.workspace = true
 rand.workspace = true
 tempfile.workspace = true
+unicode-width.workspace = true
 
 
 [package.metadata.bundle-dev]

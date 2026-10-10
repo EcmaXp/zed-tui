@@ -1,6 +1,8 @@
 #[cfg(unix)]
 mod client;
 #[cfg(unix)]
+mod icon_glyphs;
+#[cfg(unix)]
 mod input;
 #[cfg(unix)]
 mod protocol;
@@ -78,7 +80,9 @@ mod unix {
     use util::{ResultExt as _, asset_str};
     use workspace::Workspace;
 
-    use super::{client, protocol::ClientMessage, server, title_bar::TerminalTitleBar};
+    use super::{
+        client, icon_glyphs, protocol::ClientMessage, server, title_bar::TerminalTitleBar,
+    };
 
     const DEFAULT_COLS: u16 = 120;
     const DEFAULT_ROWS: u16 = 40;
@@ -486,6 +490,7 @@ mod unix {
             });
 
             let default_colors: Rc<RefCell<DefaultColors>> = Rc::default();
+            platform.set_icon_glyphs(icon_glyphs::icon_glyphs());
             platform.set_frame_sink({
                 let default_colors = default_colors.clone();
                 move |mut grid: CellGrid| {

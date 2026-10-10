@@ -23011,6 +23011,7 @@ dependencies = [
  "tracing",
  "ui",
  "ui_prompt",
+ "unicode-width 0.2.2",
  "url",
  "urlencoding",
  "util",
