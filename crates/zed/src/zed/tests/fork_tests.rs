@@ -1,6 +1,178 @@
 use super::*;
 use pretty_assertions::assert_eq;
 
+fn count_notifications<T: 'static>(
+    entity: &Entity<T>,
+    cx: &mut TestAppContext,
+) -> (std::rc::Rc<std::cell::Cell<usize>>, gpui::Subscription) {
+    let count = std::rc::Rc::new(std::cell::Cell::new(0));
+    let subscription = cx.update(|cx| {
+        let count = count.clone();
+        cx.observe(entity, move |_, _| count.set(count.get() + 1))
+    });
+    (count, subscription)
+}
+
+#[gpui::test]
+async fn test_status_items_notify_only_when_their_state_changes(cx: &mut TestAppContext) {
+    let app_state = init_test(cx);
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(path!("/root"), json!({"a.txt": "one\ntwo\n"}))
+        .await;
+    cx.update(|cx| {
+        open_paths(
+            &[PathBuf::from(path!("/root/a.txt"))],
+            app_state.clone(),
+            workspace::OpenOptions::default(),
+            cx,
+        )
+    })
+    .await
+    .unwrap();
+    cx.run_until_parked();
+
+    let window = cx.update(|cx| cx.windows()[0].downcast::<MultiWorkspace>().unwrap());
+    let (editor, status_bar) = window
+        .read_with(cx, |multi_workspace, cx| {
+            let workspace = multi_workspace.workspace().read(cx);
+            (
+                workspace
+                    .active_item(cx)
+                    .unwrap()
+                    .downcast::<Editor>()
+                    .unwrap(),
+                workspace.status_bar().clone(),
+            )
+        })
+        .unwrap();
+    let buffer = cx.read(|cx| editor.read(cx).active_buffer(cx).unwrap());
+    let (line_ending, language, encoding, edit_prediction) = cx.read(|cx| {
+        let status_bar = status_bar.read(cx);
+        (
+            status_bar
+                .item_of_type::<line_ending_selector::LineEndingIndicator>()
+                .unwrap(),
+            status_bar
+                .item_of_type::<language_selector::ActiveBufferLanguage>()
+                .unwrap(),
+            status_bar
+                .item_of_type::<encoding_selector::ActiveBufferEncoding>()
+                .unwrap(),
+            status_bar
+                .item_of_type::<edit_prediction_ui::EditPredictionButton>()
+                .unwrap(),
+        )
+    });
+    let notify_editor = |cx: &mut TestAppContext| {
+        editor.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+    };
+
+    window
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| editor.insert("x", window, cx))
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let (line_ending_count, _line_ending_subscription) = count_notifications(&line_ending, cx);
+    let (language_count, _language_subscription) = count_notifications(&language, cx);
+    let (encoding_count, _encoding_subscription) = count_notifications(&encoding, cx);
+    let (edit_prediction_count, _edit_prediction_subscription) =
+        count_notifications(&edit_prediction, cx);
+    let counts = || {
+        [
+            line_ending_count.get(),
+            language_count.get(),
+            encoding_count.get(),
+            edit_prediction_count.get(),
+        ]
+    };
+    let changes_since = |before: [usize; 4]| {
+        let after = counts();
+        [0, 1, 2, 3].map(|index| after[index] - before[index])
+    };
+
+    let before = counts();
+    window
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.insert("abc", window, cx);
+                editor.move_left(&editor::actions::MoveLeft, window, cx);
+                editor.insert("y", window, cx);
+            })
+        })
+        .unwrap();
+    notify_editor(cx);
+    assert_eq!(
+        changes_since(before),
+        [0, 0, 0, 0],
+        "edits and cursor moves that leave an item's state unchanged must not notify it"
+    );
+
+    let before = counts();
+    buffer.update(cx, |buffer, cx| while buffer.undo(cx).is_some() {});
+    notify_editor(cx);
+    assert!(!cx.read(|cx| buffer.read(cx).is_dirty()));
+    let [
+        line_ending_changes,
+        language_changes,
+        encoding_changes,
+        edit_prediction_changes,
+    ] = changes_since(before);
+    assert_eq!(
+        [
+            line_ending_changes,
+            edit_prediction_changes,
+            encoding_changes
+        ],
+        [language_changes, language_changes, language_changes + 1],
+        "only the encoding item, which shows the dirty state, adds its own notification"
+    );
+
+    let before = counts();
+    buffer.update(cx, |buffer, cx| {
+        buffer.set_line_ending(language::LineEnding::Windows, cx)
+    });
+    notify_editor(cx);
+    let [
+        line_ending_changes,
+        language_changes,
+        encoding_changes,
+        edit_prediction_changes,
+    ] = changes_since(before);
+    assert_eq!(
+        [
+            line_ending_changes,
+            edit_prediction_changes,
+            encoding_changes
+        ],
+        [language_changes + 1, language_changes, language_changes],
+        "only the line ending item adds its own notification"
+    );
+
+    let before = counts();
+    buffer.update(cx, |buffer, cx| buffer.set_language(Some(rust_lang()), cx));
+    notify_editor(cx);
+    let [
+        line_ending_changes,
+        language_changes,
+        encoding_changes,
+        edit_prediction_changes,
+    ] = changes_since(before);
+    assert_eq!(
+        [language_changes, edit_prediction_changes, encoding_changes],
+        [
+            line_ending_changes + 1,
+            line_ending_changes + 1,
+            line_ending_changes
+        ],
+        "the language item and the edit prediction button both show the language"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn test_tui_drops_font_size_keybindings() {

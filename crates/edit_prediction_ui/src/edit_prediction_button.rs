@@ -1392,6 +1392,13 @@ impl EditPredictionButton {
     }
 
     pub fn update_enabled(&mut self, editor: Entity<Editor>, cx: &mut Context<Self>) {
+        let previous_enabled = self.editor_enabled;
+        let previous_show_predictions = self.editor_show_predictions;
+        let previous_provider = self.edit_prediction_provider.take();
+        let previous_language = self.language.take();
+        let previous_file = self.file.take();
+        let previous_focus_handle = self.editor_focus_handle.take();
+
         let editor = editor.read(cx);
         let snapshot = editor.buffer().read(cx).snapshot(cx);
         let suggestion_anchor = editor.selections.newest_anchor().start;
@@ -1413,7 +1420,23 @@ impl EditPredictionButton {
         self.file = file;
         self.editor_focus_handle = Some(editor.focus_handle(cx));
 
-        cx.notify();
+        let unchanged = self.editor_enabled == previous_enabled
+            && self.editor_show_predictions == previous_show_predictions
+            && same_arc(&self.edit_prediction_provider, &previous_provider)
+            && same_arc(&self.language, &previous_language)
+            && same_arc(&self.file, &previous_file)
+            && self.editor_focus_handle == previous_focus_handle;
+        if !unchanged {
+            cx.notify();
+        }
+    }
+}
+
+fn same_arc<T: ?Sized>(left: &Option<Arc<T>>, right: &Option<Arc<T>>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+        (None, None) => true,
+        _ => false,
     }
 }
 
