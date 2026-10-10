@@ -10,6 +10,7 @@ pub(super) struct CellSnapper {
     cell_size: Size<f32>,
     viewport_width: f32,
     cell_nodes: FxHashMap<LayoutId, CellNode>,
+    nested_rule_spacing_owners: FxHashMap<(LayoutId, Side), LayoutId>,
 }
 
 #[derive(Clone, Copy)]
@@ -34,12 +35,34 @@ enum Edge {
     Content,
     Blank,
     CoveredPadding,
+    Rule,
+    RuleSpacing(Spacing),
+    NestedRuleSpacing(Spacing),
 }
 
 impl Edge {
     fn is_blank(self) -> bool {
-        matches!(self, Self::Blank | Self::CoveredPadding)
+        matches!(
+            self,
+            Self::Blank | Self::CoveredPadding | Self::RuleSpacing(_) | Self::NestedRuleSpacing(_)
+        )
     }
+
+    fn is_visible_blank(self) -> bool {
+        self != Self::CoveredPadding && self.is_blank()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Spacing {
+    Padding,
+    Margin,
+}
+
+struct Snapped {
+    node: CellNode,
+    nested_rule_spacing_owners: Vec<(Side, LayoutId)>,
+    dropped_spacings: Vec<(LayoutId, Side, Spacing)>,
 }
 
 impl CellSnapper {
@@ -48,6 +71,7 @@ impl CellSnapper {
             cell_size,
             viewport_width: f32::INFINITY,
             cell_nodes: FxHashMap::default(),
+            nested_rule_spacing_owners: FxHashMap::default(),
         }
     }
 
@@ -57,6 +81,7 @@ impl CellSnapper {
 
     pub(super) fn clear(&mut self) {
         self.cell_nodes.clear();
+        self.nested_rule_spacing_owners.clear();
     }
 
     pub(super) fn request_layout(
@@ -66,7 +91,10 @@ impl CellSnapper {
         style: &Style,
         children: &[LayoutId],
     ) -> LayoutId {
-        let node = self.snap(&mut taffy_style, style, children);
+        let snapped = self.snap(&mut taffy_style, style, children);
+        for (node, side, spacing) in snapped.dropped_spacings {
+            drop_spacing(tree, node, side, spacing);
+        }
         if let Some(min_width) = width_around_fixed_children(tree, &taffy_style, children) {
             let min_width = if min_width > self.viewport_width {
                 let edges =
@@ -90,7 +118,10 @@ impl CellSnapper {
         }
         .expect(EXPECT_MESSAGE)
         .into();
-        self.cell_nodes.insert(id, node);
+        self.cell_nodes.insert(id, snapped.node);
+        for (side, owner) in snapped.nested_rule_spacing_owners {
+            self.nested_rule_spacing_owners.insert((id, side), owner);
+        }
         id
     }
 
@@ -115,7 +146,7 @@ impl CellSnapper {
         taffy_style: &mut taffy::style::Style,
         style: &Style,
         children: &[LayoutId],
-    ) -> CellNode {
+    ) -> Snapped {
         let unsnapped = HorizontalSpacing::of(taffy_style);
         let hairline_width = positive_length(taffy_style.size.width)
             .filter(|width| *width < self.cell_size.width / 2.0);
@@ -126,17 +157,81 @@ impl CellSnapper {
             .filter(|child| !self.cell_nodes.get(child).is_some_and(|node| node.is_empty))
             .collect();
         let is_framed = style.is_framed_surface();
-        self.avoid_doubled_blank_columns(taffy_style, unsnapped, &content);
+        let draws_rules = !self.is_toggle_box(taffy_style)
+            && style
+                .border_color
+                .is_some_and(|color| !color.is_transparent());
+        let ruled_left = draws_rules && !style.border_widths.left.is_zero();
+        let ruled_right = draws_rules && !is_framed && !style.border_widths.right.is_zero();
+        let (keeps_left_rule_padding, keeps_right_rule_padding) = self.avoid_doubled_blank_columns(
+            taffy_style,
+            unsnapped,
+            &content,
+            ruled_left,
+            ruled_right,
+        );
         if is_framed {
             keep_left_frame_edge_only(taffy_style, self.cell_size.width);
         }
-        let mut node = self.cell_node(taffy_style, &content, false);
-        if hairline_width.is_some() {
-            node.left = Edge::Content;
-            node.right = Edge::Content;
-            node.hairline_width = hairline_width;
+        let dropped_spacings = self.redundant_rule_spacings(taffy_style, &content);
+        let node = self.cell_node(taffy_style, &content, false);
+        let is_in_flow = taffy_style.position != taffy::style::Position::Absolute;
+        let is_rule_margin = |margin: taffy::style::LengthPercentageAuto| {
+            is_in_flow
+                && positive_length(margin).is_some_and(|margin| margin <= self.cell_size.width)
+        };
+        let edge = |edge, is_ruled, margin, keeps_rule_padding| {
+            if hairline_width.is_some() {
+                Edge::Content
+            } else if is_ruled && is_rule_margin(margin) {
+                Edge::RuleSpacing(Spacing::Margin)
+            } else if is_ruled {
+                Edge::Rule
+            } else if keeps_rule_padding {
+                Edge::RuleSpacing(Spacing::Padding)
+            } else {
+                edge
+            }
+        };
+        let node = CellNode {
+            left: edge(
+                node.left,
+                ruled_left,
+                taffy_style.margin.left,
+                keeps_left_rule_padding,
+            ),
+            right: edge(
+                node.right,
+                ruled_right,
+                taffy_style.margin.right,
+                keeps_right_rule_padding,
+            ),
+            hairline_width,
+            ..node
+        };
+        let nested_rule_spacing_owners =
+            [(Side::Left, content.first()), (Side::Right, content.last())]
+                .into_iter()
+                .filter(|(side, _)| matches!(node.edge(*side), Edge::NestedRuleSpacing(_)))
+                .filter_map(|(side, edge_child)| {
+                    Some((side, self.rule_spacing_owner(*edge_child?, side)?))
+                })
+                .collect();
+        Snapped {
+            node,
+            nested_rule_spacing_owners,
+            dropped_spacings,
         }
-        node
+    }
+
+    fn is_toggle_box(&self, style: &taffy::style::Style) -> bool {
+        let fits = |length: taffy::style::Dimension, limit: f32| {
+            positive_length(length).is_some_and(|length| length <= limit)
+        };
+        fits(
+            style.size.width,
+            Style::MAX_TOGGLE_BOX_COLUMNS as f32 * self.cell_size.width,
+        ) && fits(style.size.height, self.cell_size.height)
     }
 
     fn snap_measured(&self, taffy_style: &mut taffy::style::Style, style: &Style) -> CellNode {
@@ -180,21 +275,31 @@ impl CellSnapper {
         style: &mut taffy::style::Style,
         unsnapped: HorizontalSpacing,
         content: &[LayoutId],
-    ) {
+        ruled_left: bool,
+        ruled_right: bool,
+    ) -> (bool, bool) {
         let Some(flow) = Flow::of(style, content) else {
-            return;
+            return (false, false);
         };
         let round = |value| round_to_cell(value, self.cell_size.width);
+        let is_blank_inside = |child: &LayoutId, side, is_ruled| {
+            let edge = self.edge(*child, side);
+            if is_ruled {
+                edge.is_visible_blank()
+            } else {
+                edge.is_blank()
+            }
+        };
         let mut restore_left = positive_length(unsnapped.padding_left).is_some()
             && flow
                 .leading
                 .iter()
-                .all(|child| self.edge(*child, Side::Left).is_blank());
+                .all(|child| is_blank_inside(child, Side::Left, ruled_left));
         let mut restore_right = positive_length(unsnapped.padding_right).is_some()
             && flow
                 .trailing
                 .iter()
-                .all(|child| self.edge(*child, Side::Right).is_blank());
+                .all(|child| is_blank_inside(child, Side::Right, ruled_right));
         if !flow.is_row
             && unsnapped.padding_left == unsnapped.padding_right
             && restore_left != restore_right
@@ -216,6 +321,73 @@ impl CellSnapper {
         {
             style.gap.width = snap_length(unsnapped.gap_width, round);
         }
+        let keeps_rule_padding = |padding: taffy::style::LengthPercentage,
+                                  unsnapped_padding: taffy::style::LengthPercentage,
+                                  edge_children: &[LayoutId],
+                                  side| {
+            positive_length(padding).is_some()
+                && positive_length(snap_length(unsnapped_padding, round)).is_none()
+                && edge_children
+                    .iter()
+                    .all(|child| self.edge(*child, side) == Edge::Rule)
+        };
+        (
+            keeps_rule_padding(
+                style.padding.left,
+                unsnapped.padding_left,
+                flow.leading,
+                Side::Left,
+            ),
+            keeps_rule_padding(
+                style.padding.right,
+                unsnapped.padding_right,
+                flow.trailing,
+                Side::Right,
+            ),
+        )
+    }
+
+    fn redundant_rule_spacings(
+        &self,
+        style: &taffy::style::Style,
+        content: &[LayoutId],
+    ) -> Vec<(LayoutId, Side, Spacing)> {
+        let mut redundant = Vec::new();
+        let Some(flow) = Flow::of(style, content) else {
+            return redundant;
+        };
+        let mut drop_nested = |child, edge, side| {
+            if let Edge::NestedRuleSpacing(spacing) = edge
+                && let Some(owner) = self.rule_spacing_owner(child, side)
+            {
+                redundant.push((owner, side, spacing));
+            }
+        };
+        let is_blank = |length: taffy::style::LengthPercentage| positive_length(length).is_some();
+        if is_blank(style.padding.left) {
+            for child in flow.leading {
+                drop_nested(*child, self.edge(*child, Side::Left), Side::Left);
+            }
+        }
+        if is_blank(style.padding.right) {
+            for child in flow.trailing {
+                drop_nested(*child, self.edge(*child, Side::Right), Side::Right);
+            }
+        }
+        if flow.is_row {
+            let gap_is_blank = is_blank(style.gap.width);
+            for (before, after) in flow.pairs() {
+                let before_edge = self.edge(before, Side::Right);
+                let after_edge = self.edge(after, Side::Left);
+                if gap_is_blank || before_edge.is_blank() {
+                    drop_nested(after, after_edge, Side::Left);
+                }
+                if gap_is_blank || after_edge == Edge::Blank {
+                    drop_nested(before, before_edge, Side::Right);
+                }
+            }
+        }
+        redundant
     }
 
     fn cell_node(
@@ -275,9 +447,19 @@ impl CellSnapper {
     }
 
     fn edge(&self, id: LayoutId, side: Side) -> Edge {
-        self.cell_nodes
-            .get(&id)
-            .map_or(Edge::Content, |node| node.edge(side))
+        match self.cell_nodes.get(&id).map(|node| node.edge(side)) {
+            Some(Edge::RuleSpacing(spacing)) => Edge::NestedRuleSpacing(spacing),
+            Some(edge) => edge,
+            None => Edge::Content,
+        }
+    }
+
+    fn rule_spacing_owner(&self, id: LayoutId, side: Side) -> Option<LayoutId> {
+        match self.cell_nodes.get(&id)?.edge(side) {
+            Edge::RuleSpacing(_) => Some(id),
+            Edge::NestedRuleSpacing(_) => self.nested_rule_spacing_owners.get(&(id, side)).copied(),
+            _ => None,
+        }
     }
 }
 
@@ -331,6 +513,19 @@ fn is_row(style: &taffy::style::Style) -> bool {
             style.flex_direction,
             taffy::style::FlexDirection::Row | taffy::style::FlexDirection::RowReverse
         )
+}
+
+fn drop_spacing(tree: &mut TaffyTree<NodeContext>, node: LayoutId, side: Side, spacing: Spacing) {
+    let mut style = tree.style(node.into()).expect(EXPECT_MESSAGE).clone();
+    let zero_padding = taffy::style::LengthPercentage::length(0.);
+    let zero_margin = taffy::style::LengthPercentageAuto::length(0.);
+    match (spacing, side) {
+        (Spacing::Padding, Side::Left) => style.padding.left = zero_padding,
+        (Spacing::Padding, Side::Right) => style.padding.right = zero_padding,
+        (Spacing::Margin, Side::Left) => style.margin.left = zero_margin,
+        (Spacing::Margin, Side::Right) => style.margin.right = zero_margin,
+    }
+    tree.set_style(node.into(), style).expect(EXPECT_MESSAGE);
 }
 
 fn snap_axis(edges: std::ops::Range<f32>, cell: f32, layout_extent: f32) -> (f32, f32) {
@@ -813,7 +1008,7 @@ mod tests {
             let unsnapped = HorizontalSpacing::of(&unsnapped_style);
             let mut style = unsnapped_style.clone();
             snap_style_to_cells(&mut style, snapper.cell_size);
-            snapper.avoid_doubled_blank_columns(&mut style, unsnapped, &[child]);
+            snapper.avoid_doubled_blank_columns(&mut style, unsnapped, &[child], false, false);
             assert_eq!(
                 style.padding.left,
                 LengthPercentage::length(8.),

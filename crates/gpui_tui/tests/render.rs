@@ -454,6 +454,235 @@ fn gaps_collapse_only_between_padded_children() {
     );
 }
 
+struct SpacedRow(fn() -> gpui::AnyElement);
+
+impl Render for SpacedRow {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .bg(rgb(0x202020))
+            .text_color(rgb(0xffffff))
+            .text_size(px(16.))
+            .line_height(px(16.))
+            .child((self.0)())
+    }
+}
+
+fn spaced_row_text(row: fn() -> gpui::AnyElement) -> String {
+    spaced_rows(row).remove(0)
+}
+
+fn ruled(label: &'static str) -> gpui::Div {
+    div()
+        .border_l_1()
+        .border_color(rgb(0x808080))
+        .pl(px(8.))
+        .child(label)
+}
+
+fn padded(child: impl IntoElement) -> gpui::Div {
+    div().flex().px(px(2.)).child(child)
+}
+
+#[test]
+fn ruled_edges_keep_one_blank_cell_from_text() {
+    let row = spaced_row_text(|| {
+        div()
+            .flex()
+            .gap(px(2.))
+            .child(padded("alpha.rs"))
+            .child("src/")
+            .child(padded(ruled("fn alpha")))
+            .into_any_element()
+    });
+    assert_eq!(row, " alpha.rs src/ │ fn alpha");
+}
+
+#[test]
+fn ruled_edges_next_to_padded_neighbors_do_not_double_the_blank() {
+    let row = spaced_row_text(|| {
+        div()
+            .flex()
+            .gap(px(2.))
+            .child(padded("main.rs"))
+            .child(padded(ruled("fn main")))
+            .into_any_element()
+    });
+    assert_eq!(row, " main.rs │ fn main");
+}
+
+#[test]
+fn adjacent_ruled_edges_keep_one_blank_cell_between_them() {
+    fn chip(label: &'static str) -> gpui::Div {
+        div()
+            .border_1()
+            .border_color(rgb(0x808080))
+            .px(px(4.))
+            .child(label)
+    }
+    let row = spaced_row_text(|| {
+        div()
+            .flex()
+            .gap(px(2.))
+            .child(chip("a"))
+            .child(chip("b"))
+            .into_any_element()
+    });
+    assert_eq!(row, "│ a │ │ b │");
+}
+
+#[test]
+fn facing_ruled_edges_share_one_blank_cell() {
+    let row = spaced_row_text(|| {
+        div()
+            .flex()
+            .child(padded(
+                div()
+                    .border_r_1()
+                    .border_color(rgb(0x808080))
+                    .pr(px(8.))
+                    .child("a"),
+            ))
+            .child(padded(ruled("b")))
+            .into_any_element()
+    });
+    assert_eq!(row, " a │ │ b");
+}
+
+#[test]
+fn toggle_boxes_are_not_ruled_so_their_labels_keep_one_blank_cell() {
+    let row = spaced_row_text(|| {
+        div()
+            .flex()
+            .gap(px(2.))
+            .child(
+                div()
+                    .flex()
+                    .size(px(16.))
+                    .rounded(px(2.))
+                    .border_1()
+                    .border_color(rgb(0x808080)),
+            )
+            .child("Trust")
+            .into_any_element()
+    });
+    assert_eq!(row, "☐ Trust");
+}
+
+fn square_button(label: &'static str) -> gpui::Div {
+    div()
+        .flex()
+        .flex_none()
+        .w(px(11.))
+        .px(px(2.))
+        .justify_center()
+        .child(label)
+}
+
+fn ruled_row() -> gpui::Div {
+    div().flex().border_l_1().border_color(rgb(0x808080))
+}
+
+#[test]
+fn ruled_edges_keep_their_inner_padding_when_the_edge_child_draws_content() {
+    let row = spaced_row_text(|| {
+        ruled_row()
+            .pl(px(3.))
+            .child(square_button("a"))
+            .child(square_button("b"))
+            .into_any_element()
+    });
+    assert_eq!(row, "│ a b");
+
+    let row = spaced_row_text(|| {
+        div()
+            .flex()
+            .pl(px(3.))
+            .child(square_button("a"))
+            .child(square_button("b"))
+            .into_any_element()
+    });
+    assert_eq!(row, "a b");
+}
+
+#[test]
+fn ruled_edges_drop_their_margin_when_the_neighbor_is_already_blank() {
+    let row = spaced_row_text(|| {
+        div()
+            .flex()
+            .gap(px(2.))
+            .child(square_button("x"))
+            .child(ruled_row().ml(px(5.)).pl(px(5.)).child(square_button("a")))
+            .into_any_element()
+    });
+    assert_eq!(row, "x │ a");
+
+    let row = spaced_row_text(|| {
+        div()
+            .flex()
+            .child("x")
+            .child(ruled_row().ml(px(5.)).pl(px(5.)).child("a"))
+            .into_any_element()
+    });
+    assert_eq!(row, "x │ a");
+
+    let row = spaced_row_text(|| {
+        div()
+            .flex()
+            .child(
+                div()
+                    .flex()
+                    .border_r_1()
+                    .border_color(rgb(0x808080))
+                    .mr(px(5.))
+                    .pr(px(5.))
+                    .child("a"),
+            )
+            .child(padded("y"))
+            .into_any_element()
+    });
+    assert_eq!(row, "a │ y");
+}
+
+#[test]
+fn rule_padding_drops_beside_an_already_blank_neighbor_in_block_and_column_flows() {
+    fn ruled_on_the_right(label: &'static str) -> gpui::Div {
+        div()
+            .border_r_1()
+            .border_color(rgb(0x808080))
+            .pr(px(8.))
+            .child(label)
+    }
+    let row = spaced_row_text(|| {
+        div()
+            .flex()
+            .child(div().px(px(2.)).child(ruled_on_the_right("a")))
+            .child(padded("b"))
+            .into_any_element()
+    });
+    assert_eq!(row, " a │ b");
+
+    let row = spaced_row_text(|| {
+        div()
+            .flex()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .px(px(2.))
+                    .child(ruled_on_the_right("a")),
+            )
+            .child(padded("b"))
+            .into_any_element()
+    });
+    assert_eq!(row, " a │ b");
+}
+
+fn spaced_rows(row: fn() -> gpui::AnyElement) -> Vec<String> {
+    let grid = view_frame(30, 3, move || SpacedRow(row));
+    trimmed_rows(&grid, 0..2)
+}
+
 #[derive(Debug, Default, PartialEq)]
 struct ActiveWindows {
     platform: Option<AnyWindowHandle>,
