@@ -34,6 +34,7 @@ const UNCHANGED_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 const UNCHANGED_FRAMES_BEFORE_SLOWDOWN: u32 = 2;
 const INPUT_SETTLE: Duration = Duration::from_millis(6);
 const INPUT_ACTIVITY: Duration = Duration::from_millis(250);
+const MAX_RUNNABLE_BATCH: Duration = Duration::from_millis(8);
 
 #[derive(Default)]
 struct FramePacer {
@@ -393,7 +394,16 @@ impl Platform for TuiPlatform {
 
         while !self.should_quit.get() {
             match receiver.recv_timeout(self.frame_wait()) {
-                Ok(runnable) => run_runnable(runnable),
+                Ok(runnable) => {
+                    run_runnable(runnable);
+                    let batch_start = Instant::now();
+                    while batch_start.elapsed() < MAX_RUNNABLE_BATCH {
+                        match receiver.try_recv() {
+                            Ok(runnable) => run_runnable(runnable),
+                            Err(_) => break,
+                        }
+                    }
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
