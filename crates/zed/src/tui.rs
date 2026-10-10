@@ -58,6 +58,7 @@ mod unix {
 
     use anyhow::{Context as _, Result};
     use clap::{Parser, Subcommand};
+    use command_palette_hooks::CommandPaletteFilter;
     use gpui::{App, Application, UpdateGlobal as _};
     use gpui_tui::TuiPlatform;
     use settings::{
@@ -224,6 +225,10 @@ mod unix {
                         after_start,
                     },
             } = self;
+
+            CommandPaletteFilter::update_global(cx, |filter, _| {
+                filter.hide_action_types(&crate::zed::font_size_actions());
+            });
 
             platform.set_frame_sink(on_frame);
 

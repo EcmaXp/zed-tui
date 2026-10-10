@@ -237,6 +237,7 @@ ztracing.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 ciborium.workspace = true
+command_palette_hooks.workspace = true
 crossterm.workspace = true
 gpui_tui.workspace = true
 
