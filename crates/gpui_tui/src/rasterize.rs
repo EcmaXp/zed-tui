@@ -1,7 +1,7 @@
 use std::ops::Range;
 
 use gpui::{
-    AtlasKey, Bounds, ContentMask, Hsla, MonochromeSprite, Point, PrimitiveBatch, Quad, Rgba,
+    AtlasKey, Bounds, ContentMask, Hsla, MonochromeSprite, Path, Point, PrimitiveBatch, Quad, Rgba,
     ScaledPixels, Scene, Underline,
 };
 
@@ -106,6 +106,11 @@ pub(crate) fn rasterize_scene(
                     rasterizer.quad(quad);
                 }
             }
+            PrimitiveBatch::Paths(range) => {
+                for path in scene.paths.get(range).unwrap_or(&[]) {
+                    rasterizer.path(path);
+                }
+            }
             PrimitiveBatch::Underlines(range) => {
                 for underline in scene.underlines.get(range).unwrap_or(&[]) {
                     rasterizer.underline(underline);
@@ -117,7 +122,6 @@ pub(crate) fn rasterize_scene(
                 }
             }
             PrimitiveBatch::Shadows(_)
-            | PrimitiveBatch::Paths(_)
             | PrimitiveBatch::SubpixelSprites { .. }
             | PrimitiveBatch::PolychromeSprites { .. }
             | PrimitiveBatch::Surfaces(_) => {}
@@ -461,6 +465,33 @@ impl Rasterizer<'_> {
         }
     }
 
+    fn path(&mut self, path: &Path<ScaledPixels>) {
+        let Some(color) = path.color.as_solid().filter(|color| color.a > 0.) else {
+            return;
+        };
+        let Some(rect) = clipped(&path.bounds, &path.content_mask) else {
+            return;
+        };
+        let rgba = color.to_rgb();
+        let rows = intersect(covered_rows(&rect), &(0..self.grid.rows.into()));
+        let cols = intersect(covered_cols(&rect), &(0..self.grid.cols.into()));
+        for row in rows {
+            for col in cols.clone() {
+                let center = device_cell_center(col, row);
+                let covered = path.vertices.chunks_exact(3).any(|triangle| {
+                    let triangle = [0, 1, 2].map(|index| {
+                        let position = triangle[index].xy_position;
+                        (position.x.0, position.y.0)
+                    });
+                    triangle_contains(&triangle, (center.x, center.y))
+                });
+                if covered && let Some(cell) = self.grid.cell_mut(col, row) {
+                    cell.bg = canvas_if_untouched(cell.bg, self.canvas).blend_rgba(rgba);
+                }
+            }
+        }
+    }
+
     fn underline(&mut self, underline: &Underline) {
         let Some(rect) = clipped(&underline.bounds, &underline.content_mask) else {
             return;
@@ -535,12 +566,24 @@ impl Rasterizer<'_> {
     }
 }
 
+fn triangle_contains(triangle: &[(f32, f32); 3], point: (f32, f32)) -> bool {
+    let sign = |a: (f32, f32), b: (f32, f32), c: (f32, f32)| {
+        (a.0 - c.0) * (b.1 - c.1) - (b.0 - c.0) * (a.1 - c.1)
+    };
+    let d1 = sign(point, triangle[0], triangle[1]);
+    let d2 = sign(point, triangle[1], triangle[2]);
+    let d3 = sign(point, triangle[2], triangle[0]);
+    let has_negative = d1 < 0. || d2 < 0. || d3 < 0.;
+    let has_positive = d1 > 0. || d2 > 0. || d3 > 0.;
+    !(has_negative && has_positive)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use gpui::{
         AtlasTextureId, AtlasTextureKind, AtlasTile, DevicePixels, MonochromeSprite, Size, point,
-        size,
+        px, size,
     };
 
     fn rasterize(scene: &Scene, atlas: &TuiAtlas, cols: u16, rows: u16) -> CellGrid {
@@ -567,6 +610,73 @@ mod tests {
 
     fn rgb(r: u8, g: u8, b: u8) -> Rgb {
         Rgb::new(r, g, b)
+    }
+
+    #[test]
+    fn paths_cover_the_cells_whose_centers_lie_inside_a_triangle() {
+        let atlas = TuiAtlas::default();
+        let (cols, rows) = (24u16, 12u16);
+        let mut seed = 0x2545_f491_u32;
+        let mut next = |bound: f32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed % 10_000) as f32 / 10_000. * bound
+        };
+        let mut covering_paths = 0;
+        for _ in 0..50 {
+            let width = cols as f32 * CELL_WIDTH;
+            let height = rows as f32 * CELL_HEIGHT;
+            let mut path = Path::new(point(px(next(width)), px(next(height))));
+            for _ in 0..6 {
+                path.line_to(point(
+                    px(next(width + 40.) - 20.),
+                    px(next(height + 40.) - 20.),
+                ));
+            }
+            path.color = Hsla::white().opacity(0.5).into();
+            let mut path = path.scale(1.);
+            path.content_mask = ContentMask {
+                bounds: scaled_bounds(next(40.), next(40.), next(width), next(height)),
+            };
+
+            let mut expected = CellGrid::new(cols, rows, Rgb::default());
+            if let Some(rect) = clipped(&path.bounds, &path.content_mask) {
+                let triangles: Vec<[(f32, f32); 3]> = path
+                    .vertices
+                    .chunks_exact(3)
+                    .map(|triangle| {
+                        [0, 1, 2].map(|index| {
+                            let position = triangle[index].xy_position;
+                            (position.x.0, position.y.0)
+                        })
+                    })
+                    .collect();
+                for row in covered_rows(&rect) {
+                    for col in covered_cols(&rect) {
+                        let center = device_cell_center(col, row);
+                        if triangles
+                            .iter()
+                            .any(|triangle| triangle_contains(triangle, (center.x, center.y)))
+                            && let Some(cell) = expected.cell_mut(col, row)
+                        {
+                            cell.bg = cell.bg.blend(Hsla::white().opacity(0.5));
+                        }
+                    }
+                }
+            }
+
+            let mut scene = Scene::default();
+            scene.insert_primitive(path);
+            scene.finish();
+            let grid = rasterize(&scene, &atlas, cols, rows);
+            assert_eq!(grid, expected);
+            covering_paths += (grid.cells.iter().any(|cell| cell.bg != Rgb::default())) as usize;
+        }
+        assert!(
+            covering_paths > 25,
+            "only {covering_paths} paths covered a cell"
+        );
     }
 
     #[test]
@@ -749,6 +859,13 @@ mod tests {
         let grid = rasterize(&scene, &atlas, 3, 2);
         assert_eq!(grid.row_text(0), "한 ");
         assert_eq!(grid.row_text(1), " │ ");
+    }
+
+    #[test]
+    fn triangle_hit_test() {
+        let triangle = [(0., 0.), (10., 0.), (0., 10.)];
+        assert!(triangle_contains(&triangle, (2., 2.)));
+        assert!(!triangle_contains(&triangle, (9., 9.)));
     }
 
     fn scaled_bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
