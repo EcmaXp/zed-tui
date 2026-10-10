@@ -9,7 +9,7 @@ use crate::{
     CELL_HEIGHT, CELL_WIDTH,
     atlas::TuiAtlas,
     device_cell_center,
-    grid::{Cell, CellAttrs, CellGrid, Glyph, Rgb},
+    grid::{Cell, CellAttrs, CellGrid, Glyph, Rgb, UnderlineColor},
     text_system::{is_bold, is_italic},
 };
 
@@ -56,6 +56,7 @@ fn paint_line_glyph(cell: &mut Cell, ch: char, color: Rgba) -> bool {
     cell.glyph = ch.into();
     cell.fg = fg;
     cell.attrs = CellAttrs::empty();
+    cell.underline = UnderlineColor::default();
     true
 }
 
@@ -306,6 +307,7 @@ impl Rasterizer<'_> {
                     if clears_text {
                         cell.glyph = ' '.into();
                         cell.attrs = CellAttrs::empty();
+                        cell.underline = UnderlineColor::default();
                     }
                     cell.bg = cell.bg.blend_rgba(rgba);
                 }
@@ -419,9 +421,17 @@ impl Rasterizer<'_> {
             return;
         };
         let row = ((rect.top() - 1.) / CELL_HEIGHT).floor() as i32;
+        let style = if underline.wavy == true.into() {
+            CellAttrs::UNDERLINE | CellAttrs::CURLY_UNDERLINE
+        } else {
+            CellAttrs::UNDERLINE
+        };
+        let color = underline.color.to_rgb();
         for col in covered_cols(&rect) {
             if let Some(cell) = self.grid.cell_mut(col, row) {
-                cell.attrs.insert(CellAttrs::UNDERLINE);
+                cell.attrs.remove(CellAttrs::CURLY_UNDERLINE);
+                cell.attrs.insert(style);
+                cell.underline = UnderlineColor::of(cell.bg.blend_rgba(color));
             }
         }
     }
@@ -444,13 +454,16 @@ impl Rasterizer<'_> {
         if let Some(cell) = self.grid.cell_mut(col, row) {
             cell.glyph = ' '.into();
             cell.attrs = CellAttrs::empty();
+            cell.underline = UnderlineColor::default();
         }
     }
 
     fn put_char(&mut self, col: i32, row: i32, glyph: Glyph, color: Rgba, attrs: CellAttrs) {
         let wide = glyph.cells() == 2;
         let Some(&Cell {
-            attrs: shown_attrs, ..
+            attrs: shown_attrs,
+            underline,
+            ..
         }) = self.grid.cell(col, row)
         else {
             return;
@@ -458,7 +471,7 @@ impl Rasterizer<'_> {
         if wide && self.grid.cell(col + 1, row).is_none() {
             return;
         }
-        let kept = shown_attrs & CellAttrs::UNDERLINE;
+        let kept = shown_attrs & (CellAttrs::UNDERLINE | CellAttrs::CURLY_UNDERLINE);
         self.clear_char(col, row);
         if wide {
             self.clear_char(col + 1, row);
@@ -467,6 +480,7 @@ impl Rasterizer<'_> {
             cell.glyph = glyph;
             cell.fg = cell.bg.blend_rgba(color);
             cell.attrs = attrs | kept;
+            cell.underline = underline;
         }
         if wide && let Some(cell) = self.grid.cell_mut(col + 1, row) {
             cell.glyph = ' '.into();
@@ -537,6 +551,41 @@ mod tests {
         assert_eq!(grid.row_text(0), "┌──┐");
         assert_eq!(grid.row_text(1), "│  │");
         assert_eq!(grid.row_text(3), "└──┘");
+    }
+
+    fn underline(x: f32, wavy: bool, color: Hsla) -> Underline {
+        Underline {
+            order: 0,
+            pad: 0,
+            bounds: scaled_bounds(x, 14., 16., 1.),
+            content_mask: full_mask(),
+            color,
+            thickness: ScaledPixels(1.),
+            wavy: wavy.into(),
+        }
+    }
+
+    #[test]
+    fn underlines_keep_their_curl_and_color_under_text() {
+        let atlas = TuiAtlas::default();
+        let red = gpui::red();
+        let mut scene = Scene::default();
+        scene.insert_primitive(underline(0., true, red));
+        scene.insert_primitive(underline(16., false, Hsla::white()));
+        scene.insert_primitive(glyph_sprite(&atlas, 'x', 0.));
+        scene.insert_primitive(glyph_sprite(&atlas, 'y', 16.));
+        scene.finish();
+        let grid = rasterize(&scene, &atlas, 4, 2);
+        let curly = CellAttrs::UNDERLINE | CellAttrs::CURLY_UNDERLINE;
+        let wavy = grid.cell(0, 0).unwrap();
+        assert_eq!(wavy.glyph, 'x');
+        assert!(wavy.attrs.contains(curly));
+        assert_eq!(wavy.underline.rgb(), Some(wavy.bg.blend_rgba(red.to_rgb())));
+        let straight = grid.cell(2, 0).unwrap();
+        assert_eq!(straight.glyph, 'y');
+        assert!(straight.attrs.contains(CellAttrs::UNDERLINE));
+        assert!(!straight.attrs.contains(CellAttrs::CURLY_UNDERLINE));
+        assert!(!grid.cell(0, 1).unwrap().attrs.intersects(curly));
     }
 
     fn bordered_quad(width: f32, height: f32) -> Scene {

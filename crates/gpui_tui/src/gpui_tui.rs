@@ -12,7 +12,7 @@ use std::cell::RefCell;
 
 use gpui::{Pixels, Point, Size, point, px, size};
 
-pub use grid::{Cell, CellAttrs, CellGrid, Glyph, Rgb};
+pub use grid::{Cell, CellAttrs, CellGrid, Glyph, Rgb, UnderlineColor};
 pub use platform::TuiPlatform;
 pub use text_system::TuiTextSystem;
 

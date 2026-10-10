@@ -63,6 +63,7 @@ bitflags::bitflags! {
         const BOLD = 1;
         const ITALIC = 1 << 1;
         const UNDERLINE = 1 << 2;
+        const CURLY_UNDERLINE = 1 << 3;
         const WIDE_CONTINUATION = 1 << 4;
     }
 }
@@ -188,12 +189,26 @@ impl fmt::Debug for Glyph {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct UnderlineColor(Option<Rgb>);
+
+impl UnderlineColor {
+    pub fn of(color: Rgb) -> Self {
+        Self(Some(color))
+    }
+
+    pub fn rgb(self) -> Option<Rgb> {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cell {
     pub glyph: Glyph,
     pub fg: Rgb,
     pub bg: Rgb,
     pub attrs: CellAttrs,
+    pub underline: UnderlineColor,
 }
 
 impl Cell {
@@ -207,6 +222,7 @@ impl Cell {
             fg: Rgb::new(255, 255, 255),
             bg,
             attrs: CellAttrs::empty(),
+            underline: UnderlineColor::default(),
         }
     }
 
@@ -299,6 +315,16 @@ impl CellGrid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn underline_colors_round_trip() {
+        let color = Rgb::new(224, 108, 117);
+        let underline = UnderlineColor::of(color);
+        assert_ne!(underline, UnderlineColor::default());
+        assert_eq!(underline, UnderlineColor::of(color));
+        assert_eq!(underline.rgb(), Some(color));
+        assert_eq!(UnderlineColor::default().rgb(), None);
+    }
 
     #[test]
     fn clusters_keep_their_whole_text_past_sixty_five_thousand_entries() {
