@@ -38,7 +38,9 @@ const QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 const HANGUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const RESIZE_FRAME_WAIT: Duration = Duration::from_millis(100);
 const MOUSE_MOVE_INTERVAL: Duration = Duration::from_millis(8);
-const ATTRIBUTE_CODES: [(CellAttrs, &str); 2] = [(CellAttrs::BOLD, "1"), (CellAttrs::ITALIC, "3")];
+const ATTRIBUTE_CODES: [(CellAttrs, &str, &str); 2] =
+    [(CellAttrs::BOLD, "1", "22"), (CellAttrs::ITALIC, "3", "23")];
+const UNDERLINE_OFF: &str = "24";
 
 pub enum Exit {
     Detached,
@@ -241,6 +243,14 @@ impl Layer {
             Self::Underline => "58",
         }
     }
+
+    fn default_code(self) -> &'static str {
+        match self {
+            Self::Foreground => "39",
+            Self::Background => "49",
+            Self::Underline => "59",
+        }
+    }
 }
 
 fn read_query_reply(timeout: Duration) -> QueryReplies {
@@ -301,7 +311,10 @@ impl PenColor {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Pen {
-    style: Option<Style>,
+    fg: Option<PenColor>,
+    bg: PenColor,
+    underline: PenColor,
+    attrs: CellAttrs,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -310,6 +323,7 @@ struct Style {
     bg: PenColor,
     underline: Option<PenColor>,
     attrs: CellAttrs,
+    relevant: CellAttrs,
 }
 
 impl Style {
@@ -319,6 +333,7 @@ impl Style {
             bg,
             underline: None,
             attrs: CellAttrs::empty(),
+            relevant: CellAttrs::UNDERLINE | CellAttrs::CURLY_UNDERLINE,
         }
     }
 
@@ -344,36 +359,213 @@ impl Style {
             bg: PenColor::background(cell),
             underline,
             attrs,
+            relevant: CellAttrs::all(),
         }
     }
 }
 
 impl Pen {
-    fn write_style(&mut self, output: &mut impl Write, style: Style) -> io::Result<()> {
-        if self.style == Some(style) {
-            return Ok(());
-        }
-        output.write_all(b"\x1b[0")?;
-        for (flag, on) in ATTRIBUTE_CODES {
-            if style.attrs.contains(flag) {
-                write!(output, ";{on}")?;
+    fn after(&self, style: &Style, wanted: CellAttrs, resets: bool) -> Pen {
+        let mut pen = *self;
+        if resets {
+            pen.fg = Some(style.fg.unwrap_or(PenColor::Default));
+            pen.underline = style.underline.unwrap_or(PenColor::Default);
+        } else {
+            if style.fg.is_some() {
+                pen.fg = style.fg;
+            }
+            if let Some(underline) = style.underline {
+                pen.underline = underline;
             }
         }
-        if let Some(code) = underline_code(style.attrs) {
-            write!(output, ";{code}")?;
-        }
-        for (layer, color) in [
-            (Layer::Foreground, style.fg),
-            (Layer::Background, Some(style.bg)),
-            (Layer::Underline, style.underline),
-        ] {
-            if let Some(PenColor::Color(Rgb { r, g, b })) = color {
-                write!(output, ";{};2;{r};{g};{b}", layer.extended_code())?;
+        pen.bg = style.bg;
+        pen.attrs = wanted;
+        pen
+    }
+
+    fn push_changes(&self, style: &Style, wanted: CellAttrs, sink: &mut impl SgrSink) {
+        for (flag, on, off) in ATTRIBUTE_CODES {
+            if self.attrs.contains(flag) && !wanted.contains(flag) {
+                sink.push(SgrParam::Code(off));
+            } else if wanted.contains(flag) && !self.attrs.contains(flag) {
+                sink.push(SgrParam::Code(on));
             }
         }
+        match (underline_code(self.attrs), underline_code(wanted)) {
+            (Some(_), None) => sink.push(SgrParam::Code(UNDERLINE_OFF)),
+            (shown, Some(code)) if shown != Some(code) => sink.push(SgrParam::Code(code)),
+            _ => {}
+        }
+        if let Some(fg) = style.fg.filter(|fg| self.fg != Some(*fg)) {
+            sink.push(SgrParam::of(Layer::Foreground, fg));
+        }
+        if self.bg != style.bg {
+            sink.push(SgrParam::of(Layer::Background, style.bg));
+        }
+        if let Some(underline) = style
+            .underline
+            .filter(|underline| self.underline != *underline)
+        {
+            sink.push(SgrParam::of(Layer::Underline, underline));
+        }
+    }
+
+    fn plan(&self, style: &Style) -> Option<SgrPlan> {
+        let wanted = (self.attrs - style.relevant) | (style.attrs & style.relevant);
+        let mut changes = ParamLength::default();
+        self.push_changes(style, wanted, &mut changes);
+        if changes.count == 0 {
+            return None;
+        }
+        let mut reset = ParamLength::default();
+        push_reset(style, wanted, &mut reset);
+        let reset_len = usize::from(reset.count > 0) + reset.len();
+        let resets = reset_len < changes.len();
+        Some(SgrPlan { resets, wanted })
+    }
+
+    fn write_plan(
+        &mut self,
+        output: &mut impl Write,
+        style: &Style,
+        plan: &SgrPlan,
+    ) -> io::Result<()> {
+        output.write_all(b"\x1b[")?;
+        let mut writer = ParamWriter {
+            output: &mut *output,
+            count: usize::from(plan.resets),
+            result: Ok(()),
+        };
+        if plan.resets {
+            push_reset(style, plan.wanted, &mut writer);
+        } else {
+            self.push_changes(style, plan.wanted, &mut writer);
+        }
+        writer.result?;
         output.write_all(b"m")?;
-        self.style = Some(style);
+        *self = self.after(style, plan.wanted, plan.resets);
         Ok(())
+    }
+
+    fn write_style(&mut self, output: &mut impl Write, style: Style) -> io::Result<()> {
+        match self.plan(&style) {
+            Some(plan) => self.write_plan(output, &style, &plan),
+            None => Ok(()),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SgrParam {
+    Code(&'static str),
+    Color(&'static str, Rgb),
+}
+
+impl SgrParam {
+    fn of(layer: Layer, color: PenColor) -> Self {
+        match color {
+            PenColor::Default => Self::Code(layer.default_code()),
+            PenColor::Color(rgb) => Self::Color(layer.extended_code(), rgb),
+        }
+    }
+
+    fn len(self) -> usize {
+        match self {
+            Self::Code(code) => code.len(),
+            Self::Color(code, Rgb { r, g, b }) => {
+                code.len()
+                    + 5
+                    + decimal_len(usize::from(r))
+                    + decimal_len(usize::from(g))
+                    + decimal_len(usize::from(b))
+            }
+        }
+    }
+
+    fn write(self, output: &mut impl Write) -> io::Result<()> {
+        match self {
+            Self::Code(code) => output.write_all(code.as_bytes()),
+            Self::Color(code, Rgb { r, g, b }) => {
+                output.write_all(code.as_bytes())?;
+                output.write_all(b";2;")?;
+                write_decimal(output, usize::from(r))?;
+                output.write_all(b";")?;
+                write_decimal(output, usize::from(g))?;
+                output.write_all(b";")?;
+                write_decimal(output, usize::from(b))
+            }
+        }
+    }
+}
+
+trait SgrSink {
+    fn push(&mut self, param: SgrParam);
+}
+
+#[derive(Default)]
+struct ParamLength {
+    bytes: usize,
+    count: usize,
+}
+
+impl ParamLength {
+    fn len(&self) -> usize {
+        self.bytes + self.count.saturating_sub(1)
+    }
+}
+
+impl SgrSink for ParamLength {
+    fn push(&mut self, param: SgrParam) {
+        self.bytes += param.len();
+        self.count += 1;
+    }
+}
+
+struct ParamWriter<'a, W: Write> {
+    output: &'a mut W,
+    count: usize,
+    result: io::Result<()>,
+}
+
+impl<W: Write> SgrSink for ParamWriter<'_, W> {
+    fn push(&mut self, param: SgrParam) {
+        if self.result.is_err() {
+            return;
+        }
+        if self.count > 0
+            && let Err(error) = self.output.write_all(b";")
+        {
+            self.result = Err(error);
+            return;
+        }
+        self.count += 1;
+        self.result = param.write(self.output);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SgrPlan {
+    resets: bool,
+    wanted: CellAttrs,
+}
+
+fn push_reset(style: &Style, wanted: CellAttrs, sink: &mut impl SgrSink) {
+    for (flag, on, _) in ATTRIBUTE_CODES {
+        if wanted.contains(flag) {
+            sink.push(SgrParam::Code(on));
+        }
+    }
+    if let Some(code) = underline_code(wanted) {
+        sink.push(SgrParam::Code(code));
+    }
+    for (layer, pen_color) in [
+        (Layer::Foreground, style.fg),
+        (Layer::Background, Some(style.bg)),
+        (Layer::Underline, style.underline),
+    ] {
+        if let Some(pen_color @ PenColor::Color(_)) = pen_color {
+            sink.push(SgrParam::of(layer, pen_color));
+        }
     }
 }
 
@@ -1558,6 +1750,76 @@ mod tests {
         output
     }
 
+    fn random_pen_color(random: &mut Random) -> PenColor {
+        const CHANNELS: [u8; 6] = [0, 7, 40, 99, 100, 255];
+        if random.next(4) == 0 {
+            return PenColor::Default;
+        }
+        let mut channel = || CHANNELS[random.next(CHANNELS.len())];
+        PenColor::Color(Rgb::new(channel(), channel(), channel()))
+    }
+
+    fn random_attrs(random: &mut Random) -> CellAttrs {
+        let flags = [
+            CellAttrs::BOLD,
+            CellAttrs::ITALIC,
+            CellAttrs::UNDERLINE,
+            CellAttrs::CURLY_UNDERLINE,
+        ];
+        flags
+            .into_iter()
+            .filter(|_| random.next(2) == 0)
+            .fold(CellAttrs::empty(), |attrs, flag| attrs | flag)
+    }
+
+    fn random_style(random: &mut Random) -> Style {
+        let optional =
+            |random: &mut Random| (random.next(3) != 0).then(|| random_pen_color(random));
+        let fg = optional(random);
+        let underline = optional(random);
+        Style {
+            fg,
+            bg: random_pen_color(random),
+            underline,
+            attrs: random_attrs(random),
+            relevant: if random.next(2) == 0 {
+                CellAttrs::all()
+            } else {
+                CellAttrs::UNDERLINE | CellAttrs::CURLY_UNDERLINE
+            },
+        }
+    }
+
+    #[test]
+    fn truecolor_styles_match_the_formatted_encoder() {
+        let mut random = Random::new(7);
+        for _ in 0..20_000 {
+            let pen = Pen {
+                fg: (random.next(4) != 0).then(|| random_pen_color(&mut random)),
+                bg: random_pen_color(&mut random),
+                underline: random_pen_color(&mut random),
+                attrs: random_attrs(&mut random),
+            };
+            let style = random_style(&mut random);
+            let mut written = pen;
+            let mut output = Vec::new();
+            written.write_style(&mut output, style).unwrap();
+            match pen.plan(&style) {
+                Some(plan) => {
+                    assert_eq!(
+                        pen.after(&style, plan.wanted, plan.resets),
+                        written,
+                        "{pen:?} {output:?}"
+                    );
+                }
+                None => {
+                    assert!(output.is_empty(), "{pen:?} {output:?}");
+                    assert_eq!(written, pen);
+                }
+            }
+        }
+    }
+
     #[test]
     fn decimals_are_written_like_display() {
         for value in [0, 1, 9, 10, 99, 100, 255, 1000, 65535, usize::MAX] {
@@ -1930,6 +2192,48 @@ mod tests {
     }
 
     #[test]
+    fn resets_omit_the_zero_parameter() {
+        let mut pen = Pen::default();
+        let mut output = Vec::new();
+        let (red, blue) = (Rgb::new(200, 0, 0), Rgb::new(0, 0, 200));
+        let mut write = |pen: &mut Pen, fg, bg, attrs| {
+            output.clear();
+            pen.write_style(
+                &mut output,
+                Style {
+                    fg: Some(fg),
+                    bg,
+                    underline: None,
+                    attrs,
+                    relevant: CellAttrs::all(),
+                },
+            )
+            .unwrap();
+            String::from_utf8(output.clone()).unwrap()
+        };
+        let all = CellAttrs::BOLD | CellAttrs::ITALIC | CellAttrs::UNDERLINE;
+        write(&mut pen, PenColor::Color(red), PenColor::Color(blue), all);
+        assert_eq!(
+            write(
+                &mut pen,
+                PenColor::Color(blue),
+                PenColor::Default,
+                CellAttrs::BOLD
+            ),
+            "\x1b[;1;38;2;0;0;200m"
+        );
+        assert_eq!(
+            write(
+                &mut pen,
+                PenColor::Default,
+                PenColor::Default,
+                CellAttrs::empty()
+            ),
+            "\x1b[m"
+        );
+    }
+
+    #[test]
     fn rendered_frames_match_an_emulated_terminal() {
         let mut curled = false;
         let mut colored_underlines = false;
@@ -1996,12 +2300,12 @@ mod tests {
     fn ghostty_underlines_carry_their_curl_and_color() {
         let output = underlined_output(true);
         assert!(
-            output.contains("4:3") && output.contains(";58;2;224;108;117m"),
+            output.contains("4:3;38;2;200;200;200;48;2;40;44;52;58;2;224;108;117mab\x1b[4mcd\x1b[4:3;59mef\x1b[24mgh"),
             "{output:?}"
         );
         let output = underlined_output(false);
         assert!(
-            !output.contains("4:3") && !output.contains(";58;"),
+            output.contains("\x1b[4;38;2;200;200;200;48;2;40;44;52mabcdef\x1b[24mgh"),
             "{output:?}"
         );
     }
@@ -2090,7 +2394,10 @@ mod tests {
         renderer.grid = Some(grid.clone());
         renderer.render().unwrap();
         let output = output_text(&renderer);
-        assert!(output.contains("\x1b[0m"), "{output:?}");
+        assert!(
+            output.contains("\x1b[49m") || output.contains("\x1b[m"),
+            "{output:?}"
+        );
         assert!(!output.contains("48;2;40;44;52"), "{output:?}");
         emulator.feed(&mut renderer);
         emulator.assert_shows(&grid, 20);
