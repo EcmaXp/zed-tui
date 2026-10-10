@@ -3833,7 +3833,6 @@ impl Editor {
                         |_, theme| theme.colors().editor_document_highlight_write_background,
                         cx,
                     );
-                    cx.notify();
                 })
                 .log_err();
             }
@@ -9543,10 +9542,14 @@ impl Editor {
         color_fetcher: impl Fn(&usize, &Theme) -> Hsla + Send + Sync + 'static,
         cx: &mut Context<Self>,
     ) {
-        self.background_highlights
-            .insert(key, (Arc::new(color_fetcher), Arc::from(ranges)));
-        self.scrollbar_marker_state.dirty = true;
-        cx.notify();
+        let had_ranges = self
+            .background_highlights
+            .insert(key, (Arc::new(color_fetcher), Arc::from(ranges)))
+            .is_some_and(|(_, previous_ranges)| !previous_ranges.is_empty());
+        if had_ranges || !ranges.is_empty() {
+            self.scrollbar_marker_state.dirty = true;
+            cx.notify();
+        }
     }
 
     pub fn clear_background_highlights(

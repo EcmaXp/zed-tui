@@ -2,6 +2,133 @@ use super::*;
 use pretty_assertions::assert_eq;
 
 #[gpui::test]
+async fn test_highlight_background_without_ranges_before_or_after_does_not_notify(
+    cx: &mut TestAppContext,
+) {
+    fn highlight_read_ranges(
+        editor: &mut Editor,
+        ranges: &[Range<Anchor>],
+        cx: &mut Context<Editor>,
+    ) {
+        editor.highlight_background(
+            HighlightKey::DocumentHighlightRead,
+            ranges,
+            |_, theme| theme.colors().editor_document_highlight_read_background,
+            cx,
+        );
+    }
+
+    init_test(cx, |_| {});
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.set_state("fn mainˇ() {}");
+    cx.run_until_parked();
+
+    let notifications = Arc::new(AtomicUsize::new(0));
+    let editor = cx.editor.clone();
+    let _subscription = cx.update(|_, cx| {
+        let notifications = notifications.clone();
+        cx.observe(&editor, move |_, _| {
+            notifications.fetch_add(1, atomic::Ordering::SeqCst);
+        })
+    });
+
+    cx.update_editor(|editor, _, cx| highlight_read_ranges(editor, &[], cx));
+    cx.update_editor(|editor, _, cx| highlight_read_ranges(editor, &[], cx));
+    cx.run_until_parked();
+    assert_eq!(
+        notifications.load(atomic::Ordering::SeqCst),
+        0,
+        "expected no notification when the key had no ranges and still has none",
+    );
+
+    let range = cx.update_editor(|editor, _, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        snapshot.anchor_before(Point::new(0, 3))..snapshot.anchor_after(Point::new(0, 7))
+    });
+    cx.update_editor(|editor, _, cx| highlight_read_ranges(editor, &[range], cx));
+    cx.run_until_parked();
+    let notifications_after_adding = notifications.load(atomic::Ordering::SeqCst);
+    assert!(
+        notifications_after_adding > 0,
+        "expected a notification when ranges are added",
+    );
+
+    cx.update_editor(|editor, _, cx| highlight_read_ranges(editor, &[], cx));
+    cx.run_until_parked();
+    assert!(
+        notifications.load(atomic::Ordering::SeqCst) > notifications_after_adding,
+        "expected a notification when ranges are removed",
+    );
+}
+
+#[gpui::test]
+async fn test_refreshing_document_highlights_without_any_before_or_after_does_not_notify(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+    update_test_editor_settings(cx, &|settings| {
+        settings.cursor_blink = Some(false);
+    });
+
+    let mut cx = EditorLspTestContext::new_rust(
+        lsp::ServerCapabilities {
+            document_highlight_provider: Some(lsp::OneOf::Left(true)),
+            ..lsp::ServerCapabilities::default()
+        },
+        cx,
+    )
+    .await;
+    let debounce = Duration::from_millis(
+        cx.update(|_, cx| EditorSettings::get_global(cx).lsp_highlight_debounce.0),
+    );
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let _request_handler =
+        cx.set_request_handler::<lsp::request::DocumentHighlightRequest, _, _>({
+            let request_count = request_count.clone();
+            move |_, _, _| {
+                request_count.fetch_add(1, atomic::Ordering::SeqCst);
+                async move { Ok(Some(Vec::new())) }
+            }
+        });
+    cx.set_state(indoc! {"
+        fn main() {
+            let foo = 1;
+            fˇoo;
+        }
+    "});
+    cx.executor()
+        .advance_clock(CODE_ACTIONS_DEBOUNCE_TIMEOUT * 4);
+    cx.run_until_parked();
+    let requests_before_refresh = request_count.load(atomic::Ordering::SeqCst);
+
+    let notifications = Arc::new(AtomicUsize::new(0));
+    let editor = cx.editor.clone();
+    let _subscription = cx.update(|_, cx| {
+        let notifications = notifications.clone();
+        cx.observe(&editor, move |_, _| {
+            notifications.fetch_add(1, atomic::Ordering::SeqCst);
+        })
+    });
+    cx.update_editor(|editor, _, cx| {
+        editor.refresh_document_highlights(cx);
+    });
+    cx.executor().advance_clock(debounce);
+    cx.run_until_parked();
+
+    assert_eq!(
+        request_count.load(atomic::Ordering::SeqCst),
+        requests_before_refresh + 1,
+        "expected the refresh to query the server",
+    );
+    assert_eq!(document_highlight_count(&mut cx), 0);
+    assert_eq!(
+        notifications.load(atomic::Ordering::SeqCst),
+        0,
+        "expected an empty response to not notify when there were no document highlights before",
+    );
+}
+
+#[gpui::test]
 async fn test_indent_guides_stop_at_excerpt_boundaries(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
