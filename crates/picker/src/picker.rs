@@ -692,6 +692,10 @@ impl<D: PickerDelegate> Picker<D> {
         self
     }
 
+    pub fn initial_gui_width(self, width: Rems, window: &Window) -> Self {
+        self.initial_width(shape::gui_width(width, window))
+    }
+
     /// Overrides the picker's max height. Plain pickers default to
     /// [`DEFAULT_MODAL_MAX_HEIGHT`] and shrink below it to fit their content;
     /// only call this for pickers that want a different cap (e.g. the outline
