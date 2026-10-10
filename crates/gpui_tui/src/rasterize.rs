@@ -46,6 +46,11 @@ fn covered_cells(start: f32, end: f32, cell_size: f32) -> Range<i32> {
     first..last
 }
 
+fn cells_with_centers_between(min: f32, max: f32, cell_size: f32) -> Range<i32> {
+    let half = cell_size / 2.;
+    ((min - half) / cell_size).ceil() as i32..((max - half) / cell_size).floor() as i32 + 1
+}
+
 fn intersect(a: Range<i32>, b: &Range<i32>) -> Range<i32> {
     a.start.max(b.start)..a.end.min(b.end)
 }
@@ -167,6 +172,7 @@ pub(crate) struct RasterScratch {
     placements: Vec<Option<Placement>>,
     line_cursors: Vec<LineCursor>,
     rules_by_row: Vec<Vec<Range<i32>>>,
+    path_cells: Vec<bool>,
 }
 
 pub(crate) fn rasterize_scene(
@@ -689,19 +695,50 @@ impl Rasterizer<'_> {
         let rgba = color.to_rgb();
         let rows = intersect(covered_rows(&rect), &(0..self.grid.rows.into()));
         let cols = intersect(covered_cols(&rect), &(0..self.grid.cols.into()));
-        for row in rows {
-            for col in cols.clone() {
-                let center = device_cell_center(col, row);
-                let covered = path.vertices.chunks_exact(3).any(|triangle| {
-                    let triangle = [0, 1, 2].map(|index| {
-                        let position = triangle[index].xy_position;
-                        (position.x.0, position.y.0)
-                    });
-                    triangle_contains(&triangle, (center.x, center.y))
-                });
-                if covered && let Some(cell) = self.grid.cell_mut(col, row) {
-                    cell.bg = canvas_if_untouched(cell.bg, self.canvas).blend_rgba(rgba);
+        if rows.is_empty() || cols.is_empty() {
+            return;
+        }
+        let width = cols.len();
+        let path_cells = &mut self.scratch.path_cells;
+        path_cells.clear();
+        path_cells.resize(rows.len() * width, false);
+        for triangle in path.vertices.chunks_exact(3) {
+            let triangle = [0, 1, 2].map(|index| {
+                let position = triangle[index].xy_position;
+                (position.x.0, position.y.0)
+            });
+            let min = |values: [f32; 3]| values.into_iter().fold(f32::INFINITY, f32::min);
+            let max = |values: [f32; 3]| values.into_iter().fold(f32::NEG_INFINITY, f32::max);
+            let (xs, ys) = (triangle.map(|point| point.0), triangle.map(|point| point.1));
+            let triangle_rows = intersect(
+                cells_with_centers_between(min(ys), max(ys), CELL_HEIGHT),
+                &rows,
+            );
+            let triangle_cols = intersect(
+                cells_with_centers_between(min(xs), max(xs), CELL_WIDTH),
+                &cols,
+            );
+            for row in triangle_rows {
+                for col in triangle_cols.clone() {
+                    let index = (row - rows.start) as usize * width + (col - cols.start) as usize;
+                    let center = device_cell_center(col, row);
+                    if let Some(covered) = path_cells.get_mut(index)
+                        && !*covered
+                    {
+                        *covered = triangle_contains(&triangle, (center.x, center.y));
+                    }
                 }
+            }
+        }
+        for (index, _) in path_cells
+            .iter()
+            .enumerate()
+            .filter(|(_, covered)| **covered)
+        {
+            let col = cols.start + (index % width) as i32;
+            let row = rows.start + (index / width) as i32;
+            if let Some(cell) = self.grid.cell_mut(col, row) {
+                cell.bg = canvas_if_untouched(cell.bg, self.canvas).blend_rgba(rgba);
             }
         }
     }
