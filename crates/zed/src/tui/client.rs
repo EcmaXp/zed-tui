@@ -369,6 +369,10 @@ impl Style {
 }
 
 impl Pen {
+    fn shows(&self, style: &Style) -> bool {
+        self.plan(style).is_none()
+    }
+
     fn after(&self, style: &Style, wanted: CellAttrs, resets: bool) -> Pen {
         let mut pen = *self;
         if resets {
@@ -425,7 +429,11 @@ impl Pen {
         push_reset(style, wanted, &mut reset);
         let reset_len = usize::from(reset.count > 0) + reset.len();
         let resets = reset_len < changes.len();
-        Some(SgrPlan { resets, wanted })
+        Some(SgrPlan {
+            len: 3 + if resets { reset_len } else { changes.len() },
+            resets,
+            wanted,
+        })
     }
 
     fn write_plan(
@@ -549,6 +557,7 @@ impl<W: Write> SgrSink for ParamWriter<'_, W> {
 
 #[derive(Clone, Copy)]
 struct SgrPlan {
+    len: usize,
     resets: bool,
     wanted: CellAttrs,
 }
@@ -846,13 +855,141 @@ impl<W: Write> Terminal<W> {
         let drawn = self
             .plan_draw(cells, range, blank_tail_start, &mut scratch)
             .and_then(|drawn_to| {
-                for segment in &scratch.segments {
-                    self.draw_segment(row, segment, &scratch.text)?;
-                }
+                self.draw_planned(row, &mut scratch)?;
                 Ok(drawn_to)
             });
         self.draw_scratch = scratch;
         drawn
+    }
+
+    fn draw_planned(&mut self, row: u16, scratch: &mut DrawScratch) -> io::Result<()> {
+        match self.plan_grouped_order(row, scratch) {
+            None => scratch
+                .segments
+                .iter()
+                .try_for_each(|segment| self.draw_segment(row, segment, &scratch.text)),
+            Some(PlannedOrder::Grouped) => scratch
+                .order
+                .iter()
+                .zip(&scratch.plans)
+                .filter_map(|(index, plan)| Some((scratch.segments.get(*index)?, plan)))
+                .try_for_each(|(segment, plan)| {
+                    self.draw_planned_segment(row, segment, plan, &scratch.text)
+                }),
+            Some(PlannedOrder::InOrder) => scratch
+                .segments
+                .iter()
+                .zip(&scratch.in_order_plans)
+                .try_for_each(|(segment, plan)| {
+                    self.draw_planned_segment(row, segment, plan, &scratch.text)
+                }),
+        }
+    }
+
+    fn plan_grouped_order(&self, row: u16, scratch: &mut DrawScratch) -> Option<PlannedOrder> {
+        let DrawScratch {
+            segments,
+            styles,
+            style_counts,
+            shown,
+            order,
+            plans,
+            in_order_plans,
+            pending,
+            deferred,
+            steps,
+            has_clusters,
+            ..
+        } = scratch;
+        if *steps <= 2 || *has_clusters || styles.len() < 2 {
+            return None;
+        }
+        let start = DrawState {
+            pen: self.pen,
+            cursor: self.cursor,
+        };
+        style_counts.clear();
+        style_counts.resize(styles.len(), 0);
+        for segment in segments.iter() {
+            if let Some(count) = style_counts.get_mut(segment.style_id) {
+                *count += 1;
+            }
+        }
+        let mut state = start;
+        let mut grouped = 0usize;
+        order.clear();
+        plans.clear();
+        pending.clear();
+        pending.extend(0..segments.len());
+        let mut leader = None;
+        loop {
+            if let Some(index) = leader
+                && let Some(segment) = segments.get(index)
+            {
+                let (bytes, plan) = state.plan_segment(row, segment, false);
+                grouped = grouped.saturating_add(bytes);
+                order.push(index);
+                plans.push(plan);
+                if let Some(count) = style_counts.get_mut(segment.style_id) {
+                    *count = count.saturating_sub(1);
+                }
+            }
+            shown.clear();
+            shown.resize(styles.len(), None);
+            let any_shown = styles
+                .iter()
+                .zip(style_counts.iter())
+                .zip(shown.iter_mut())
+                .any(|((style, count), known)| {
+                    *count > 0 && *known.get_or_insert_with(|| state.pen.shows(style))
+                });
+            if any_shown {
+                deferred.clear();
+                for &index in pending.iter() {
+                    let Some(segment) = segments.get(index) else {
+                        continue;
+                    };
+                    let style_shown = shown.get_mut(segment.style_id).is_some_and(|known| {
+                        *known.get_or_insert_with(|| state.pen.shows(&segment.style))
+                    });
+                    if style_shown && state.reaches(row, segment) {
+                        let (bytes, plan) = state.plan_segment(row, segment, true);
+                        grouped = grouped.saturating_add(bytes);
+                        order.push(index);
+                        plans.push(plan);
+                        if let Some(count) = style_counts.get_mut(segment.style_id) {
+                            *count = count.saturating_sub(1);
+                        }
+                    } else {
+                        deferred.push(index);
+                    }
+                }
+                std::mem::swap(pending, deferred);
+            }
+            if pending.is_empty() {
+                break;
+            }
+            leader = Some(pending.remove(0));
+        }
+        if order
+            .iter()
+            .enumerate()
+            .all(|(position, index)| position == *index)
+        {
+            return Some(PlannedOrder::Grouped);
+        }
+        let mut state = start;
+        in_order_plans.clear();
+        let mut in_order = 0usize;
+        for segment in segments.iter() {
+            let (bytes, plan) = state.plan_segment(row, segment, false);
+            in_order = in_order.saturating_add(bytes);
+            if in_order > grouped {
+                return Some(PlannedOrder::Grouped);
+            }
+            in_order_plans.push(plan);
+        }
+        Some(PlannedOrder::InOrder)
     }
 
     fn plan_draw(
@@ -866,6 +1003,9 @@ impl<W: Write> Terminal<W> {
         let visible_cols = cells.len().min(cols);
         scratch.segments.clear();
         scratch.text.clear();
+        scratch.styles.clear();
+        scratch.steps = 0;
+        scratch.has_clusters = false;
         let mut col = range.start;
         while col < range.end {
             let Some(cell) = cells.get(col) else {
@@ -875,6 +1015,7 @@ impl<W: Write> Terminal<W> {
                 col += 1;
                 continue;
             }
+            scratch.steps += 1;
             let background = PenColor::background(cell);
             let blank_run = cells
                 .get(col..range.end)
@@ -890,16 +1031,20 @@ impl<W: Write> Terminal<W> {
                 MIN_ERASE_RUN
             };
             if erases_to_edge || blank_run >= min_run {
-                let kind = if erases_to_edge {
-                    SegmentKind::EraseToEdge
+                let (kind, content) = if erases_to_edge {
+                    (SegmentKind::EraseToEdge, 3)
                 } else {
-                    SegmentKind::Erase(blank_run)
+                    (SegmentKind::Erase(blank_run), 3 + decimal_len(blank_run))
                 };
+                let style = Style::blank(background);
+                let style_id = style_id_of(&mut scratch.styles, style);
                 scratch.segments.push(DrawSegment {
                     col,
-                    style: Style::blank(background),
+                    style,
+                    style_id,
                     kind,
                     is_blank_glyph: false,
+                    content,
                     cursor_after: Some(col),
                 });
                 if erases_to_edge {
@@ -918,6 +1063,7 @@ impl<W: Write> Terminal<W> {
             };
             let next_col = col + width;
             let character = glyph.as_char();
+            scratch.has_clusters |= character.is_none();
             let text_start = scratch.text.len();
             match character {
                 Some(character) => scratch
@@ -926,6 +1072,7 @@ impl<W: Write> Terminal<W> {
                 None => glyph.write_to(&mut scratch.text)?,
             }
             let text_end = scratch.text.len();
+            let content = text_end - text_start;
             let cursor_after = (next_col < cols && character.is_some()).then_some(next_col);
             let style = Style::of_cell(cell, self.features.ghostty);
             let is_blank_glyph = style.fg.is_none();
@@ -934,6 +1081,7 @@ impl<W: Write> Terminal<W> {
                     style: last_style,
                     kind: SegmentKind::Glyphs { end, .. },
                     is_blank_glyph: last_is_blank,
+                    content: last_content,
                     cursor_after: last_cursor_after,
                     ..
                 }) if *last_cursor_after == Some(col)
@@ -944,17 +1092,21 @@ impl<W: Write> Terminal<W> {
                             && !last_style.attrs.contains(CellAttrs::UNDERLINE))) =>
                 {
                     *end = text_end;
+                    *last_content += content;
                     *last_cursor_after = cursor_after;
                 }
                 _ => {
+                    let style_id = style_id_of(&mut scratch.styles, style);
                     scratch.segments.push(DrawSegment {
                         col,
                         style,
+                        style_id,
                         kind: SegmentKind::Glyphs {
                             start: text_start,
                             end: text_end,
                         },
                         is_blank_glyph,
+                        content,
                         cursor_after,
                     });
                 }
@@ -967,6 +1119,23 @@ impl<W: Write> Terminal<W> {
     fn draw_segment(&mut self, row: u16, segment: &DrawSegment, text: &[u8]) -> io::Result<()> {
         self.move_to(segment.col, row)?;
         self.pen.write_style(&mut self.body, segment.style)?;
+        self.write_segment_content(row, segment, text)
+    }
+
+    fn draw_planned_segment(
+        &mut self,
+        row: u16,
+        segment: &DrawSegment,
+        plan: &SegmentPlan,
+        text: &[u8],
+    ) -> io::Result<()> {
+        for step in plan.moves {
+            step.write(&mut self.body)?;
+        }
+        self.cursor = Some((segment.col, row));
+        if let Some(sgr) = &plan.sgr {
+            self.pen.write_plan(&mut self.body, &segment.style, sgr)?;
+        }
         self.write_segment_content(row, segment, text)
     }
 
@@ -989,10 +1158,42 @@ impl<W: Write> Terminal<W> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum PlannedOrder {
+    Grouped,
+    InOrder,
+}
+
+#[derive(Clone, Copy)]
+struct SegmentPlan {
+    moves: [CursorStep; 2],
+    sgr: Option<SgrPlan>,
+}
+
 #[derive(Default)]
 struct DrawScratch {
     segments: Vec<DrawSegment>,
     text: Vec<u8>,
+    steps: usize,
+    has_clusters: bool,
+    styles: Vec<Style>,
+    style_counts: Vec<usize>,
+    shown: Vec<Option<bool>>,
+    order: Vec<usize>,
+    plans: Vec<SegmentPlan>,
+    in_order_plans: Vec<SegmentPlan>,
+    pending: Vec<usize>,
+    deferred: Vec<usize>,
+}
+
+fn style_id_of(styles: &mut Vec<Style>, style: Style) -> usize {
+    match styles.iter().position(|known| *known == style) {
+        Some(style_id) => style_id,
+        None => {
+            styles.push(style);
+            styles.len() - 1
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1006,9 +1207,49 @@ enum SegmentKind {
 struct DrawSegment {
     col: usize,
     style: Style,
+    style_id: usize,
     kind: SegmentKind,
     is_blank_glyph: bool,
+    content: usize,
     cursor_after: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct DrawState {
+    pen: Pen,
+    cursor: Option<(usize, u16)>,
+}
+
+impl DrawState {
+    fn reaches(&self, row: u16, segment: &DrawSegment) -> bool {
+        !segment.is_blank_glyph || self.cursor == Some((segment.col, row))
+    }
+
+    fn plan_segment(
+        &mut self,
+        row: u16,
+        segment: &DrawSegment,
+        shown: bool,
+    ) -> (usize, SegmentPlan) {
+        let moves = if self.cursor == Some((segment.col, row)) {
+            [CursorStep::Stay, CursorStep::Stay]
+        } else {
+            shortest_move_steps(self.cursor, segment.col, row)
+        };
+        let sgr = if shown {
+            None
+        } else {
+            self.pen.plan(&segment.style)
+        };
+        if let Some(plan) = &sgr {
+            self.pen = self.pen.after(&segment.style, plan.wanted, plan.resets);
+        }
+        self.cursor = segment.cursor_after.map(|col| (col, row));
+        let bytes = moves.into_iter().map(CursorStep::len).sum::<usize>()
+            + sgr.as_ref().map_or(0, |plan| plan.len)
+            + segment.content;
+        (bytes, SegmentPlan { moves, sgr })
+    }
 }
 
 struct Renderer<W: Write> {
@@ -1628,7 +1869,7 @@ fn term_mouse(mouse: &event::MouseEvent) -> TermEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::test_support::{Random, text_row};
+    use crate::tui::test_support::{Random, source_lines, text_row};
     use alacritty_terminal::{
         Term,
         event::VoidListener,
@@ -1846,6 +2087,24 @@ mod tests {
         output
     }
 
+    #[test]
+    fn truecolor_rows_draw_each_color_in_one_pass() {
+        let (type_color, punctuation) = (Rgb::new(110, 180, 191), Rgb::new(178, 185, 198));
+        let mut grid = CellGrid::new(40, 1, Rgb::new(40, 44, 52));
+        text_row(&mut grid, 0, 0, "Alpha, Beta, Gamma, Delta");
+        for cell in grid.row_mut(0) {
+            cell.fg = if cell.glyph == ',' {
+                punctuation
+            } else {
+                type_color
+            };
+        }
+        let mut renderer = Renderer::new(Vec::new(), 40, 1);
+        let mut emulator = Emulator::new(40, 1);
+        let truecolor = render_checked(&mut renderer, &mut emulator, &grid);
+        assert_eq!(truecolor.matches("38;2;").count(), 2, "{truecolor:?}");
+    }
+
     fn random_pen_color(random: &mut Random) -> PenColor {
         const CHANNELS: [u8; 6] = [0, 7, 40, 99, 100, 255];
         if random.next(4) == 0 {
@@ -1902,6 +2161,7 @@ mod tests {
             written.write_style(&mut output, style).unwrap();
             match pen.plan(&style) {
                 Some(plan) => {
+                    assert_eq!(plan.len, output.len(), "{pen:?} {output:?}");
                     assert_eq!(
                         pen.after(&style, plan.wanted, plan.resets),
                         written,
@@ -1911,6 +2171,7 @@ mod tests {
                 None => {
                     assert!(output.is_empty(), "{pen:?} {output:?}");
                     assert_eq!(written, pen);
+                    assert!(pen.shows(&style));
                 }
             }
         }
@@ -1969,6 +2230,253 @@ mod tests {
                 .sum();
             assert_eq!(planned, output.len());
         }
+    }
+
+    #[test]
+    fn simulated_draws_match_the_bytes_they_write() {
+        let mut random = Random::new(5);
+        for _ in 0..200 {
+            let mut grid = CellGrid::new(60, 1, Rgb::new(40, 44, 52));
+            text_row(
+                &mut grid,
+                0,
+                0,
+                &source_lines(1, random.next(1000) as u64)[0],
+            );
+            for cell in grid.row_mut(0) {
+                if let PenColor::Color(color) = random_pen_color(&mut random) {
+                    cell.fg = color;
+                }
+                if random.next(6) == 0 {
+                    cell.bg = Rgb::new(50, 56, 66);
+                }
+                cell.attrs = random_attrs(&mut random) - CellAttrs::CURLY_UNDERLINE;
+            }
+            let mut terminal = Renderer::new(Vec::new(), 60, 1).terminal;
+            terminal.cursor = (random.next(2) == 0).then(|| (random.next(60), 0));
+            terminal.pen.fg = Some(random_pen_color(&mut random));
+            let cells = grid.row(0).to_vec();
+            let start = random.next(30);
+            let state_start = (terminal.pen, terminal.cursor);
+            let mut scratch = DrawScratch::default();
+            terminal
+                .plan_draw(&cells, start..60, None, &mut scratch)
+                .unwrap();
+            let mut state = DrawState {
+                pen: terminal.pen,
+                cursor: terminal.cursor,
+            };
+            assert!(scratch.segments.len() <= scratch.steps);
+            let simulated: usize = scratch
+                .segments
+                .iter()
+                .map(|segment| state.plan_segment(0, segment, false).0)
+                .sum();
+            for segment in &scratch.segments {
+                terminal.draw_segment(0, segment, &scratch.text).unwrap();
+            }
+            assert_eq!(simulated, terminal.body.len());
+            let mut reference = Renderer::new(Vec::new(), 60, 1).terminal;
+            reference.cursor = state_start.1;
+            reference.pen = state_start.0;
+            for step in reference_steps(&cells, start..60, 60) {
+                draw_reference_step(&mut reference, 0, &step);
+            }
+            assert_eq!(
+                String::from_utf8_lossy(&reference.body),
+                String::from_utf8_lossy(&terminal.body)
+            );
+            assert_eq!(state.pen, terminal.pen);
+            assert_eq!(state.cursor, terminal.cursor);
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ReferenceKind {
+        Erase(usize),
+        Glyph(Glyph, usize),
+    }
+
+    #[derive(Clone, Copy)]
+    struct ReferenceStep {
+        col: usize,
+        style: Style,
+        kind: ReferenceKind,
+    }
+
+    fn reference_steps(cells: &[Cell], range: Range<usize>, cols: usize) -> Vec<ReferenceStep> {
+        let visible_cols = cells.len().min(cols);
+        let mut steps = Vec::new();
+        let mut col = range.start;
+        while col < range.end {
+            let cell = cells[col];
+            if cell.is_wide_continuation() {
+                col += 1;
+                continue;
+            }
+            let background = PenColor::background(&cell);
+            let blank_run = cells[col..range.end]
+                .iter()
+                .take_while(|blank| is_blank_on(blank, background))
+                .count();
+            let min_run = if col + blank_run == range.end {
+                MIN_ERASE_RUN_BEFORE_MOVE
+            } else {
+                MIN_ERASE_RUN
+            };
+            if blank_run >= min_run {
+                steps.push(ReferenceStep {
+                    col,
+                    style: Style::blank(background),
+                    kind: ReferenceKind::Erase(blank_run),
+                });
+                col += blank_run;
+                continue;
+            }
+            let is_wide = cells
+                .get(col + 1)
+                .is_some_and(|next| next.is_wide_continuation());
+            let (glyph, width) = match (is_wide, col + 2 <= visible_cols) {
+                (true, true) => (cell.glyph, 2),
+                (true, false) => (Glyph::from_char(' '), 1),
+                (false, _) => (cell.glyph, 1),
+            };
+            steps.push(ReferenceStep {
+                col,
+                style: Style::of_cell(&cell, false),
+                kind: ReferenceKind::Glyph(glyph, width),
+            });
+            col += 1;
+        }
+        steps
+    }
+
+    fn draw_reference_step(terminal: &mut Terminal<Vec<u8>>, row: u16, step: &ReferenceStep) {
+        terminal.move_to(step.col, row).unwrap();
+        terminal
+            .pen
+            .write_style(&mut terminal.body, step.style)
+            .unwrap();
+        match step.kind {
+            ReferenceKind::Erase(count) => write!(terminal.body, "\x1b[{count}X").unwrap(),
+            ReferenceKind::Glyph(glyph, width) => {
+                glyph.write_to(&mut terminal.body).unwrap();
+                let next_col = step.col + width;
+                terminal.cursor = (next_col < terminal.cols as usize && glyph.as_char().is_some())
+                    .then_some((next_col, row));
+            }
+        }
+    }
+
+    fn draw_by_encoding_both_orders(
+        terminal: &mut Terminal<Vec<u8>>,
+        row: u16,
+        cells: &[Cell],
+        range: Range<usize>,
+    ) {
+        let steps = reference_steps(cells, range, terminal.cols as usize);
+        let start = terminal.body.len();
+        let (pen, cursor) = (terminal.pen, terminal.cursor);
+        for step in &steps {
+            draw_reference_step(terminal, row, step);
+        }
+        if steps.len() <= 2 {
+            return;
+        }
+        let in_order = terminal.body.split_off(start);
+        let in_order_end = (terminal.pen, terminal.cursor);
+        (terminal.pen, terminal.cursor) = (pen, cursor);
+        let joins = |terminal: &Terminal<Vec<u8>>, step: &ReferenceStep| {
+            let is_blank_glyph =
+                matches!(step.kind, ReferenceKind::Glyph(..)) && step.style.fg.is_none();
+            terminal.pen.shows(&step.style)
+                && (!is_blank_glyph || terminal.cursor == Some((step.col, row)))
+        };
+        let mut pending = steps;
+        while !pending.is_empty() {
+            if !pending.iter().any(|step| joins(terminal, step)) {
+                let leftmost = pending.remove(0);
+                draw_reference_step(terminal, row, &leftmost);
+            }
+            let mut deferred = Vec::new();
+            for step in pending {
+                if joins(terminal, &step) {
+                    draw_reference_step(terminal, row, &step);
+                } else {
+                    deferred.push(step);
+                }
+            }
+            pending = deferred;
+        }
+        if terminal.body.len() - start >= in_order.len() {
+            terminal.body.truncate(start);
+            terminal.body.extend_from_slice(&in_order);
+            (terminal.pen, terminal.cursor) = in_order_end;
+        }
+    }
+
+    #[test]
+    fn planned_regrouping_matches_encoding_both_orders() {
+        let palette = [
+            Rgb::new(110, 180, 191),
+            Rgb::new(178, 185, 198),
+            Rgb::new(180, 119, 207),
+            Rgb::new(9, 0, 255),
+        ];
+        let mut random = Random::new(13);
+        let mut regrouped = 0;
+        for _ in 0..400 {
+            let mut grid = CellGrid::new(80, 1, Rgb::new(40, 44, 52));
+            text_row(
+                &mut grid,
+                0,
+                0,
+                &source_lines(2, random.next(1000) as u64).concat(),
+            );
+            for cell in grid.row_mut(0) {
+                cell.fg = palette[random.next(palette.len())];
+                if random.next(8) == 0 {
+                    cell.bg = Rgb::new(50, 56, 66);
+                }
+                cell.attrs = match random.next(12) {
+                    0 => CellAttrs::BOLD,
+                    1 => CellAttrs::UNDERLINE,
+                    _ => CellAttrs::empty(),
+                };
+                if random.next(25) == 0 {
+                    cell.attrs |= CellAttrs::DEFAULT_FOREGROUND;
+                }
+            }
+            let cells = grid.row(0).to_vec();
+            let pen = Pen {
+                fg: Some(PenColor::Color(palette[random.next(palette.len())])),
+                ..Pen::default()
+            };
+            let cursor = (random.next(3) != 0).then(|| (random.next(80), 0));
+            let range = random.next(20)..80 - random.next(20);
+            let mut planned = Renderer::new(Vec::new(), 80, 1).terminal;
+            let mut encoded = Renderer::new(Vec::new(), 80, 1).terminal;
+            for terminal in [&mut planned, &mut encoded] {
+                terminal.pen = pen;
+                terminal.cursor = cursor;
+            }
+            let planned_end = planned.draw(0, &cells, range.clone(), None).unwrap();
+            draw_by_encoding_both_orders(&mut encoded, 0, &cells, range.clone());
+            assert_eq!(planned_end, range.end);
+            assert_eq!(
+                String::from_utf8_lossy(&planned.body),
+                String::from_utf8_lossy(&encoded.body)
+            );
+            assert_eq!((planned.pen, planned.cursor), (encoded.pen, encoded.cursor));
+            let mut in_order = Renderer::new(Vec::new(), 80, 1).terminal;
+            in_order.pen = pen;
+            in_order.cursor = cursor;
+            for step in reference_steps(&cells, range, 80) {
+                draw_reference_step(&mut in_order, 0, &step);
+            }
+            regrouped += usize::from(planned.body.len() < in_order.body.len());
+        }
+        assert!(regrouped > 100, "{regrouped}");
     }
 
     fn parse_replies(chunks: &[&[u8]]) -> QueryReplies {
