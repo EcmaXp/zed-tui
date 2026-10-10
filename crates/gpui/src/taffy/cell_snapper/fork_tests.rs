@@ -1,9 +1,14 @@
 use crate::{
-    self as gpui, App, BoxShadow, Context, DispatchPhase, FocusHandle, InteractiveElement as _,
-    IntoElement, IsZero as _, ParentElement as _, Render, Styled as _, TestAppContext,
-    TestDispatcher, Window, black, div, point, px, red,
+    self as gpui, App, BackgroundExecutor, BoxShadow, Context, DispatchPhase, FocusHandle,
+    ForegroundExecutor, InteractiveElement as _, IntoElement, IsZero as _, ParentElement as _,
+    Render, Styled as _, TestAppContext, TestDispatcher, Window, black, div, point, px, red,
 };
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    sync::Arc,
+    time::Duration,
+};
 
 crate::actions!(fork_test, [TestAction]);
 
@@ -91,6 +96,36 @@ fn test_shared_action_listener_dispatches_in_every_frame(cx: &mut TestAppContext
             DispatchPhase::Bubble,
         ]
     );
+}
+
+#[test]
+fn timers_fire_at_their_deadline_without_spawning_tasks() {
+    let dispatcher = TestDispatcher::new(0);
+    let scheduler = dispatcher.scheduler().clone();
+    let arc_dispatcher = Arc::new(dispatcher.clone());
+    let background_executor = BackgroundExecutor::new(arc_dispatcher.clone());
+    let foreground_executor = ForegroundExecutor::new(arc_dispatcher);
+
+    drop(background_executor.timer(Duration::from_millis(10)));
+    let timer = background_executor.timer(Duration::from_millis(10));
+    assert_eq!(scheduler.pending_task_counts(), (0, 0));
+
+    let fired = Rc::new(Cell::new(false));
+    foreground_executor
+        .spawn({
+            let fired = fired.clone();
+            async move {
+                timer.await;
+                fired.set(true);
+            }
+        })
+        .detach();
+
+    dispatcher.run_until_parked();
+    dispatcher.advance_clock(Duration::from_millis(9));
+    assert!(!fired.get());
+    dispatcher.advance_clock(Duration::from_millis(1));
+    assert!(fired.get());
 }
 
 #[test]
