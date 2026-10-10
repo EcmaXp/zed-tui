@@ -3,7 +3,7 @@ use crate::{
     AbsoluteLength, Bounds, DefiniteLength, Length, Pixels, Point, Size, Style, Window, size,
     util::round_half_toward_zero,
 };
-use taffy::TaffyTree;
+use taffy::{TaffyTree, TraversePartialTree as _};
 
 pub(super) struct CellSnapper {
     cell_size: Size<f32>,
@@ -30,6 +30,22 @@ impl CellSnapper {
         children: &[LayoutId],
     ) -> LayoutId {
         snap_to_cells(&mut taffy_style, style, self.cell_size, self.viewport_width);
+        if let Some(min_width) = width_around_fixed_children(tree, &taffy_style, children) {
+            let min_width = if min_width > self.viewport_width {
+                let edges =
+                    horizontal_edges(&taffy_style.border) + horizontal_edges(&taffy_style.padding);
+                narrow_fixed_children(
+                    tree,
+                    children.iter().map(|child| (*child).into()),
+                    self.viewport_width - edges,
+                    MAX_WRAPPER_DEPTH,
+                );
+                self.viewport_width
+            } else {
+                min_width
+            };
+            taffy_style.min_size.width = taffy::style::Dimension::length(min_width);
+        }
         if children.is_empty() {
             tree.new_leaf(taffy_style)
         } else {
@@ -71,6 +87,14 @@ impl CellSnapper {
     }
 }
 
+fn is_row(style: &taffy::style::Style) -> bool {
+    style.display == taffy::style::Display::Flex
+        && matches!(
+            style.flex_direction,
+            taffy::style::FlexDirection::Row | taffy::style::FlexDirection::RowReverse
+        )
+}
+
 fn snap_axis(edges: std::ops::Range<f32>, cell: f32, layout_extent: f32) -> (f32, f32) {
     let start = round_to_cell(edges.start, cell);
     let end = round_to_cell(edges.end, cell);
@@ -82,9 +106,105 @@ fn snap_axis(edges: std::ops::Range<f32>, cell: f32, layout_extent: f32) -> (f32
     (start, extent)
 }
 
+const MAX_WRAPPER_DEPTH: usize = 3;
+
+fn width_around_fixed_children(
+    tree: &TaffyTree<NodeContext>,
+    style: &taffy::style::Style,
+    children: &[LayoutId],
+) -> Option<f32> {
+    let border = horizontal_edges(&style.border);
+    if border <= 0.
+        || !style.min_size.width.is_auto()
+        || style.overflow.x == taffy::style::Overflow::Scroll
+    {
+        return None;
+    }
+    let widest = widest_fixed_width(
+        tree,
+        style,
+        children.iter().map(|child| (*child).into()),
+        MAX_WRAPPER_DEPTH,
+    )?;
+    let fitted = widest + border + horizontal_edges(&style.padding);
+    match positive_length(style.size.width) {
+        Some(width) if widest > width || fitted <= width => None,
+        _ => Some(fitted),
+    }
+}
+
+fn widest_fixed_width(
+    tree: &TaffyTree<NodeContext>,
+    style: &taffy::style::Style,
+    children: impl Iterator<Item = taffy::NodeId>,
+    depth: usize,
+) -> Option<f32> {
+    if is_row(style) {
+        return None;
+    }
+    children
+        .filter_map(|child| {
+            let child_style = tree.style(child).ok()?;
+            if child_style.position == taffy::style::Position::Absolute {
+                return None;
+            }
+            if let Some(width) = positive_length(child_style.size.width) {
+                return Some(width);
+            }
+            let widest = widest_fixed_width(
+                tree,
+                child_style,
+                tree.child_ids(child),
+                depth.checked_sub(1)?,
+            )?;
+            Some(
+                widest
+                    + horizontal_edges(&child_style.border)
+                    + horizontal_edges(&child_style.padding),
+            )
+        })
+        .reduce(f32::max)
+}
+
+fn narrow_fixed_children(
+    tree: &mut TaffyTree<NodeContext>,
+    children: impl Iterator<Item = taffy::NodeId>,
+    limit: f32,
+    depth: usize,
+) {
+    for child in children {
+        let mut child_style = tree.style(child).expect(EXPECT_MESSAGE).clone();
+        if child_style.position == taffy::style::Position::Absolute {
+            continue;
+        }
+        if let Some(width) = positive_length(child_style.size.width) {
+            if width > limit {
+                child_style.size.width = taffy::style::Dimension::length(limit);
+                tree.set_style(child, child_style).expect(EXPECT_MESSAGE);
+            }
+            continue;
+        }
+        let Some(depth) = depth.checked_sub(1) else {
+            continue;
+        };
+        let edges = horizontal_edges(&child_style.border) + horizontal_edges(&child_style.padding);
+        let grandchildren = tree.children(child).expect(EXPECT_MESSAGE);
+        narrow_fixed_children(tree, grandchildren.into_iter(), limit - edges, depth);
+    }
+}
+
+fn horizontal_edges(edges: &taffy::geometry::Rect<taffy::style::LengthPercentage>) -> f32 {
+    let length = |value: taffy::style::LengthPercentage| positive_length(value).unwrap_or(0.);
+    length(edges.left) + length(edges.right)
+}
+
 fn length_value(length: impl Into<taffy::style::Dimension>) -> Option<f32> {
     let raw = length.into().into_raw();
     (raw.tag() == taffy::style::CompactLength::LENGTH_TAG).then(|| raw.value())
+}
+
+fn positive_length(length: impl Into<taffy::style::Dimension>) -> Option<f32> {
+    length_value(length).filter(|value| *value > 0.)
 }
 
 fn snap_to_cells(
@@ -360,6 +480,116 @@ mod tests {
             widen_text_widths(&mut taffy_style, &style, 8., f32::INFINITY);
             assert_eq!(taffy_style, unchanged);
         }
+    }
+
+    #[test]
+    fn bordered_wrappers_fit_their_fixed_width_children() {
+        use taffy::style::{Dimension, LengthPercentage};
+        let mut tree = TaffyTree::<NodeContext>::new();
+        let child = tree
+            .new_leaf(taffy::style::Style {
+                size: TaffySize {
+                    width: Dimension::length(400.),
+                    height: Dimension::auto(),
+                },
+                ..Default::default()
+            })
+            .unwrap();
+        let mut wrapper = taffy::style::Style {
+            flex_direction: taffy::style::FlexDirection::Column,
+            ..Default::default()
+        };
+        wrapper.border.left = LengthPercentage::length(8.);
+        wrapper.border.right = LengthPercentage::length(8.);
+        let children = [LayoutId::from(child)];
+        assert_eq!(
+            width_around_fixed_children(&tree, &wrapper, &children),
+            Some(416.)
+        );
+        let aside = tree
+            .new_leaf(taffy::style::Style {
+                position: taffy::style::Position::Absolute,
+                size: TaffySize {
+                    width: Dimension::length(900.),
+                    height: Dimension::auto(),
+                },
+                ..Default::default()
+            })
+            .unwrap();
+        let auto_wrapper = tree
+            .new_with_children(
+                taffy::style::Style {
+                    display: taffy::style::Display::Block,
+                    ..Default::default()
+                },
+                &[child, aside],
+            )
+            .unwrap();
+        assert_eq!(
+            width_around_fixed_children(&tree, &wrapper, &[LayoutId::from(auto_wrapper)]),
+            Some(416.)
+        );
+        for (width, expected) in [(400., Some(416.)), (480., None), (300., None)] {
+            wrapper.size.width = Dimension::length(width);
+            assert_eq!(
+                width_around_fixed_children(&tree, &wrapper, &children),
+                expected,
+                "box width {width}"
+            );
+        }
+        wrapper.border.left = LengthPercentage::length(0.);
+        wrapper.border.right = LengthPercentage::length(0.);
+        assert_eq!(
+            width_around_fixed_children(&tree, &wrapper, &children),
+            None
+        );
+    }
+
+    #[test]
+    fn bordered_wrappers_stay_within_the_viewport_by_narrowing_their_children() {
+        use taffy::style::{Dimension, LengthPercentage};
+        let fixed = |width| taffy::style::Style {
+            size: TaffySize {
+                width: Dimension::length(width),
+                height: Dimension::auto(),
+            },
+            ..Default::default()
+        };
+        let mut tree = TaffyTree::<NodeContext>::new();
+        let results = tree.new_leaf(fixed(640.)).unwrap();
+        let footer = tree.new_leaf(fixed(320.)).unwrap();
+        let column = tree
+            .new_with_children(
+                taffy::style::Style {
+                    display: taffy::style::Display::Block,
+                    ..Default::default()
+                },
+                &[results],
+            )
+            .unwrap();
+        let mut frame = taffy::style::Style {
+            flex_direction: taffy::style::FlexDirection::Column,
+            ..Default::default()
+        };
+        frame.border.left = LengthPercentage::length(8.);
+        frame.border.right = LengthPercentage::length(8.);
+
+        let mut snapper = CellSnapper::new(size(8., 16.));
+        snapper.set_viewport_width(640.);
+        let frame = snapper.request_layout(
+            &mut tree,
+            frame,
+            &Style::default(),
+            &[LayoutId::from(column), LayoutId::from(footer)],
+        );
+
+        let width = |node| tree.style(node).unwrap().size.width;
+        assert_eq!(
+            tree.style(frame.into()).unwrap().min_size.width,
+            Dimension::length(640.)
+        );
+        assert_eq!(width(results), Dimension::length(624.));
+        assert_eq!(width(footer), Dimension::length(320.));
     }
 
     #[test]
