@@ -1,24 +1,26 @@
 use std::ops::Range;
 
 use gpui::{
-    AtlasKey, Bounds, ContentMask, Hsla, MonochromeSprite, Path, Point, PrimitiveBatch, Quad, Rgba,
-    ScaledPixels, Scene, Underline,
+    AtlasKey, Bounds, ContentMask, Hsla, IsZero, MonochromeSprite, Path, Point, PrimitiveBatch,
+    Quad, Rgba, ScaledPixels, Scene, Underline,
 };
 
 use crate::{
     CELL_HEIGHT, CELL_WIDTH,
     atlas::TuiAtlas,
-    device_cell_center,
-    grid::{Cell, CellAttrs, CellGrid, Glyph, Rgb, UnderlineColor},
+    caret_cell, device_cell_center,
+    grid::{Cell, CellAttrs, CellGrid, CursorPosition, CursorShape, Glyph, Rgb, UnderlineColor},
     text_system::{is_bold, is_italic},
 };
 
 const OPAQUE_ALPHA: f32 = 0.9;
 const MIN_BOXED_ROWS: usize = 2;
 const MIN_RULED_ROWS: usize = 3;
+const MAX_GLYPH_COLS: usize = 2;
 const MIN_LINE_CONTRAST: u32 = 12;
 const CONTIGUOUS_EPSILON: f32 = 0.5;
 const SAME_LINE_TOLERANCE: f32 = 3.;
+const HOLLOW_CURSOR_TINT: f32 = 0.5;
 
 fn to_bounds(bounds: &Bounds<ScaledPixels>) -> Bounds<f32> {
     bounds.map(|value| value.0)
@@ -75,6 +77,89 @@ fn cell_of(x: f32, y: f32) -> (i32, i32) {
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CaretCandidate {
+    pub(crate) cell: CursorPosition,
+    pub(crate) color: Rgb,
+    pub(crate) shape: CursorShape,
+    pub(crate) drew_bar: bool,
+    pub(crate) covered_cell: Cell,
+    pub(crate) drawn_cell: Cell,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CaretMode {
+    TerminalCursor,
+}
+
+pub(crate) fn resolve_carets(
+    grid: &mut CellGrid,
+    carets: &[CaretCandidate],
+    focused: Option<CursorPosition>,
+    last_caret_color: Option<Rgb>,
+    mode: CaretMode,
+) -> Option<Rgb> {
+    let focused_caret =
+        focused.and_then(|focused| carets.iter().rev().find(|caret| caret.cell == focused));
+    let caret_color = match focused_caret {
+        Some(focused_caret) => {
+            if mode == CaretMode::TerminalCursor {
+                place_terminal_cursor(grid, focused_caret);
+            }
+            focused_caret.color
+        }
+        None => last_caret_color?,
+    };
+    let terminal_cursor = grid.cursor;
+    for caret in carets.iter().filter(|caret| {
+        caret.shape == CursorShape::Bar
+            && caret.color == caret_color
+            && Some(caret.cell) != terminal_cursor
+    }) {
+        draw_block_caret(grid, caret);
+    }
+    Some(caret_color)
+}
+
+fn place_terminal_cursor(grid: &mut CellGrid, caret: &CaretCandidate) {
+    grid.cursor = Some(caret.cell);
+    grid.cursor_shape = caret.shape;
+    let Some(cell) = grid.cell_mut(caret.cell.col.into(), caret.cell.row.into()) else {
+        return;
+    };
+    if caret.shape == CursorShape::Bar {
+        if caret.drew_bar && cell.glyph == '│' {
+            cell.glyph = ' '.into();
+        }
+    } else if *cell == caret.drawn_cell {
+        *cell = caret.covered_cell;
+    }
+}
+
+fn draw_block_caret(grid: &mut CellGrid, caret: &CaretCandidate) {
+    let (col, row) = (i32::from(caret.cell.col), i32::from(caret.cell.row));
+    if grid.cell(col, row) != Some(&caret.drawn_cell) {
+        return;
+    }
+    let lead = if caret.drawn_cell.is_wide_continuation() {
+        col - 1
+    } else {
+        col
+    };
+    let width = grid
+        .cell(lead, row)
+        .map_or(1, |cell| cell.glyph.cells() as i32);
+    for block_col in lead..lead + width {
+        if let Some(cell) = grid.cell_mut(block_col, row) {
+            if caret.drew_bar && cell.glyph == '│' {
+                cell.glyph = ' '.into();
+            }
+            cell.fg = cell.bg;
+            cell.bg = caret.color;
+        }
+    }
+}
+
 #[derive(Default)]
 struct RasterScratch {
     candidates: Vec<TextCandidate>,
@@ -90,7 +175,7 @@ pub(crate) fn rasterize_scene(
     cols: u16,
     rows: u16,
     canvas: Rgb,
-) -> CellGrid {
+) -> (CellGrid, Vec<CaretCandidate>) {
     let scratch = &mut RasterScratch::default();
     layout_text(scene, atlas, icon_glyph, scratch);
     scratch.rules_by_row.resize_with(rows as usize, Vec::new);
@@ -98,6 +183,7 @@ pub(crate) fn rasterize_scene(
         grid: CellGrid::new(cols, rows, Rgb::default()),
         canvas,
         scratch,
+        carets: Vec::new(),
     };
     for batch in scene.batches() {
         match batch {
@@ -127,7 +213,7 @@ pub(crate) fn rasterize_scene(
             | PrimitiveBatch::Surfaces(_) => {}
         }
     }
-    rasterizer.grid
+    (rasterizer.grid, rasterizer.carets)
 }
 
 type SpriteId = usize;
@@ -277,6 +363,7 @@ struct Rasterizer<'a> {
     grid: CellGrid,
     canvas: Rgb,
     scratch: &'a mut RasterScratch,
+    carets: Vec<CaretCandidate>,
 }
 
 impl Rasterizer<'_> {
@@ -334,9 +421,20 @@ impl Rasterizer<'_> {
     }
 
     fn vertical_bar(&mut self, rect: &Bounds<f32>, color: Hsla) {
+        let center = rect.center();
         let rgba = color.to_rgb();
-        let col = (rect.center().x / CELL_WIDTH).floor() as i32;
-        for row in covered_rows(rect) {
+        let rows = covered_rows(rect);
+        if rows.len() <= 1 {
+            let (col, row) = caret_cell(rect.left(), center.y);
+            let Some(covered_cell) = self.grid.cell(col, row).copied() else {
+                return;
+            };
+            let drew_bar = self.line_char(col, row, '│', rgba);
+            self.push_caret(col, row, CursorShape::Bar, rgba, covered_cell, drew_bar);
+            return;
+        }
+        let col = (center.x / CELL_WIDTH).floor() as i32;
+        for row in rows {
             self.divider_char(col, row, rgba);
         }
     }
@@ -355,6 +453,21 @@ impl Rasterizer<'_> {
         let row = (rect.center().y / CELL_HEIGHT).floor() as i32;
         let rgba = color.to_rgb();
         let cols = covered_cols(rect);
+        if cols.len() <= MAX_GLYPH_COLS {
+            let covered_cell = self.grid.cell(cols.start, row).copied();
+            self.underline_cells(row, cols.clone(), rgba);
+            if let Some(covered_cell) = covered_cell.filter(|_| !cols.is_empty()) {
+                self.push_caret(
+                    cols.start,
+                    row,
+                    CursorShape::Underline,
+                    rgba,
+                    covered_cell,
+                    false,
+                );
+            }
+            return;
+        }
         let mut drew = false;
         for col in cols.clone() {
             drew |= self.line_char(col, row, '─', rgba);
@@ -409,6 +522,29 @@ impl Rasterizer<'_> {
         let (first_row, last_row) = (rows.start, rows.end - 1);
         let edges = quad.border_widths;
         let color = quad.border_color.to_rgb();
+        if rows.len() == 1
+            && cols.len() <= MAX_GLYPH_COLS
+            && edges.left.0 > 0.
+            && quad.corner_radii.is_zero()
+        {
+            let is_top_border_strip = clipped.top() <= full.top();
+            if !is_top_border_strip {
+                return;
+            }
+            let covered_cell = self.grid.cell(first_col, first_row).copied();
+            self.hollow_cells(first_row, cols, color);
+            if let Some(covered_cell) = covered_cell {
+                self.push_caret(
+                    first_col,
+                    first_row,
+                    CursorShape::Block,
+                    color,
+                    covered_cell,
+                    false,
+                );
+            }
+            return;
+        }
         let is_boxed = [edges.top, edges.right, edges.bottom, edges.left]
             .iter()
             .all(|width| width.0 > 0.);
@@ -512,6 +648,59 @@ impl Rasterizer<'_> {
         }
     }
 
+    fn underline_cells(&mut self, row: i32, cols: Range<i32>, color: Rgba) {
+        for col in cols {
+            if let Some(cell) = self.grid.cell_mut(col, row) {
+                let underline = cell.bg.blend_rgba(color);
+                if cell.glyph == ' ' {
+                    cell.fg = underline;
+                }
+                cell.attrs.remove(CellAttrs::CURLY_UNDERLINE);
+                cell.attrs.insert(CellAttrs::UNDERLINE);
+                cell.underline = UnderlineColor::of(underline);
+            }
+        }
+    }
+
+    fn hollow_cells(&mut self, row: i32, cols: Range<i32>, color: Rgba) {
+        let tint = Rgba {
+            a: color.a * HOLLOW_CURSOR_TINT,
+            ..color
+        };
+        let canvas = self.canvas;
+        for col in cols {
+            if let Some(cell) = self.grid.cell_mut(col, row) {
+                cell.bg = canvas_if_untouched(cell.bg, canvas).blend_rgba(tint);
+            }
+        }
+    }
+
+    fn push_caret(
+        &mut self,
+        col: i32,
+        row: i32,
+        shape: CursorShape,
+        color: Rgba,
+        covered_cell: Cell,
+        drew_bar: bool,
+    ) {
+        if let (Ok(caret_col), Ok(caret_row)) = (u16::try_from(col), u16::try_from(row))
+            && let Some(drawn_cell) = self.grid.cell(col, row).copied()
+        {
+            self.carets.push(CaretCandidate {
+                cell: CursorPosition {
+                    col: caret_col,
+                    row: caret_row,
+                },
+                color: covered_cell.bg.blend_rgba(color),
+                shape,
+                drew_bar,
+                covered_cell,
+                drawn_cell,
+            });
+        }
+    }
+
     fn sprite(&mut self, id: SpriteId) {
         if let Some(placement) = self.scratch.placements.get(id).copied().flatten() {
             self.put_char(
@@ -586,13 +775,18 @@ mod tests {
         px, size,
     };
 
-    fn rasterize(scene: &Scene, atlas: &TuiAtlas, cols: u16, rows: u16) -> CellGrid {
+    fn rasterize(
+        scene: &Scene,
+        atlas: &TuiAtlas,
+        cols: u16,
+        rows: u16,
+    ) -> (CellGrid, Vec<CaretCandidate>) {
         rasterize_scene(scene, atlas, &chevron_icon, cols, rows, Rgb::default())
     }
 
     fn rasterize_on(scene: &Scene, canvas: Rgb, cols: u16, rows: u16) -> CellGrid {
         let atlas = TuiAtlas::default();
-        rasterize_scene(scene, &atlas, &chevron_icon, cols, rows, canvas)
+        rasterize_scene(scene, &atlas, &chevron_icon, cols, rows, canvas).0
     }
 
     fn fill_quad(x: f32, y: f32, width: f32, height: f32, color: Hsla) -> Quad {
@@ -669,7 +863,7 @@ mod tests {
             let mut scene = Scene::default();
             scene.insert_primitive(path);
             scene.finish();
-            let grid = rasterize(&scene, &atlas, cols, rows);
+            let grid = rasterize(&scene, &atlas, cols, rows).0;
             assert_eq!(grid, expected);
             covering_paths += (grid.cells.iter().any(|cell| cell.bg != Rgb::default())) as usize;
         }
@@ -702,13 +896,13 @@ mod tests {
         };
         scene.insert_primitive(border(background));
         scene.finish();
-        let grid = rasterize(&scene, &atlas, 4, 4);
+        let grid = rasterize(&scene, &atlas, 4, 4).0;
         assert_eq!(grid.row_text(0), "    ");
 
         let mut scene = Scene::default();
         scene.insert_primitive(border(Hsla::white()));
         scene.finish();
-        let grid = rasterize(&scene, &atlas, 4, 4);
+        let grid = rasterize(&scene, &atlas, 4, 4).0;
         assert_eq!(grid.row_text(0), "┌──┐");
         assert_eq!(grid.row_text(1), "│  │");
         assert_eq!(grid.row_text(3), "└──┘");
@@ -736,7 +930,7 @@ mod tests {
         scene.insert_primitive(glyph_sprite(&atlas, 'x', 0.));
         scene.insert_primitive(glyph_sprite(&atlas, 'y', 16.));
         scene.finish();
-        let grid = rasterize(&scene, &atlas, 4, 2);
+        let grid = rasterize(&scene, &atlas, 4, 2).0;
         let curly = CellAttrs::UNDERLINE | CellAttrs::CURLY_UNDERLINE;
         let wavy = grid.cell(0, 0).unwrap();
         assert_eq!(wavy.glyph, 'x');
@@ -816,14 +1010,14 @@ mod tests {
     #[test]
     fn one_row_quads_only_get_side_borders() {
         let atlas = TuiAtlas::default();
-        let grid = rasterize(&bordered_quad(32., 16.), &atlas, 4, 1);
+        let grid = rasterize(&bordered_quad(32., 16.), &atlas, 4, 1).0;
         assert_eq!(grid.row_text(0), "│  │");
     }
 
     #[test]
     fn two_row_quads_get_a_full_frame() {
         let atlas = TuiAtlas::default();
-        let grid = rasterize(&bordered_quad(32., 26.), &atlas, 4, 2);
+        let grid = rasterize(&bordered_quad(32., 26.), &atlas, 4, 2).0;
         assert_eq!(grid.row_text(0), "┌──┐");
         assert_eq!(grid.row_text(1), "└──┘");
     }
@@ -843,8 +1037,251 @@ mod tests {
             ..Default::default()
         });
         scene.finish();
-        let grid = rasterize(&scene, &atlas, 4, 2);
+        let grid = rasterize(&scene, &atlas, 4, 2).0;
         assert_eq!(grid.row_text(1), "    ");
+    }
+
+    fn hollow_cursor(x: f32, width: f32, color: Hsla) -> Quad {
+        Quad {
+            bounds: scaled_bounds(x, 0., width, 16.),
+            content_mask: full_mask(),
+            border_color: color,
+            border_widths: gpui::Edges::all(ScaledPixels(1.)),
+            ..Default::default()
+        }
+    }
+
+    fn underline_cursor(x: f32, width: f32, color: Hsla) -> Quad {
+        fill_quad(x, 14., width, 2., color)
+    }
+
+    fn cursor_row(cursors: &[Quad]) -> CellGrid {
+        let atlas = TuiAtlas::default();
+        let mut scene = Scene::default();
+        scene.insert_primitive(glyph_sprite(&atlas, 'a', 0.));
+        let mut wide_glyph = glyph_sprite(&atlas, '한', 16.);
+        wide_glyph.bounds.size.width = ScaledPixels(16.);
+        scene.insert_primitive(wide_glyph);
+        for cursor in cursors {
+            scene.insert_primitive(*cursor);
+        }
+        scene.finish();
+        rasterize(&scene, &atlas, 6, 1).0
+    }
+
+    fn underlined_cols(grid: &CellGrid) -> Vec<usize> {
+        grid.row(0)
+            .iter()
+            .enumerate()
+            .filter(|(_, cell)| cell.attrs.contains(CellAttrs::UNDERLINE))
+            .map(|(col, _)| col)
+            .collect()
+    }
+
+    fn tinted_cols(grid: &CellGrid) -> Vec<usize> {
+        grid.row(0)
+            .iter()
+            .enumerate()
+            .filter(|(_, cell)| cell.bg != Rgb::default())
+            .map(|(col, _)| col)
+            .collect()
+    }
+
+    #[test]
+    fn hollow_cursors_tint_their_cells_instead_of_underlining_them() {
+        let cursor = Hsla::from(gpui::rgb(0x74ade8));
+        let grid = cursor_row(&[
+            hollow_cursor(0., 8., cursor),
+            hollow_cursor(16., 16., cursor),
+            hollow_cursor(40., 8., cursor),
+        ]);
+        assert_eq!(grid.row_text(0), "a 한  ");
+        assert_eq!(underlined_cols(&grid), Vec::<usize>::new());
+        assert_eq!(tinted_cols(&grid), [0, 2, 3, 5]);
+        let tint = Rgb::default().blend(cursor.opacity(HOLLOW_CURSOR_TINT));
+        for col in [0, 2, 3, 5] {
+            assert_eq!(grid.cell(col, 0).unwrap().bg, tint);
+        }
+        assert_eq!(grid.cell(0, 0).unwrap().fg, rgb(255, 255, 255));
+        assert_eq!(grid.cell(2, 0).unwrap().fg, rgb(255, 255, 255));
+    }
+
+    #[test]
+    fn hollow_cursors_split_into_border_strips_tint_their_cell_once() {
+        let cursor = Hsla::from(gpui::rgb(0x74ade8));
+        let strips = [
+            (0., 0., 8., 1.),
+            (0., 15., 8., 1.),
+            (0., 1., 1., 14.),
+            (7., 1., 1., 14.),
+        ];
+        let atlas = TuiAtlas::default();
+        let mut scene = Scene::default();
+        for (x, y, width, height) in strips {
+            scene.insert_primitive(Quad {
+                content_mask: ContentMask {
+                    bounds: scaled_bounds(x, y, width, height),
+                },
+                ..hollow_cursor(0., 8., cursor)
+            });
+        }
+        scene.finish();
+        let (grid, carets) = rasterize(&scene, &atlas, 2, 1);
+        let tint = Rgb::default().blend(cursor.opacity(HOLLOW_CURSOR_TINT));
+        assert_eq!(grid.cell(0, 0).unwrap().bg, tint);
+        assert_eq!(carets.len(), 1);
+    }
+
+    #[test]
+    fn underline_and_hollow_cursors_are_caret_candidates_with_their_shape() {
+        let atlas = TuiAtlas::default();
+        let mut scene = Scene::default();
+        scene.insert_primitive(glyph_sprite(&atlas, 'a', 0.));
+        scene.insert_primitive(underline_cursor(0., 8., Hsla::white()));
+        scene.insert_primitive(hollow_cursor(16., 8., Hsla::red()));
+        scene.insert_primitive(caret_bar(32., Hsla::white()));
+        scene.finish();
+        let (_, carets) = rasterize(&scene, &atlas, 6, 1);
+        let mut found: Vec<_> = carets
+            .iter()
+            .map(|caret| (caret.cell.col, caret.shape, caret.color))
+            .collect();
+        found.sort_by_key(|(col, _, _)| *col);
+        assert_eq!(
+            found,
+            [
+                (0, CursorShape::Underline, rgb(255, 255, 255)),
+                (2, CursorShape::Block, rgb(255, 0, 0)),
+                (4, CursorShape::Bar, rgb(255, 255, 255)),
+            ]
+        );
+    }
+
+    fn focused_cursor_cell(cursor: Quad, mode: CaretMode) -> (CellGrid, Option<Rgb>) {
+        let atlas = TuiAtlas::default();
+        let mut scene = Scene::default();
+        scene.insert_primitive(glyph_sprite(&atlas, 'a', 0.));
+        scene.insert_primitive(cursor);
+        scene.finish();
+        let (mut grid, carets) = rasterize(&scene, &atlas, 2, 1);
+        let color = resolve_carets(
+            &mut grid,
+            &carets,
+            Some(CursorPosition { col: 0, row: 0 }),
+            None,
+            mode,
+        );
+        (grid, color)
+    }
+
+    #[test]
+    fn focused_underline_cursors_hand_their_cell_to_an_underline_terminal_cursor() {
+        let cursor = underline_cursor(0., 8., Hsla::white());
+        let (grid, color) = focused_cursor_cell(cursor, CaretMode::TerminalCursor);
+        assert_eq!(grid.cursor, Some(CursorPosition { col: 0, row: 0 }));
+        assert_eq!(grid.cursor_shape, CursorShape::Underline);
+        assert_eq!(color, Some(rgb(255, 255, 255)));
+        assert_eq!(grid.row_text(0), "a ");
+        assert_eq!(underlined_cols(&grid), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn focused_hollow_cursors_hand_their_cell_to_a_block_terminal_cursor() {
+        let cursor = hollow_cursor(0., 8., Hsla::white());
+        let (grid, color) = focused_cursor_cell(cursor, CaretMode::TerminalCursor);
+        assert_eq!(grid.cursor, Some(CursorPosition { col: 0, row: 0 }));
+        assert_eq!(grid.cursor_shape, CursorShape::Block);
+        assert_eq!(color, Some(rgb(255, 255, 255)));
+        assert_eq!(grid.row_text(0), "a ");
+        assert_eq!(tinted_cols(&grid), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn focused_bars_ask_for_a_bar_terminal_cursor() {
+        let cursor = caret_bar(0., Hsla::white());
+        let (grid, _) = focused_cursor_cell(cursor, CaretMode::TerminalCursor);
+        assert_eq!(grid.cursor, Some(CursorPosition { col: 0, row: 0 }));
+        assert_eq!(grid.cursor_shape, CursorShape::Bar);
+    }
+
+    #[test]
+    fn the_last_caret_painted_on_the_focused_cell_wins() {
+        let atlas = TuiAtlas::default();
+        let mut scene = Scene::default();
+        scene.insert_primitive(underline_cursor(0., 8., Hsla::red()));
+        scene.insert_primitive(caret_bar(0., Hsla::white()));
+        scene.finish();
+        let (mut grid, carets) = rasterize(&scene, &atlas, 2, 1);
+        let color = resolve_carets(
+            &mut grid,
+            &carets,
+            Some(CursorPosition { col: 0, row: 0 }),
+            None,
+            CaretMode::TerminalCursor,
+        );
+        assert_eq!(color, Some(rgb(255, 255, 255)));
+        assert_eq!(grid.cursor_shape, CursorShape::Bar);
+    }
+
+    #[test]
+    fn extra_underline_and_hollow_cursors_keep_their_own_look() {
+        let white = Hsla::white();
+        let atlas = TuiAtlas::default();
+        let mut scene = Scene::default();
+        for (index, ch) in "abcd".chars().enumerate() {
+            scene.insert_primitive(glyph_sprite(&atlas, ch, index as f32 * 8.));
+        }
+        scene.insert_primitive(caret_bar(0., white));
+        scene.insert_primitive(underline_cursor(16., 8., white));
+        scene.insert_primitive(hollow_cursor(24., 8., white));
+        scene.finish();
+        let (mut grid, carets) = rasterize(&scene, &atlas, 4, 1);
+        resolve_carets(
+            &mut grid,
+            &carets,
+            Some(CursorPosition { col: 0, row: 0 }),
+            None,
+            CaretMode::TerminalCursor,
+        );
+        assert_eq!(grid.row_text(0), "abcd");
+        assert_eq!(underlined_cols(&grid), [2]);
+        assert_eq!(tinted_cols(&grid), [3]);
+        assert_eq!(grid.cell(3, 0).unwrap().fg, rgb(255, 255, 255));
+    }
+
+    #[test]
+    fn underline_cursors_underline_the_text_they_sit_on() {
+        let cursor = Hsla::from(gpui::rgb(0x74ade8));
+        let grid = cursor_row(&[
+            underline_cursor(0., 8., cursor),
+            underline_cursor(16., 16., cursor),
+            underline_cursor(40., 8., cursor),
+        ]);
+        assert_eq!(grid.row_text(0), "a 한  ");
+        assert_eq!(underlined_cols(&grid), [0, 2, 3, 5]);
+        let cursor_rgb = rgb(0x74, 0xad, 0xe8);
+        for col in [0, 2, 5] {
+            assert_eq!(grid.cell(col, 0).unwrap().underline.rgb(), Some(cursor_rgb));
+        }
+        assert_eq!(grid.cell(5, 0).unwrap().fg, cursor_rgb);
+    }
+
+    #[test]
+    fn cursor_underlines_covered_by_later_content_are_hidden() {
+        let cursor = Hsla::from(gpui::rgb(0x74ade8));
+        let popup = fill_quad(0., 0., 48., 16., Hsla::from(gpui::rgb(0x2f343e)));
+        let grid = cursor_row(&[
+            underline_cursor(0., 8., cursor),
+            hollow_cursor(40., 8., cursor),
+            popup,
+        ]);
+        assert_eq!(grid.row_text(0), "      ");
+        assert_eq!(underlined_cols(&grid), Vec::<usize>::new());
+        assert!(
+            grid.row(0)
+                .iter()
+                .all(|cell| cell.bg == rgb(0x2f, 0x34, 0x3e))
+        );
     }
 
     #[test]
@@ -856,7 +1293,7 @@ mod tests {
         scene.insert_primitive(wide_glyph);
         scene.insert_primitive(fill_quad(11., 0., 1., 32., Hsla::white()));
         scene.finish();
-        let grid = rasterize(&scene, &atlas, 3, 2);
+        let grid = rasterize(&scene, &atlas, 3, 2).0;
         assert_eq!(grid.row_text(0), "한 ");
         assert_eq!(grid.row_text(1), " │ ");
     }
@@ -917,11 +1354,94 @@ mod tests {
         scene.insert_primitive(fill_quad(8., 16., 2., 16., Hsla::white()));
         scene.finish();
 
-        let grid = rasterize(&scene, &atlas, 6, 3);
+        let (grid, carets) = rasterize(&scene, &atlas, 6, 3);
         assert_eq!(grid.row_text(1), " hi   ");
         assert_eq!(grid.cell(0, 1).unwrap().bg, rgb(255, 0, 0));
         assert_eq!(grid.cell(5, 1).unwrap().bg, rgb(0, 0, 0));
         assert_eq!(grid.cell(1, 1).unwrap().fg, rgb(255, 255, 255));
+        assert_eq!(grid.cursor, None);
+        assert_eq!(
+            caret_summary(&carets),
+            [(CursorPosition { col: 1, row: 1 }, false, rgb(255, 255, 255))]
+        );
+    }
+
+    #[test]
+    fn single_row_bars_draw_a_line_and_are_caret_candidates() {
+        let atlas = TuiAtlas::default();
+        let mut scene = Scene::default();
+        scene.insert_primitive(fill_quad(16., 0., 2., 16., Hsla::white()));
+        scene.finish();
+        let (grid, carets) = rasterize(&scene, &atlas, 4, 1);
+        assert_eq!(grid.row_text(0), "  │ ");
+        assert_eq!(
+            caret_summary(&carets),
+            [(CursorPosition { col: 2, row: 0 }, true, rgb(255, 255, 255))]
+        );
+    }
+
+    fn caret_summary(carets: &[CaretCandidate]) -> Vec<(CursorPosition, bool, Rgb)> {
+        carets
+            .iter()
+            .map(|caret| (caret.cell, caret.drew_bar, caret.color))
+            .collect()
+    }
+
+    fn caret_bar(x: f32, color: Hsla) -> Quad {
+        fill_quad(x, 0., 2., 16., color)
+    }
+
+    fn resolved_caret_row(
+        text: &str,
+        bars: &[(f32, Hsla)],
+        covers: &[(f32, Hsla)],
+        focused_col: u16,
+        last_caret_color: Option<Rgb>,
+    ) -> CellGrid {
+        resolved_caret_row_in(
+            CaretMode::TerminalCursor,
+            text,
+            bars,
+            covers,
+            focused_col,
+            last_caret_color,
+        )
+    }
+
+    fn resolved_caret_row_in(
+        mode: CaretMode,
+        text: &str,
+        bars: &[(f32, Hsla)],
+        covers: &[(f32, Hsla)],
+        focused_col: u16,
+        last_caret_color: Option<Rgb>,
+    ) -> CellGrid {
+        let atlas = TuiAtlas::default();
+        let mut scene = Scene::default();
+        for (index, ch) in text.chars().enumerate() {
+            if ch != ' ' {
+                scene.insert_primitive(glyph_sprite(&atlas, ch, index as f32 * 8.));
+            }
+        }
+        for (x, color) in bars {
+            scene.insert_primitive(caret_bar(*x, *color));
+        }
+        for (x, color) in covers {
+            scene.insert_primitive(fill_quad(*x, 0., 8., 16., *color));
+        }
+        scene.finish();
+        let (mut grid, carets) = rasterize(&scene, &atlas, text.chars().count() as u16, 1);
+        resolve_carets(
+            &mut grid,
+            &carets,
+            Some(CursorPosition {
+                col: focused_col,
+                row: 0,
+            }),
+            last_caret_color,
+            mode,
+        );
+        grid
     }
 
     #[test]
@@ -931,10 +1451,110 @@ mod tests {
         scene.insert_primitive(fill_quad(0., 16., 40., 1., Hsla::white()));
         scene.insert_primitive(fill_quad(19., 0., 1., 48., Hsla::white()));
         scene.finish();
-        let grid = rasterize(&scene, &atlas, 5, 3);
+        let grid = rasterize(&scene, &atlas, 5, 3).0;
         assert_eq!(grid.row_text(0), "  │  ");
         assert_eq!(grid.row_text(1), "──│──");
         assert_eq!(grid.row_text(2), "  │  ");
+    }
+
+    #[test]
+    fn extra_carets_on_text_become_block_cells_in_the_focused_caret_color() {
+        let white = Hsla::white();
+        let grid = resolved_caret_row("abcd", &[(0., white), (16., white)], &[], 0, None);
+        assert_eq!(grid.cursor, Some(CursorPosition { col: 0, row: 0 }));
+        assert_eq!(grid.row_text(0), "abcd");
+        let block = grid.cell(2, 0).copied().unwrap();
+        assert_eq!((block.bg, block.fg), (rgb(255, 255, 255), Rgb::default()));
+        assert_eq!(grid.cell(0, 0).unwrap().bg, Rgb::default());
+    }
+
+    #[test]
+    fn extra_carets_on_blank_cells_replace_their_bar_with_a_block() {
+        let white = Hsla::white();
+        let grid = resolved_caret_row("    ", &[(0., white), (16., white)], &[], 0, None);
+        assert_eq!(grid.row_text(0), "    ");
+        assert_eq!(grid.cell(2, 0).unwrap().bg, rgb(255, 255, 255));
+        assert_eq!(grid.cell(0, 0).unwrap().bg, Rgb::default());
+    }
+
+    #[test]
+    fn one_row_bars_in_other_colors_are_left_alone() {
+        let grey = Hsla::from(gpui::rgb(0x808080));
+        let grid = resolved_caret_row(
+            "a  d",
+            &[(0., Hsla::white()), (16., grey), (24., Hsla::red())],
+            &[],
+            0,
+            None,
+        );
+        assert_eq!(grid.row_text(0), "a │d");
+        assert_eq!(grid.cell(2, 0).unwrap().bg, Rgb::default());
+        assert_eq!(grid.cell(3, 0).unwrap().bg, Rgb::default());
+    }
+
+    #[test]
+    fn carets_covered_by_later_content_stay_hidden() {
+        let white = Hsla::white();
+        let popup = Hsla::from(gpui::rgb(0x2f343e));
+        let grid = resolved_caret_row(
+            "ab  ",
+            &[(0., white), (16., white)],
+            &[(16., popup)],
+            0,
+            None,
+        );
+        assert_eq!(grid.row_text(0), "ab  ");
+        assert_eq!(grid.cell(2, 0).unwrap().bg, rgb(47, 52, 62));
+    }
+
+    #[test]
+    fn extra_carets_on_wide_chars_cover_both_cells() {
+        let atlas = TuiAtlas::default();
+        let mut scene = Scene::default();
+        scene.insert_primitive(glyph_sprite(&atlas, 'a', 0.));
+        let mut wide_glyph = glyph_sprite(&atlas, '한', 16.);
+        wide_glyph.bounds.size.width = ScaledPixels(16.);
+        scene.insert_primitive(wide_glyph);
+        scene.insert_primitive(caret_bar(0., Hsla::white()));
+        scene.insert_primitive(caret_bar(24., Hsla::white()));
+        scene.finish();
+        let (mut grid, carets) = rasterize(&scene, &atlas, 4, 1);
+        resolve_carets(
+            &mut grid,
+            &carets,
+            Some(CursorPosition { col: 0, row: 0 }),
+            None,
+            CaretMode::TerminalCursor,
+        );
+        assert_eq!(grid.row_text(0), "a 한");
+        assert_eq!(grid.cell(2, 0).unwrap().bg, rgb(255, 255, 255));
+        let continuation = grid.cell(3, 0).copied().unwrap();
+        assert_eq!(continuation.bg, rgb(255, 255, 255));
+        assert!(continuation.is_wide_continuation());
+    }
+
+    #[test]
+    fn no_blocks_without_a_matching_focused_caret() {
+        let white = Hsla::white();
+        let grid = resolved_caret_row("abcd", &[(0., white), (16., white)], &[], 3, None);
+        assert_eq!(grid.cursor, None);
+        assert!(grid.row(0).iter().all(|cell| cell.bg == Rgb::default()));
+    }
+
+    #[test]
+    fn extra_carets_stay_blocks_while_the_focused_caret_is_off_screen() {
+        let white = Hsla::white();
+        let grid = resolved_caret_row(
+            "abcd",
+            &[(0., white), (16., white)],
+            &[],
+            3,
+            Some(rgb(255, 255, 255)),
+        );
+        assert_eq!(grid.cursor, None);
+        assert_eq!(grid.cell(0, 0).unwrap().bg, rgb(255, 255, 255));
+        assert_eq!(grid.cell(2, 0).unwrap().bg, rgb(255, 255, 255));
+        assert_eq!(grid.cell(1, 0).unwrap().bg, Rgb::default());
     }
 
     fn glyph_sprite(atlas: &TuiAtlas, ch: char, x: f32) -> MonochromeSprite {
@@ -965,7 +1585,7 @@ mod tests {
             scene.insert_primitive(glyph_sprite(&atlas, ch, x));
         }
         scene.finish();
-        let grid = rasterize(&scene, &atlas, 8, 1);
+        let grid = rasterize(&scene, &atlas, 8, 1).0;
         assert_eq!(grid.row_text(0), "  ab cd ");
     }
 
@@ -1002,7 +1622,7 @@ mod tests {
             transformation: gpui::TransformationMatrix::unit(),
         });
         scene.finish();
-        let grid = rasterize(&scene, &atlas, 6, 1);
+        let grid = rasterize(&scene, &atlas, 6, 1).0;
         assert_eq!(grid.row_text(0), " ▸ a  ");
     }
 
@@ -1014,7 +1634,7 @@ mod tests {
             scene.insert_primitive(glyph_sprite(&atlas, ch, 5. + index as f32 * 8.));
         }
         scene.finish();
-        let grid = rasterize(&scene, &atlas, 6, 1);
+        let grid = rasterize(&scene, &atlas, 6, 1).0;
         assert_eq!(grid.row_text(0), " abcd ");
     }
 
@@ -1033,7 +1653,7 @@ mod tests {
         scene.insert_primitive(glyph_sprite(&atlas, 'a', 16.));
         scene.pop_layer();
         scene.finish();
-        let grid = rasterize(&scene, &atlas, 6, 2);
+        let grid = rasterize(&scene, &atlas, 6, 2).0;
         assert_eq!(grid.row_text(0), "┌ a  ┐");
         assert_eq!(grid.row_text(1), "└────┘");
     }
@@ -1047,13 +1667,13 @@ mod tests {
         scene.insert_primitive(glyph_sprite(&atlas, 'a', 0.));
         scene.pop_layer();
         scene.finish();
-        let grid = rasterize(&scene, &atlas, 6, 1);
+        let grid = rasterize(&scene, &atlas, 6, 1).0;
         assert_eq!(grid.row_text(0), "a     ");
 
         let mut scene = Scene::default();
         scene.insert_primitive(fill_quad(0., 7., 48., 1., Hsla::white()));
         scene.finish();
-        let grid = rasterize(&scene, &atlas, 6, 1);
+        let grid = rasterize(&scene, &atlas, 6, 1).0;
         assert_eq!(grid.row_text(0), "──────");
     }
 
@@ -1070,7 +1690,7 @@ mod tests {
             scene.insert_primitive(sprite);
         }
         scene.finish();
-        let grid = rasterize(&scene, &atlas, 4, 1);
+        let grid = rasterize(&scene, &atlas, 4, 1).0;
         assert_eq!(grid.row_text(0), "a   ");
     }
 
@@ -1087,7 +1707,7 @@ mod tests {
         }
         scene.pop_layer();
         scene.finish();
-        let grid = rasterize(&scene, &atlas, 6, 1);
+        let grid = rasterize(&scene, &atlas, 6, 1).0;
         assert_eq!(grid.row_text(0), " xzed ");
     }
 
@@ -1105,7 +1725,7 @@ mod tests {
             scene.insert_primitive(sprite);
         }
         scene.finish();
-        let grid = rasterize(&scene, &atlas, 2, 2);
+        let grid = rasterize(&scene, &atlas, 2, 2).0;
         assert_eq!(grid.row_text(0), "  ");
         assert_eq!(grid.row_text(1), "b ");
     }
@@ -1119,7 +1739,7 @@ mod tests {
         scene.insert_primitive(fill_quad(0., 0., 16., 16., Hsla::black()));
         scene.pop_layer();
         scene.finish();
-        let grid = rasterize(&scene, &atlas, 2, 1);
+        let grid = rasterize(&scene, &atlas, 2, 1).0;
         assert_eq!(grid.row_text(0), "  ");
     }
 
@@ -1145,7 +1765,7 @@ mod tests {
             transformation: gpui::TransformationMatrix::unit(),
         });
         scene.finish();
-        let grid = rasterize(&scene, &atlas, 2, 1);
+        let grid = rasterize(&scene, &atlas, 2, 1).0;
         assert_eq!(grid.row_text(0), "  ");
     }
 }

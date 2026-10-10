@@ -234,11 +234,27 @@ impl Cell {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CursorPosition {
+    pub col: u16,
+    pub row: u16,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CursorShape {
+    #[default]
+    Bar,
+    Block,
+    Underline,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CellGrid {
     pub cols: u16,
     pub rows: u16,
     pub cells: Vec<Cell>,
+    pub cursor: Option<CursorPosition>,
+    pub cursor_shape: CursorShape,
 }
 
 impl CellGrid {
@@ -247,6 +263,8 @@ impl CellGrid {
             cols,
             rows,
             cells: vec![Cell::blank(background); cols as usize * rows as usize],
+            cursor: None,
+            cursor_shape: CursorShape::default(),
         }
     }
 

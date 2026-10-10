@@ -13,9 +13,10 @@ use gpui::{
 
 use crate::{
     atlas::TuiAtlas,
-    grid::CellGrid,
+    caret_cell,
+    grid::{CellGrid, CursorPosition, Rgb},
     platform::{PlatformOutputs, WindowRegistry},
-    rasterize::rasterize_scene,
+    rasterize::{CaretCandidate, CaretMode, rasterize_scene, resolve_carets},
     size_for_cells, with_taken,
 };
 
@@ -38,7 +39,8 @@ pub(crate) struct WindowState {
     is_fullscreen: bool,
     atlas: TuiAtlas,
     outputs: Rc<PlatformOutputs>,
-    pending_frame: Option<CellGrid>,
+    last_caret_color: Option<Rgb>,
+    pending_frame: Option<(CellGrid, Vec<CaretCandidate>)>,
 }
 
 #[derive(Clone)]
@@ -72,6 +74,7 @@ impl TuiWindow {
                 is_fullscreen: false,
                 atlas: TuiAtlas::default(),
                 outputs,
+                last_caret_color: None,
                 pending_frame: None,
             })),
             callbacks: Rc::default(),
@@ -181,11 +184,43 @@ impl TuiWindowHandle {
     }
 
     fn deliver_pending_frame(&self) {
-        let Some(grid) = self.state.borrow_mut().pending_frame.take() else {
+        let Some((grid, carets)) = self.state.borrow_mut().pending_frame.take() else {
             return;
         };
+        let grid = self.resolve_caret(grid, carets, CaretMode::TerminalCursor);
         let outputs = self.state.borrow().outputs.clone();
         deliver_frame(&outputs.frame_sink, grid);
+    }
+
+    fn resolve_caret(
+        &self,
+        mut grid: CellGrid,
+        carets: Vec<CaretCandidate>,
+        mode: CaretMode,
+    ) -> CellGrid {
+        if !carets.is_empty() {
+            let focused = self.focused_caret();
+            let last_caret_color = self.state.borrow().last_caret_color;
+            let caret_color = resolve_carets(&mut grid, &carets, focused, last_caret_color, mode);
+            self.state.borrow_mut().last_caret_color = caret_color;
+        }
+        grid
+    }
+
+    fn focused_caret(&self) -> Option<CursorPosition> {
+        let bounds = with_taken(
+            &self.state,
+            |state| &mut state.input_handler,
+            |input_handler| input_handler.ime_candidate_bounds(),
+        )??;
+        let (col, row) = caret_cell(
+            bounds.origin.x.as_f32(),
+            (bounds.origin.y + bounds.size.height / 2.).as_f32(),
+        );
+        Some(CursorPosition {
+            col: u16::try_from(col).ok()?,
+            row: u16::try_from(row).ok()?,
+        })
     }
 }
 

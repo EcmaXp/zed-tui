@@ -12,7 +12,9 @@ use std::cell::RefCell;
 
 use gpui::{Pixels, Point, Size, point, px, size};
 
-pub use grid::{Cell, CellAttrs, CellGrid, Glyph, Rgb, UnderlineColor};
+pub use grid::{
+    Cell, CellAttrs, CellGrid, CursorPosition, CursorShape, Glyph, Rgb, UnderlineColor,
+};
 pub use platform::TuiPlatform;
 pub use text_system::TuiTextSystem;
 
@@ -38,6 +40,13 @@ pub(crate) fn device_cell_center(col: i32, row: i32) -> Point<f32> {
     point(
         col as f32 * CELL_WIDTH + CELL_WIDTH / 2.,
         row as f32 * CELL_HEIGHT + CELL_HEIGHT / 2.,
+    )
+}
+
+pub(crate) fn caret_cell(left: f32, center_y: f32) -> (i32, i32) {
+    (
+        (left / CELL_WIDTH).round() as i32,
+        (center_y / CELL_HEIGHT).floor() as i32,
     )
 }
 

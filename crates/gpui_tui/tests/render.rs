@@ -1,12 +1,14 @@
 #![cfg(unix)]
 
-use std::{cell::RefCell, rc::Rc, time::Duration};
+use std::{cell::RefCell, ops::Range, rc::Rc, time::Duration};
 
 use gpui::{
-    AnyWindowHandle, App, AppContext as _, Application, Context, IntoElement, ParentElement,
-    Render, Styled, Window, WindowOptions, div, px, rgb,
+    AnyWindowHandle, App, AppContext as _, Application, BorderStyle, Bounds, Context,
+    ElementInputHandler, EntityInputHandler, FocusHandle, InteractiveElement as _, IntoElement,
+    PaintQuad, ParentElement, Pixels, Render, Styled, UTF16Selection, Window, WindowOptions,
+    canvas, div, fill, outline, point, px, rgb, size,
 };
-use gpui_tui::{CellGrid, Rgb, TuiPlatform};
+use gpui_tui::{CellAttrs, CellGrid, CursorPosition, CursorShape, Rgb, TuiPlatform};
 
 struct Hello;
 
@@ -136,6 +138,205 @@ fn activating_a_window_moves_focus_to_it() {
                 second_is_active: true,
             },
         ]
+    );
+}
+
+struct CaretField {
+    focus_handle: FocusHandle,
+    caret: Option<fn() -> PaintQuad>,
+    extra_caret: bool,
+}
+
+fn caret_bounds(width: f32) -> Bounds<Pixels> {
+    Bounds::new(point(px(24.), px(16.)), size(px(width), px(16.)))
+}
+
+fn bar_caret() -> PaintQuad {
+    fill(caret_bounds(2.), rgb(0xffffff))
+}
+
+fn underline_caret() -> PaintQuad {
+    fill(
+        Bounds::new(point(px(24.), px(30.)), size(px(8.), px(2.))),
+        rgb(0xffffff),
+    )
+}
+
+fn hollow_caret() -> PaintQuad {
+    outline(caret_bounds(8.), rgb(0xffffff), BorderStyle::Solid)
+}
+
+impl Render for CaretField {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity();
+        let focus_handle = self.focus_handle.clone();
+        let caret = self.caret;
+        let extra_caret = self.extra_caret;
+        div()
+            .size_full()
+            .bg(rgb(0x202020))
+            .track_focus(&self.focus_handle)
+            .child(
+                canvas(
+                    |_, _, _| {},
+                    move |bounds, _, window, cx| {
+                        window.handle_input(
+                            &focus_handle,
+                            ElementInputHandler::new(bounds, entity),
+                            cx,
+                        );
+                        if let Some(caret) = caret {
+                            window.paint_quad(caret());
+                        }
+                        if extra_caret {
+                            window.paint_quad(fill(
+                                Bounds::new(point(px(40.), px(16.)), size(px(2.), px(16.))),
+                                rgb(0xffffff),
+                            ));
+                        }
+                    },
+                )
+                .size_full(),
+            )
+    }
+}
+
+impl EntityInputHandler for CaretField {
+    fn text_for_range(
+        &mut self,
+        _range: Range<usize>,
+        _adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        Some(String::new())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection {
+            range: 0..0,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        None
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+
+    fn replace_text_in_range(
+        &mut self,
+        _range: Option<Range<usize>>,
+        _text: &str,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range: Option<Range<usize>>,
+        _new_text: &str,
+        _new_selected_range: Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        _element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        Some(caret_bounds(8.))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: gpui::Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
+fn open_caret_field(
+    window: &mut Window,
+    cx: &mut App,
+    focused: bool,
+    caret: Option<fn() -> PaintQuad>,
+    extra_caret: bool,
+) -> gpui::Entity<CaretField> {
+    let field = cx.new(|cx| CaretField {
+        focus_handle: cx.focus_handle(),
+        caret,
+        extra_caret,
+    });
+    if focused {
+        let focus_handle = field.read(cx).focus_handle.clone();
+        window.focus(&focus_handle, cx);
+    }
+    field
+}
+
+fn caret_frame(focused: bool, caret: Option<fn() -> PaintQuad>, extra_caret: bool) -> CellGrid {
+    first_frame(TuiPlatform::new(8, 3), move |cx: &mut App| {
+        cx.open_window(WindowOptions::default(), |window, cx| {
+            open_caret_field(window, cx, focused, caret, extra_caret)
+        })
+        .expect("failed to open window");
+    })
+}
+
+#[test]
+fn the_cursor_follows_the_focused_input_caret() {
+    let grid = caret_frame(true, Some(bar_caret), false);
+    assert_eq!(grid.cursor, Some(CursorPosition { col: 3, row: 1 }));
+    assert_eq!(grid.cursor_shape, CursorShape::Bar);
+    assert_eq!(grid.row_text(1), "        ");
+    assert_eq!(caret_frame(false, Some(bar_caret), false).cursor, None);
+    assert_eq!(caret_frame(true, None, false).cursor, None);
+}
+
+#[test]
+fn focused_underline_and_hollow_carets_place_the_terminal_cursor_with_their_shape() {
+    for (caret, shape) in [
+        (underline_caret as fn() -> PaintQuad, CursorShape::Underline),
+        (hollow_caret, CursorShape::Block),
+    ] {
+        let grid = caret_frame(true, Some(caret), false);
+        assert_eq!(
+            (grid.cursor, grid.cursor_shape),
+            (Some(CursorPosition { col: 3, row: 1 }), shape)
+        );
+        let cell = grid.cell(3, 1).copied().expect("cell");
+        assert_eq!(cell.bg, Rgb::new(0x20, 0x20, 0x20), "{shape:?}");
+        assert!(!cell.attrs.contains(CellAttrs::UNDERLINE), "{shape:?}");
+        assert_eq!(caret_frame(false, Some(caret), false).cursor, None);
+    }
+}
+
+#[test]
+fn extra_carets_in_the_focused_caret_color_become_block_cells() {
+    let grid = caret_frame(true, Some(bar_caret), true);
+    assert_eq!(grid.cursor, Some(CursorPosition { col: 3, row: 1 }));
+    assert_eq!(grid.row_text(1), "        ");
+    assert_eq!(
+        grid.cell(5, 1).map(|cell| cell.bg),
+        Some(Rgb::new(255, 255, 255))
     );
 }
 
