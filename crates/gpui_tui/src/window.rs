@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     rc::{Rc, Weak},
     sync::Arc,
 };
@@ -118,6 +118,7 @@ pub(crate) struct TuiWindowHandle {
     registry: Weak<WindowRegistry>,
     state: Rc<RefCell<WindowState>>,
     callbacks: Rc<RefCell<Callbacks>>,
+    frame_requested: Rc<Cell<bool>>,
 }
 
 pub(crate) struct TuiWindow(TuiWindowHandle);
@@ -165,6 +166,7 @@ impl TuiWindow {
                 floating,
             })),
             callbacks: Rc::default(),
+            frame_requested: Rc::new(Cell::new(true)),
         })
     }
 
@@ -257,12 +259,20 @@ impl TuiWindowHandle {
             let mut state = self.state.borrow_mut();
             let state = &mut *state;
             if let Some(floating) = &mut state.floating {
+                let mut moved = false;
                 if (floating.underlay.cols, floating.underlay.rows) != (cols, rows) {
                     floating.underlay = CellGrid::new(cols, rows, Rgb::default());
+                    moved = true;
                 }
                 let bounds = floating_bounds(floating.requested, size);
                 size = bounds.size;
-                state.bounds.origin = bounds.origin;
+                if state.bounds.origin != bounds.origin {
+                    state.bounds.origin = bounds.origin;
+                    moved = true;
+                }
+                if moved {
+                    self.schedule_frame();
+                }
             }
             if state.bounds.size == size {
                 return;
@@ -274,6 +284,7 @@ impl TuiWindowHandle {
             |callbacks| &mut callbacks.resize,
             |callback| callback(size, 1.0),
         );
+        self.frame_requested.set(true);
     }
 
     pub(crate) fn handle(&self) -> AnyWindowHandle {
@@ -291,6 +302,18 @@ impl TuiWindowHandle {
             |callbacks| &mut callbacks.hover_status_change,
             |callback| callback(active),
         );
+    }
+
+    pub(crate) fn has_frame_request(&self) -> bool {
+        self.frame_requested.get()
+    }
+
+    pub(crate) fn schedule_frame(&self) {
+        self.frame_requested.set(true);
+    }
+
+    pub(crate) fn take_frame_request(&self) -> bool {
+        self.frame_requested.replace(false)
     }
 
     pub(crate) fn request_frame(&self) -> FrameOutcome {
@@ -326,6 +349,7 @@ impl TuiWindowHandle {
         if let Some(floating) = &mut self.state.borrow_mut().floating {
             floating.underlay = underlay;
         }
+        self.schedule_frame();
     }
 
     fn deliver_pending_frame(&self) -> FrameOutcome {
@@ -519,6 +543,15 @@ impl PlatformWindow for TuiWindow {
 
     fn is_fullscreen(&self) -> bool {
         self.0.state.borrow().is_fullscreen
+    }
+
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        let frame_requested = self.0.frame_requested.clone();
+        Some(Rc::new(move || frame_requested.set(true)))
+    }
+
+    fn schedule_frame(&self) {
+        self.0.schedule_frame();
     }
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {

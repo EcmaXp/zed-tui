@@ -69,9 +69,8 @@ impl FramePacer {
 
     fn frame_presented(&mut self, now: Instant, outcome: FrameOutcome) {
         self.unchanged_frames = match outcome {
-            FrameOutcome::NotDrawn | FrameOutcome::Unchanged => {
-                self.unchanged_frames.saturating_add(1)
-            }
+            FrameOutcome::NotDrawn => return,
+            FrameOutcome::Unchanged => self.unchanged_frames.saturating_add(1),
             FrameOutcome::Changed => 0,
         };
         self.last_frame = Some(now);
@@ -162,6 +161,9 @@ impl WindowRegistry {
         let previous = self.active.replace(Some(handle));
         if previous == Some(handle) {
             return;
+        }
+        if let Some(window) = self.focused_window() {
+            window.schedule_frame();
         }
         let mut changes = vec![(handle, true)];
         changes.extend(previous.map(|previous| (previous, false)));
@@ -350,24 +352,36 @@ impl TuiPlatform {
 
     fn present_frame(&self, now: Instant) {
         if let Some(underneath) = self.windows.window_under_floating()
+            && underneath.take_frame_request()
             && let Some(underlay) = underneath.draw_underlay()
             && let Some(window) = self.focused_window()
         {
             window.set_underlay(underlay);
         }
-        if let Some(window) = self.focused_window() {
+        if let Some(window) = self.focused_window()
+            && window.take_frame_request()
+        {
             let outcome = window.request_frame();
             self.pacer.borrow_mut().frame_presented(now, outcome);
         }
     }
 
-    fn frame_wait(&self) -> Duration {
-        self.pacer
-            .borrow()
-            .next_frame()
-            .map_or(Duration::ZERO, |next_frame| {
-                next_frame.saturating_duration_since(Instant::now())
-            })
+    fn frame_wait(&self) -> Option<Duration> {
+        let wants_frame = self
+            .focused_window()
+            .is_some_and(|window| window.has_frame_request())
+            || self
+                .windows
+                .window_under_floating()
+                .is_some_and(|window| window.has_frame_request());
+        wants_frame.then(|| {
+            self.pacer
+                .borrow()
+                .next_frame()
+                .map_or(Duration::ZERO, |next_frame| {
+                    next_frame.saturating_duration_since(Instant::now())
+                })
+        })
     }
 }
 
@@ -393,7 +407,14 @@ impl Platform for TuiPlatform {
         };
 
         while !self.should_quit.get() {
-            match receiver.recv_timeout(self.frame_wait()) {
+            let received = match self.frame_wait() {
+                Some(timeout) => receiver.recv_timeout(timeout),
+                None => receiver
+                    .recv()
+                    .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+            };
+
+            match received {
                 Ok(runnable) => {
                     run_runnable(runnable);
                     let batch_start = Instant::now();
@@ -651,6 +672,20 @@ impl Platform for TuiPlatform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frames_that_were_not_drawn_do_not_delay_the_next_one() {
+        let start = Instant::now();
+        let mut pacer = FramePacer::default();
+        assert!(pacer.is_due(start));
+
+        pacer.frame_presented(start, FrameOutcome::Changed);
+        assert!(!pacer.is_due(start + Duration::from_millis(10)));
+
+        let unrelated_check = start + BACKGROUND_FRAME_INTERVAL + Duration::from_millis(1);
+        pacer.frame_presented(unrelated_check, FrameOutcome::NotDrawn);
+        assert!(pacer.is_due(unrelated_check + Duration::from_millis(2)));
+    }
 
     #[test]
     fn unchanged_frames_slow_down_until_input_arrives() {
