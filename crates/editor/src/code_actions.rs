@@ -381,6 +381,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let had_actions = self.has_available_code_actions_for_selection();
         self.code_actions_for_selection = CodeActionsForSelection::Fetching(
             cx.spawn_in(window, async move |editor, cx| {
                 cx.background_executor()
@@ -454,7 +455,9 @@ impl Editor {
                                 CodeActionsForSelection::Ready(new_actions.clone());
                             Some(new_actions)
                         };
-                        cx.notify();
+                        if had_actions || new_actions.is_some() {
+                            cx.notify();
+                        }
                         new_actions
                     })
                     .ok()
@@ -573,3 +576,6 @@ impl CodeActionProvider for Entity<Project> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests;
