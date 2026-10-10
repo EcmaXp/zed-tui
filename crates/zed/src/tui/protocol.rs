@@ -23,6 +23,7 @@ const MAX_COLOR_TABLE: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KeyCode {
+    #[serde(rename = "c")]
     Char(char),
     Enter,
     Escape,
@@ -51,9 +52,13 @@ pub enum MouseButtonKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MouseAction {
+    #[serde(rename = "d")]
     Down(MouseButtonKind),
+    #[serde(rename = "u")]
     Up(MouseButtonKind),
+    #[serde(rename = "g")]
     Drag(MouseButtonKind),
+    #[serde(rename = "m")]
     Moved,
     ScrollUp,
     ScrollDown,
@@ -63,16 +68,25 @@ pub enum MouseAction {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TermEvent {
+    #[serde(rename = "k")]
     Key {
+        #[serde(rename = "c")]
         code: KeyCode,
+        #[serde(rename = "m", with = "wire_modifiers")]
         modifiers: Modifiers,
     },
+    #[serde(rename = "m")]
     Mouse {
+        #[serde(rename = "a")]
         action: MouseAction,
+        #[serde(rename = "x")]
         col: u16,
+        #[serde(rename = "y")]
         row: u16,
+        #[serde(rename = "m", with = "wire_modifiers")]
         modifiers: Modifiers,
     },
+    #[serde(rename = "p")]
     Paste(String),
 }
 
@@ -83,21 +97,72 @@ pub enum ClientMessage {
         cols: u16,
         rows: u16,
     },
+    #[serde(rename = "i")]
     Input(TermEvent),
+    #[serde(rename = "z")]
     Resize {
+        #[serde(rename = "c")]
         cols: u16,
+        #[serde(rename = "r")]
         rows: u16,
     },
+    #[serde(rename = "d")]
     Detach,
+    #[serde(rename = "k")]
     Kill,
+    #[serde(rename = "o")]
     Open {
+        #[serde(rename = "p")]
         paths: Vec<PathBuf>,
     },
+    #[serde(rename = "r")]
     Rendered(u32),
+    #[serde(rename = "w")]
     OpenAndWait {
+        #[serde(rename = "p")]
         paths: Vec<PathBuf>,
+        #[serde(rename = "q")]
         quit_session: bool,
     },
+}
+
+mod wire_modifiers {
+    use gpui::Modifiers;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    const CONTROL: u8 = 1;
+    const ALT: u8 = 1 << 1;
+    const SHIFT: u8 = 1 << 2;
+    const PLATFORM: u8 = 1 << 3;
+    const FUNCTION: u8 = 1 << 4;
+
+    pub fn serialize<S: Serializer>(
+        modifiers: &Modifiers,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        [
+            (modifiers.control, CONTROL),
+            (modifiers.alt, ALT),
+            (modifiers.shift, SHIFT),
+            (modifiers.platform, PLATFORM),
+            (modifiers.function, FUNCTION),
+        ]
+        .into_iter()
+        .filter(|(pressed, _)| *pressed)
+        .fold(0u8, |bits, (_, bit)| bits | bit)
+        .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Modifiers, D::Error> {
+        let bits = u8::deserialize(deserializer)?;
+        Ok(Modifiers {
+            control: bits & CONTROL != 0,
+            alt: bits & ALT != 0,
+            shift: bits & SHIFT != 0,
+            platform: bits & PLATFORM != 0,
+            function: bits & FUNCTION != 0,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +184,7 @@ fn set_frame_cursor(grid: &mut CellGrid, cursor: FrameCursor) {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ServerMessage {
+    #[serde(rename = "f")]
     FullFrame(
         u16,
         u16,
@@ -126,19 +192,28 @@ pub enum ServerMessage {
         Vec<RowPatch>,
         #[serde(with = "wire_cursor")] FrameCursor,
     ),
+    #[serde(rename = "d")]
     Diff(
         Vec<u32>,
         Vec<RowPatch>,
         #[serde(with = "wire_cursor")] FrameCursor,
     ),
+    #[serde(rename = "c")]
     Clipboard(String),
+    #[serde(rename = "t")]
     Title(String),
+    #[serde(rename = "s")]
     Shutdown,
+    #[serde(rename = "e")]
     Error(String),
+    #[serde(rename = "w")]
     WaitFinished {
+        #[serde(rename = "s")]
         status: i32,
+        #[serde(rename = "e")]
         errors: Vec<String>,
     },
+    #[serde(rename = "p")]
     Pointer(CursorStyle),
 }
 
@@ -256,6 +331,7 @@ fn underline_color(cell: &Cell) -> Option<u32> {
 
 fn encode_cells(cells: &[Cell]) -> Vec<Span> {
     let mut spans: Vec<Span> = Vec::new();
+    let mut foreground_open = false;
     for cell in cells {
         let is_continuation = cell.is_wide_continuation();
         if let Some(Span(fg, bg, attrs, text, underline)) = spans.last_mut() {
@@ -263,11 +339,16 @@ fn encode_cells(cells: &[Cell]) -> Vec<Span> {
                 text.push(CONTINUATION);
                 continue;
             }
-            if *fg == u32::from(cell.fg)
-                && *bg == u32::from(cell.bg)
+            let is_blank = cell.is_plain_blank();
+            if *bg == u32::from(cell.bg)
                 && *attrs == cell.attrs.bits()
                 && *underline == underline_color(cell)
+                && (is_blank || foreground_open || *fg == u32::from(cell.fg))
             {
+                if foreground_open && !is_blank {
+                    *fg = u32::from(cell.fg);
+                    foreground_open = false;
+                }
                 push_glyph(text, cell.glyph);
                 continue;
             }
@@ -286,6 +367,7 @@ fn encode_cells(cells: &[Cell]) -> Vec<Span> {
             text,
             underline_color(cell),
         ));
+        foreground_open = cell.is_plain_blank() || is_continuation;
     }
     spans
 }
@@ -689,6 +771,17 @@ mod tests {
                 .text()
                 .contains("e\u{301}👩\u{200d}💻o\u{308}")
         );
+    }
+
+    #[test]
+    fn spans_merge_blanks_into_neighboring_text() {
+        let grid = sample_grid();
+        let spans = encode_cells(grid.row(0));
+        let texts: Vec<&str> = spans.iter().map(|span| span.3.as_str()).collect();
+        assert_eq!(texts, vec!["fn ", "main     "]);
+        let spans = encode_cells(grid.row(1));
+        let texts: Vec<&str> = spans.iter().map(|span| span.3.as_str()).collect();
+        assert_eq!(texts, vec!["한\0", "          "]);
     }
 
     fn editor_grid(lines: &[String], first_line: usize) -> CellGrid {
