@@ -79,12 +79,12 @@ impl EditorSnapshot {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<AnyElement> {
-        let folded = self.is_line_folded(buffer_row);
         if let Crease::Inline { render_trailer, .. } = self
             .crease_snapshot
             .query_row(buffer_row, self.buffer_snapshot())?
         {
             let render_trailer = render_trailer.as_ref()?;
+            let folded = self.is_line_folded(buffer_row);
             Some(render_trailer(buffer_row, folded, window, cx))
         } else {
             None
