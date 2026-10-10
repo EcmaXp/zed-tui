@@ -58,14 +58,23 @@ mod unix {
 
     use anyhow::{Context as _, Result};
     use clap::{Parser, Subcommand};
-    use gpui::{App, Application};
+    use gpui::{App, Application, UpdateGlobal as _};
     use gpui_tui::TuiPlatform;
+    use settings::{
+        ActiveSettingsProfileName, MergeFromTrait as _, RootUserSettings as _, SettingsAssets,
+        SettingsContent, SettingsStore,
+    };
+    use util::{ResultExt as _, asset_str};
 
     use super::{client, server};
 
     const DEFAULT_COLS: u16 = 120;
     const DEFAULT_ROWS: u16 = 40;
     const SESSION: &str = "default";
+
+    const TUI_DEFAULTS_PATH: &str = "settings/tui_defaults.json";
+    const TUI_CONSTRAINTS_PATH: &str = "settings/tui_constraints.json";
+    const SETTINGS_PROFILE: &str = "tui";
 
     #[derive(Parser)]
     #[command(name = "zed --tui", about = "Zed in the terminal")]
@@ -177,12 +186,30 @@ mod unix {
             .collect())
     }
 
+    fn apply_terminal_settings(store: &mut SettingsStore, cx: &mut App) -> Result<()> {
+        let defaults = SettingsContent::parse_json_with_comments(&asset_str::<SettingsAssets>(
+            TUI_DEFAULTS_PATH,
+        ))
+        .context("parsing the terminal defaults")?;
+        store.update_default_settings(cx, |content| content.merge_from(&defaults));
+        store
+            .set_server_settings(&asset_str::<SettingsAssets>(TUI_CONSTRAINTS_PATH), cx)
+            .context("applying the terminal constraints")
+    }
+
+    fn activate_settings_profile(cx: &mut App) {
+        cx.set_global(ActiveSettingsProfileName(SETTINGS_PROFILE.into()));
+    }
+
     impl Startup {
         pub fn application(&self) -> Application {
             Application::with_platform(self.platform.clone())
         }
 
-        pub fn init_settings(&self, _: &mut App) {}
+        pub fn init_settings(&self, cx: &mut App) {
+            SettingsStore::update_global(cx, apply_terminal_settings).log_err();
+            activate_settings_profile(cx);
+        }
 
         pub fn database(&self) -> db::AppDatabase {
             db::AppDatabase::new()
@@ -201,6 +228,127 @@ mod unix {
             platform.set_frame_sink(on_frame);
 
             after_start(cx);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use settings::{FontSize, ReduceMotionMode, SaturatingBool, ThemeName, ThemeSelection};
+
+        #[gpui::test]
+        fn user_settings_override_defaults_but_not_constraints(cx: &mut gpui::TestAppContext) {
+            cx.update(|cx| {
+                let mut store = SettingsStore::test(cx);
+                apply_terminal_settings(&mut store, cx).unwrap();
+                assert_eq!(
+                    store.merged_settings().reduce_motion,
+                    Some(ReduceMotionMode::On)
+                );
+                store
+                    .set_user_settings(
+                        r#"{
+                            "theme": "Gruvbox Dark",
+                            "show_edit_predictions": true,
+                            "buffer_font_size": 20,
+                            "disable_ai": false
+                        }"#,
+                        cx,
+                    )
+                    .result()
+                    .unwrap();
+                let merged = store.merged_settings();
+                assert_eq!(
+                    merged.theme.theme,
+                    Some(ThemeSelection::Static(ThemeName("Gruvbox Dark".into())))
+                );
+                assert_eq!(
+                    merged.project.all_languages.defaults.show_edit_predictions,
+                    Some(true)
+                );
+                assert_eq!(merged.theme.buffer_font_size, Some(FontSize(16.)));
+                assert_eq!(merged.project.disable_ai, Some(SaturatingBool(false)));
+            });
+        }
+
+        #[gpui::test]
+        fn agent_and_commit_editors_use_the_buffer_row_height(cx: &mut gpui::TestAppContext) {
+            cx.update(|cx| {
+                let mut store = SettingsStore::test(cx);
+                apply_terminal_settings(&mut store, cx).unwrap();
+                let merged = store.merged_settings();
+                assert_eq!(
+                    merged.theme.agent_buffer_font_size,
+                    merged.theme.buffer_font_size
+                );
+                assert_eq!(
+                    merged.theme.git_commit_buffer_font_size,
+                    merged.theme.buffer_font_size
+                );
+            });
+        }
+
+        #[gpui::test]
+        fn user_settings_cannot_resize_fonts_or_enable_wheel_zoom(cx: &mut gpui::TestAppContext) {
+            cx.update(|cx| {
+                let mut store = SettingsStore::test(cx);
+                apply_terminal_settings(&mut store, cx).unwrap();
+                store
+                    .set_user_settings(
+                        r#"{
+                            "agent_ui_font_size": 20,
+                            "agent_buffer_font_size": 20,
+                            "git_commit_buffer_font_size": 20,
+                            "markdown_preview": { "font_size": 20 },
+                            "mouse_wheel_zoom": true
+                        }"#,
+                        cx,
+                    )
+                    .result()
+                    .unwrap();
+                let merged = store.merged_settings();
+                assert_eq!(merged.theme.agent_ui_font_size, Some(FontSize(10.)));
+                assert_eq!(merged.theme.agent_buffer_font_size, Some(FontSize(16.)));
+                assert_eq!(
+                    merged.theme.git_commit_buffer_font_size,
+                    Some(FontSize(16.))
+                );
+                assert_eq!(
+                    merged
+                        .markdown_preview
+                        .as_ref()
+                        .and_then(|markdown_preview| markdown_preview.font_size),
+                    Some(FontSize(10.))
+                );
+                assert_eq!(merged.editor.mouse_wheel_zoom, Some(false));
+            });
+        }
+
+        #[gpui::test]
+        fn the_tui_profile_applies_only_when_active(cx: &mut gpui::TestAppContext) {
+            cx.update(|cx| {
+                let user_settings = r#"{
+                    "profiles": {
+                        "tui": { "settings": { "theme": "Gruvbox Dark", "buffer_font_size": 20 } }
+                    }
+                }"#;
+                let terminal_store = |cx: &mut App| {
+                    let mut store = SettingsStore::test(cx);
+                    apply_terminal_settings(&mut store, cx).unwrap();
+                    store.set_user_settings(user_settings, cx).result().unwrap();
+                    store
+                };
+                let gruvbox = Some(ThemeSelection::Static(ThemeName("Gruvbox Dark".into())));
+
+                let store = terminal_store(cx);
+                assert_ne!(store.merged_settings().theme.theme, gruvbox);
+
+                activate_settings_profile(cx);
+                let store = terminal_store(cx);
+                let merged = store.merged_settings();
+                assert_eq!(merged.theme.theme, gruvbox);
+                assert_eq!(merged.theme.buffer_font_size, Some(FontSize(16.)));
+            });
         }
     }
 }
