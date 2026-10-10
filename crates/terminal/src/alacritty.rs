@@ -19,6 +19,7 @@ use alacritty_terminal::{
     term::{
         Config, Osc52, RenderableCursor, SEMANTIC_ESCAPE_CHARS, Term, TermMode,
         cell::{Cell as AlacCell, Flags, Hyperlink as AlacHyperlink},
+        color::Colors,
         search::{Match, RegexIter, RegexSearch},
     },
     tty,
@@ -37,9 +38,9 @@ use windows::Win32::{Foundation::HANDLE, System::Threading::GetProcessId};
 
 use crate::{
     Cell, Color, Content, Cursor, CursorShape, GridLinesChange, HoveredWord, Hyperlink,
-    HyperlinkData, IndexedCell, Modes, Point, PtyEvent, Range, RenderableCells, Scroll, Search,
-    Selection, SelectionRange, SelectionSide, SelectionType, TerminalBackendEvent, TerminalBounds,
-    ViMotion,
+    HyperlinkData, IndexedCell, Modes, NamedColor, Point, PtyEvent, Range, RenderableCells, Scroll,
+    Search, Selection, SelectionRange, SelectionSide, SelectionType, TerminalBackendEvent,
+    TerminalBounds, ViMotion,
     pty_info::ProcessIdGetter,
     terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape},
 };
@@ -481,6 +482,15 @@ fn terminal_cell_from_alacritty(cell: &AlacCell) -> Cell {
     Cell { cell: cell.clone() }
 }
 
+fn resolve_palette_override(color: Color, palette: &Colors) -> Color {
+    let index = match color {
+        Color::Indexed(index) => usize::from(index),
+        Color::Named(named) if named as usize <= NamedColor::BrightWhite as usize => named as usize,
+        Color::Named(_) | Color::Spec(_) => return color,
+    };
+    palette[index].map_or(color, Color::Spec)
+}
+
 impl Cell {
     #[inline]
     pub fn character(&self) -> char {
@@ -907,9 +917,15 @@ pub(super) fn make_content(term: &Term<ZedListener>, last_content: &Content) -> 
     let estimated_size = content.display_iter.size_hint().0;
     let mut cells = Vec::with_capacity(estimated_size);
 
-    cells.extend(content.display_iter.map(|ic| IndexedCell {
-        point: terminal_point_from_alacritty(ic.point),
-        cell: terminal_cell_from_alacritty(ic.cell),
+    let palette = content.colors;
+    cells.extend(content.display_iter.map(|ic| {
+        let mut cell = terminal_cell_from_alacritty(ic.cell);
+        cell.cell.fg = resolve_palette_override(cell.cell.fg, palette);
+        cell.cell.bg = resolve_palette_override(cell.cell.bg, palette);
+        IndexedCell {
+            point: terminal_point_from_alacritty(ic.point),
+            cell,
+        }
     }));
 
     let selection_text = if content.selection.is_some() {
