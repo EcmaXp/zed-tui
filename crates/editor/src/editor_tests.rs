@@ -1,3 +1,4 @@
+mod fork_tests;
 use super::*;
 use crate::{
     JoinLines,
