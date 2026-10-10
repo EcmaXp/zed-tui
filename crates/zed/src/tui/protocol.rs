@@ -716,6 +716,69 @@ mod tests {
         }
     }
 
+    fn wire_hex(message: &impl Serialize) -> String {
+        let mut body = Vec::new();
+        ciborium::into_writer(message, &mut body).unwrap();
+        body.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn server_messages_keep_their_wire_bytes() {
+        let full_frame = ServerMessage::FullFrame(
+            2,
+            1,
+            vec![0xff0000, 0],
+            vec![RowPatch(0, 0, vec![Span(0, 1, 4, "ab".into(), Some(0))])],
+            Some((CursorPosition { col: 1, row: 0 }, CursorShape::Underline)),
+        );
+        let diff = ServerMessage::Diff(
+            Vec::new(),
+            vec![WireScroll(0, 1, -1, Some((0, 2)))],
+            Vec::new(),
+            None,
+        );
+        let hello = ClientMessage::Hello {
+            version: PROTOCOL_VERSION,
+            cols: 80,
+            rows: 24,
+        };
+        let input = ClientMessage::Input(TermEvent::Key {
+            code: KeyCode::Char('q'),
+            modifiers: Modifiers {
+                control: true,
+                ..Default::default()
+            },
+        });
+        let actual = [
+            wire_hex(&full_frame),
+            wire_hex(&diff),
+            wire_hex(&ServerMessage::Clipboard("x".into())),
+            wire_hex(&ServerMessage::Title("t".into())),
+            wire_hex(&ServerMessage::Shutdown),
+            wire_hex(&ServerMessage::Error("x".into())),
+            wire_hex(&ServerMessage::WaitFinished {
+                status: 1,
+                errors: vec!["x".into()],
+            }),
+            wire_hex(&ServerMessage::Pointer(CursorStyle::PointingHand)),
+            wire_hex(&hello),
+            wire_hex(&input),
+        ];
+        let expected = [
+            "a16166850201821a00ff0000008183000081850001046261620083010002",
+            "a161648480818400012082000280f6",
+            "a161636178",
+            "a161746174",
+            "6173",
+            "a161656178",
+            "a16177a26173016165816178",
+            "a161706c506f696e74696e6748616e64",
+            "a16548656c6c6fa36776657273696f6e0f64636f6c73185064726f77731818",
+            "a16169a1616ba26163a161636171616d01",
+        ];
+        assert_eq!(actual, expected);
+    }
+
     #[test]
     fn pointer_messages_round_trip() {
         let messages = [
