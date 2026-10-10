@@ -538,6 +538,9 @@ impl PlatformWindow for TuiWindow {
     fn set_title(&mut self, title: &str) {
         let outputs = {
             let mut state = self.0.state.borrow_mut();
+            if state.title == title {
+                return;
+            }
             state.title = title.to_owned();
             state.outputs.clone()
         };
