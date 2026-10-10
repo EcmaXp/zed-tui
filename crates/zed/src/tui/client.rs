@@ -466,13 +466,21 @@ impl<W: Write> Terminal<W> {
             let text_end = scratch.text.len();
             let cursor_after = (next_col < cols && character.is_some()).then_some(next_col);
             let style = Style::of_cell(cell, self.features.ghostty);
+            let is_blank_glyph = style.fg.is_none();
             match scratch.segments.last_mut() {
                 Some(DrawSegment {
                     style: last_style,
                     end,
+                    is_blank_glyph: last_is_blank,
                     cursor_after: last_cursor_after,
                     ..
-                }) if *last_cursor_after == Some(col) && *last_style == style => {
+                }) if *last_cursor_after == Some(col)
+                    && (*last_style == style
+                        || (is_blank_glyph
+                            && !*last_is_blank
+                            && last_style.bg == style.bg
+                            && !last_style.attrs.contains(CellAttrs::UNDERLINE))) =>
+                {
                     *end = text_end;
                     *last_cursor_after = cursor_after;
                 }
@@ -482,6 +490,7 @@ impl<W: Write> Terminal<W> {
                         style,
                         start: text_start,
                         end: text_end,
+                        is_blank_glyph,
                         cursor_after,
                     });
                 }
@@ -513,6 +522,7 @@ struct DrawSegment {
     style: Style,
     start: usize,
     end: usize,
+    is_blank_glyph: bool,
     cursor_after: Option<usize>,
 }
 
