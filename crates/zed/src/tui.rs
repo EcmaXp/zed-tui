@@ -77,7 +77,7 @@ mod unix {
     use util::{ResultExt as _, asset_str};
     use workspace::Workspace;
 
-    use super::{client, server, title_bar::TerminalTitleBar};
+    use super::{client, protocol::ClientMessage, server, title_bar::TerminalTitleBar};
 
     const DEFAULT_COLS: u16 = 120;
     const DEFAULT_ROWS: u16 = 40;
@@ -97,6 +97,8 @@ mod unix {
         session: Option<String>,
         #[arg(long, global = true)]
         user_data_dir: Option<PathBuf>,
+        #[arg(long, help = "Wait for the opened files to be closed before exiting")]
+        wait: bool,
         #[command(subcommand)]
         command: Option<Command>,
         paths: Vec<PathBuf>,
@@ -271,6 +273,9 @@ mod unix {
     }
 
     fn open(cli: Cli) -> Result<Outcome> {
+        if cli.wait && cli.paths.is_empty() {
+            anyhow::bail!("--wait needs a file to open");
+        }
         let current_dir = std::env::current_dir().context("reading the current directory")?;
         let targets = cli
             .paths
@@ -282,26 +287,39 @@ mod unix {
         let inside_session =
             std::env::var_os(server::SESSION_ENV).is_some_and(|name| name == *session.paths.name);
 
+        let mut started = false;
         if !server::is_running(&session.paths) {
             let extra_targets = targets
                 .iter()
                 .filter(|target| **target != session.root)
                 .cloned()
                 .collect::<Vec<_>>();
-            server::spawn_daemon(
+            started = server::spawn_daemon(
                 &session.paths,
                 &session.root,
-                &extra_targets,
+                if cli.wait { &[] } else { &extra_targets },
                 cli.user_data_dir.as_deref(),
             )?;
-        } else if !targets.is_empty() {
-            server::open(&session.paths, targets)?;
+        } else if !cli.wait && !targets.is_empty() {
+            server::open(&session.paths, targets.clone())?;
         }
 
-        if inside_session {
-            return Ok(Outcome::Exit(0));
+        if !cli.wait {
+            if inside_session {
+                return Ok(Outcome::Exit(0));
+            }
+            return attach(&session.paths);
         }
-        attach(&session.paths)
+        let wait = ClientMessage::OpenAndWait {
+            paths: targets,
+            quit_session: started,
+        };
+        let exit = if inside_session {
+            client::wait_without_attaching(&session.paths.socket, wait)?
+        } else {
+            client::attach(&session.paths.socket, Some(wait))?
+        };
+        Ok(report_wait(&session.paths.name, exit))
     }
 
     fn describe(session: &str, exit: client::Exit) -> Result<String> {
@@ -310,14 +328,29 @@ mod unix {
             client::Exit::ServerShutdown => format!("session {session:?} has ended"),
             client::Exit::Disconnected => format!("lost connection to session {session:?}"),
             client::Exit::Rejected(error) => anyhow::bail!(error),
+            client::Exit::WaitFinished { .. } => String::new(),
         })
     }
 
     fn attach(session_paths: &server::SessionPaths) -> Result<Outcome> {
-        let exit = client::attach(&session_paths.socket)?;
+        let exit = client::attach(&session_paths.socket, None)?;
         let message = describe(&session_paths.name, exit)?;
         writeln!(std::io::stdout(), "{message}").ok();
         Ok(Outcome::Exit(0))
+    }
+
+    fn report_wait(session: &str, exit: client::Exit) -> Outcome {
+        if let client::Exit::WaitFinished { status, errors } = exit {
+            for error in errors {
+                eprintln!("zed --tui: {error}");
+            }
+            return Outcome::Exit(status);
+        }
+        match describe(session, exit) {
+            Ok(message) => eprintln!("zed --tui: {message} before the files were closed"),
+            Err(error) => eprintln!("zed --tui: {error:#}"),
+        }
+        Outcome::Exit(1)
     }
 
     fn absolute_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
@@ -451,6 +484,26 @@ mod unix {
         use settings::{
             FontSize, ReduceMotionMode, SaturatingBool, ThemeColor, ThemeName, ThemeSelection,
         };
+
+        #[test]
+        fn wait_is_a_top_level_flag_and_sessions_default_to_the_path() {
+            let cli = Cli::try_parse_from(["zed --tui", "--wait", "a.txt"]).unwrap();
+            assert!(cli.wait);
+            assert_eq!(cli.session, None);
+            assert_eq!(cli.paths, [PathBuf::from("a.txt")]);
+            assert!(Cli::try_parse_from(["zed --tui", "attach", "--wait"]).is_err());
+
+            let cli = Cli::try_parse_from(["zed --tui", "server", "--root", "/r", "/r/a"]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Some(Command::Server { root: Some(root), paths })
+                    if root == Path::new("/r") && paths == [PathBuf::from("/r/a")]
+            ));
+            let cli = Cli::try_parse_from(["zed --tui", "kill", "sub"]).unwrap();
+            assert!(
+                matches!(cli.command, Some(Command::Kill { path: Some(path) }) if path == Path::new("sub"))
+            );
+        }
 
         #[gpui::test]
         fn user_settings_override_defaults_but_not_constraints(cx: &mut gpui::TestAppContext) {

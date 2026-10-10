@@ -16,7 +16,7 @@ use parking_lot::Mutex;
 
 use crate::tui::protocol::{
     ClientMessage, FrameDecoder, KeyCode, MouseAction, MouseButtonKind, PROTOCOL_VERSION,
-    ServerMessage, TermEvent, read_message, write_message,
+    ServerMessage, TermEvent, WAIT_ONLY_SIZE, read_message, write_message,
 };
 const PUSH_TITLE: &str = "\x1b[22;0t";
 const POP_TITLE: &str = "\x1b[23;0t";
@@ -37,6 +37,7 @@ pub enum Exit {
     ServerShutdown,
     Disconnected,
     Rejected(String),
+    WaitFinished { status: i32, errors: Vec<String> },
 }
 
 #[derive(Clone, Copy, Default)]
@@ -552,7 +553,9 @@ impl<W: Write> Renderer<W> {
             ServerMessage::Clipboard(text) => self.copy_to_clipboard(text)?,
             ServerMessage::Title(title) => self.set_title(title)?,
             ServerMessage::Pointer(style) => self.set_pointer(*style)?,
-            ServerMessage::Shutdown | ServerMessage::Error(_) => {}
+            ServerMessage::Shutdown
+            | ServerMessage::Error(_)
+            | ServerMessage::WaitFinished { .. } => {}
         }
         Ok(false)
     }
@@ -676,7 +679,11 @@ enum ClientEvent {
     Exit(Exit),
 }
 
-fn connect(socket: &Path, (cols, rows): (u16, u16)) -> Result<UnixStream> {
+fn connect(
+    socket: &Path,
+    (cols, rows): (u16, u16),
+    wait: Option<ClientMessage>,
+) -> Result<UnixStream> {
     let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("connecting to {}", socket.display()))?;
     write_message(
@@ -687,6 +694,9 @@ fn connect(socket: &Path, (cols, rows): (u16, u16)) -> Result<UnixStream> {
             rows,
         },
     )?;
+    if let Some(wait) = wait {
+        write_message(&mut stream, &wait)?;
+    }
     Ok(stream)
 }
 
@@ -694,6 +704,10 @@ fn exit_of(message: &ServerMessage) -> Option<Exit> {
     match message {
         ServerMessage::Shutdown => Some(Exit::ServerShutdown),
         ServerMessage::Error(error) => Some(Exit::Rejected(error.clone())),
+        ServerMessage::WaitFinished { status, errors } => Some(Exit::WaitFinished {
+            status: *status,
+            errors: errors.clone(),
+        }),
         ServerMessage::FullFrame(..)
         | ServerMessage::Clipboard(_)
         | ServerMessage::Title(_)
@@ -701,9 +715,9 @@ fn exit_of(message: &ServerMessage) -> Option<Exit> {
     }
 }
 
-pub fn attach(socket: &Path) -> Result<Exit> {
+pub fn attach(socket: &Path, wait: Option<ClientMessage>) -> Result<Exit> {
     let (cols, rows) = terminal::size().context("reading the terminal size")?;
-    let stream = connect(socket, (cols, rows))?;
+    let stream = connect(socket, (cols, rows), wait)?;
     let socket_writer = Arc::new(Mutex::new(stream.try_clone()?));
     let mut reader = BufReader::new(stream);
 
@@ -801,6 +815,16 @@ pub fn attach(socket: &Path) -> Result<Exit> {
             if write_message(&mut *socket_writer.lock(), message).is_err() {
                 return Ok(Exit::Disconnected);
             }
+        }
+    }
+    Ok(Exit::Disconnected)
+}
+
+pub fn wait_without_attaching(socket: &Path, wait: ClientMessage) -> Result<Exit> {
+    let mut reader = BufReader::new(connect(socket, WAIT_ONLY_SIZE, Some(wait))?);
+    while let Ok(message) = read_message::<ServerMessage>(&mut reader) {
+        if let Some(exit) = exit_of(&message) {
+            return Ok(exit);
         }
     }
     Ok(Exit::Disconnected)

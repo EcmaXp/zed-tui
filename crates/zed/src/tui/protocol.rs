@@ -11,6 +11,7 @@ use gpui_tui::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 pub const PROTOCOL_VERSION: u32 = 15;
+pub const WAIT_ONLY_SIZE: (u16, u16) = (0, 0);
 const MAX_MESSAGE_LEN: usize = 64 * 1024 * 1024;
 const CONTINUATION: char = '\0';
 const CLUSTER_EXTEND: char = '\u{1}';
@@ -72,12 +73,25 @@ pub enum TermEvent {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ClientMessage {
-    Hello { version: u32, cols: u16, rows: u16 },
+    Hello {
+        version: u32,
+        cols: u16,
+        rows: u16,
+    },
     Input(TermEvent),
-    Resize { cols: u16, rows: u16 },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
     Detach,
     Kill,
-    Open { paths: Vec<PathBuf> },
+    Open {
+        paths: Vec<PathBuf>,
+    },
+    OpenAndWait {
+        paths: Vec<PathBuf>,
+        quit_session: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +123,10 @@ pub enum ServerMessage {
     Title(String),
     Shutdown,
     Error(String),
+    WaitFinished {
+        status: i32,
+        errors: Vec<String>,
+    },
     Pointer(CursorStyle),
 }
 
@@ -308,7 +326,8 @@ impl FrameDecoder {
             | ServerMessage::Title(_)
             | ServerMessage::Pointer(_)
             | ServerMessage::Shutdown
-            | ServerMessage::Error(_) => {}
+            | ServerMessage::Error(_)
+            | ServerMessage::WaitFinished { .. } => {}
         }
     }
 }
@@ -341,6 +360,10 @@ mod tests {
                 rows: 30,
             },
             ClientMessage::Detach,
+            ClientMessage::OpenAndWait {
+                paths: vec![PathBuf::from("/repo/.git/COMMIT_EDITMSG")],
+                quit_session: true,
+            },
         ];
         let mut buffer = Vec::new();
         for message in &messages {

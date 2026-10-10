@@ -12,14 +12,15 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread,
     time::{Duration, Instant},
 };
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
+use cli::{CliRequest, CliResponse, CliResponseSink};
 use collections::HashMap;
 use futures::{
     StreamExt as _,
@@ -29,18 +30,20 @@ use gpui::{App, AsyncApp, CursorStyle};
 use gpui_tui::{CellGrid, TuiPlatform};
 use parking_lot::Mutex;
 use util::ResultExt as _;
+use workspace::{AppState, MultiWorkspace};
 
 use crate::tui::{
     input::{InputTranslator, Translated},
     protocol::{
-        ClientMessage, FrameEncoder, PROTOCOL_VERSION, ServerMessage, TermEvent, read_message,
-        write_message,
+        ClientMessage, FrameEncoder, PROTOCOL_VERSION, ServerMessage, TermEvent, WAIT_ONLY_SIZE,
+        read_message, write_message,
     },
 };
 
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(30);
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_SESSION_BASENAME: usize = 32;
+const FIRST_WINDOW_POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub const SESSION_ENV: &str = "ZED_TUI_SESSION";
 pub const ALREADY_RUNNING_EXIT_CODE: i32 = 3;
 
@@ -205,6 +208,7 @@ enum Outgoing {
 
 struct ClientHandle {
     id: u64,
+    receives_frames: bool,
     sender: mpsc::Sender<Outgoing>,
 }
 
@@ -245,9 +249,9 @@ impl ClientHub {
     fn broadcast_frame(&self, grid: Arc<CellGrid>) {
         let mut state = self.state.lock();
         state.last_frame = Some(grid.clone());
-        state
-            .clients
-            .retain(|client| client.sender.send(Outgoing::Frame(grid.clone())).is_ok());
+        state.clients.retain(|client| {
+            !client.receives_frames || client.sender.send(Outgoing::Frame(grid.clone())).is_ok()
+        });
     }
 
     fn broadcast_message(&self, message: ServerMessage) {
@@ -273,6 +277,17 @@ impl ClientHub {
         }
     }
 
+    fn send_message_to(&self, id: u64, message: ServerMessage) -> bool {
+        self.state
+            .lock()
+            .client(id)
+            .is_some_and(|client| client.sender.send(Outgoing::Message(message)).is_ok())
+    }
+
+    fn has_client(&self, id: u64) -> bool {
+        self.state.lock().client(id).is_some()
+    }
+
     fn set_pointer(&self, style: CursorStyle) {
         let mut state = self.state.lock();
         state.pointer = style;
@@ -296,10 +311,21 @@ impl ClientHub {
 }
 
 enum ServerEvent {
-    Resized { id: u64, cols: u16, rows: u16 },
-    Disconnected { id: u64 },
+    Resized {
+        id: u64,
+        cols: u16,
+        rows: u16,
+    },
+    Disconnected {
+        id: u64,
+    },
     Input(TermEvent),
     Open(Vec<PathBuf>),
+    OpenAndWait {
+        id: u64,
+        paths: Vec<PathBuf>,
+        quit_session: bool,
+    },
     Kill,
 }
 
@@ -455,9 +481,114 @@ fn handle_event(
             }
         }
         ServerEvent::Open(paths) => platform.open_urls(file_urls(&paths)),
+        ServerEvent::OpenAndWait {
+            id,
+            paths,
+            quit_session,
+        } => {
+            let hub = hub.clone();
+            cx.spawn(async move |cx| open_and_wait(hub, id, paths, quit_session, cx).await)
+                .detach();
+        }
         ServerEvent::Kill => {
             cx.update(|cx| cx.quit());
         }
+    }
+}
+
+struct WaitSink {
+    hub: Arc<ClientHub>,
+    id: u64,
+    errors: Mutex<Vec<String>>,
+    delivered: Arc<AtomicBool>,
+}
+
+impl CliResponseSink for WaitSink {
+    fn send(&self, response: CliResponse) -> Result<()> {
+        match response {
+            CliResponse::Ping if self.hub.has_client(self.id) => Ok(()),
+            CliResponse::Ping => Err(anyhow!("client {} stopped waiting", self.id)),
+            CliResponse::Stdout { message } | CliResponse::Stderr { message } => {
+                log::info!("waiting client {}: {message}", self.id);
+                self.errors.lock().push(message);
+                Ok(())
+            }
+            CliResponse::Exit { status } => {
+                let errors = std::mem::take(&mut *self.errors.lock());
+                let delivered = self
+                    .hub
+                    .send_message_to(self.id, ServerMessage::WaitFinished { status, errors });
+                self.delivered.store(delivered, Ordering::SeqCst);
+                if delivered {
+                    Ok(())
+                } else {
+                    Err(anyhow!("client {} left before its wait finished", self.id))
+                }
+            }
+            CliResponse::PromptOpenBehavior => Err(anyhow!("cannot prompt a waiting client")),
+        }
+    }
+}
+
+async fn open_and_wait(
+    hub: Arc<ClientHub>,
+    id: u64,
+    paths: Vec<PathBuf>,
+    quit_session: bool,
+    cx: &mut AsyncApp,
+) {
+    let Some(app_state) = cx.update(|cx| AppState::try_global(cx)) else {
+        hub.send_message_to(
+            id,
+            ServerMessage::WaitFinished {
+                status: 1,
+                errors: vec!["the session has not started".to_owned()],
+            },
+        );
+        return;
+    };
+    let deadline = Instant::now() + DAEMON_START_TIMEOUT;
+    while !cx.update(|cx| {
+        cx.windows()
+            .iter()
+            .any(|window| window.downcast::<MultiWorkspace>().is_some())
+    }) && Instant::now() < deadline
+    {
+        cx.background_executor()
+            .timer(FIRST_WINDOW_POLL_INTERVAL)
+            .await;
+    }
+
+    let delivered = Arc::new(AtomicBool::new(false));
+    let sink = WaitSink {
+        hub,
+        id,
+        errors: Mutex::default(),
+        delivered: delivered.clone(),
+    };
+    let (requests, receiver) = unbounded();
+    requests
+        .unbounded_send(CliRequest::Open {
+            paths: paths
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
+            urls: Vec::new(),
+            diff_paths: Vec::new(),
+            diff_all: false,
+            wsl: None,
+            wait: true,
+            open_behavior: cli::OpenBehavior::Add,
+            env: None,
+            user_data_dir: None,
+            dev_container: false,
+            cwd: None,
+        })
+        .log_err();
+    drop(requests);
+    crate::zed::handle_cli_connection((receiver, Box::new(sink)), app_state, cx).await;
+    if quit_session && delivered.load(Ordering::SeqCst) {
+        cx.update(|cx| cx.quit());
     }
 }
 
@@ -541,24 +672,33 @@ fn serve_client(
         other => bail!("expected a hello message, got {other:?}"),
     };
 
+    let receives_frames = (cols, rows) != WAIT_ONLY_SIZE;
     let (sender, receiver) = mpsc::channel();
     thread::Builder::new()
         .name(format!("ClientWriter-{id}"))
         .spawn(move || write_to_client(write_stream, receiver))?;
     {
         let mut state = hub.state.lock();
-        if let Some(title) = state.last_title.clone() {
+        if let Some(title) = state.last_title.clone().filter(|_| receives_frames) {
             sender
                 .send(Outgoing::Message(ServerMessage::Title(title)))
                 .log_err();
         }
-        state.clients.push(ClientHandle { id, sender });
+        state.clients.push(ClientHandle {
+            id,
+            receives_frames,
+            sender,
+        });
     }
 
-    events
-        .unbounded_send(ServerEvent::Resized { id, cols, rows })
-        .log_err();
-    log::info!("client {id} attached at {cols}x{rows}");
+    if receives_frames {
+        events
+            .unbounded_send(ServerEvent::Resized { id, cols, rows })
+            .log_err();
+        log::info!("client {id} attached at {cols}x{rows}");
+    } else {
+        log::info!("client {id} attached to wait without frames");
+    }
 
     let hub = hub.clone();
     let events = events.clone();
@@ -598,6 +738,14 @@ fn read_from_client(
             Ok(ClientMessage::Resize { cols, rows }) => ServerEvent::Resized { id, cols, rows },
             Ok(ClientMessage::Kill) => ServerEvent::Kill,
             Ok(ClientMessage::Open { paths }) => ServerEvent::Open(paths),
+            Ok(ClientMessage::OpenAndWait {
+                paths,
+                quit_session,
+            }) => ServerEvent::OpenAndWait {
+                id,
+                paths,
+                quit_session,
+            },
             Ok(ClientMessage::Detach) => return true,
             Ok(ClientMessage::Hello { .. }) => continue,
             Err(error) => {
@@ -634,7 +782,7 @@ pub fn spawn_daemon(
     root: &Path,
     paths_to_open: &[PathBuf],
     user_data_dir: Option<&Path>,
-) -> Result<()> {
+) -> Result<bool> {
     create_private_dir(&session_paths.directory)?;
     let log = fs::File::create(&session_paths.log)
         .with_context(|| format!("creating {}", session_paths.log.display()))?;
@@ -663,7 +811,8 @@ pub fn spawn_daemon(
     let deadline = Instant::now() + DAEMON_START_TIMEOUT;
     while Instant::now() < deadline {
         if is_running(session_paths) {
-            return Ok(());
+            let owner = fs::read_to_string(&session_paths.pid).unwrap_or_default();
+            return Ok(owner.trim() == child.id().to_string());
         }
         if let Some(status) = child.try_status()?
             && status.code() != Some(ALREADY_RUNNING_EXIT_CODE)
@@ -1048,6 +1197,116 @@ mod tests {
         let root = Path::new("/work/한글 repo");
         write_root(&session_paths, root).unwrap();
         assert_eq!(read_root(&session_paths).as_deref(), Some(root));
+    }
+
+    #[test]
+    fn an_open_and_wait_after_hello_reports_the_client_id() {
+        let hub = Arc::new(ClientHub::default());
+        let (id, mut client_side, mut events) = attach(&hub);
+        let paths = vec![PathBuf::from("/repo/a.txt")];
+        write_message(
+            &mut client_side,
+            &ClientMessage::OpenAndWait {
+                paths: paths.clone(),
+                quit_session: true,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            next_event(&mut events),
+            ServerEvent::OpenAndWait { id: waiting, paths: opened, quit_session: true }
+                if waiting == id && opened == paths
+        ));
+    }
+
+    fn wait_sink(hub: &Arc<ClientHub>, id: u64) -> (WaitSink, Arc<AtomicBool>) {
+        let delivered = Arc::new(AtomicBool::new(false));
+        let sink = WaitSink {
+            hub: hub.clone(),
+            id,
+            errors: Mutex::default(),
+            delivered: delivered.clone(),
+        };
+        (sink, delivered)
+    }
+
+    #[test]
+    fn a_finished_wait_reaches_only_its_client() {
+        let hub = Arc::new(ClientHub::default());
+        let (waiting, waiting_side, _waiting_events) = attach(&hub);
+        let (_, other_side, _other_events) = attach(&hub);
+        let (sink, delivered) = wait_sink(&hub, waiting);
+
+        sink.send(CliResponse::Stderr {
+            message: "oops".into(),
+        })
+        .unwrap();
+        sink.send(CliResponse::Exit { status: 0 }).unwrap();
+        hub.broadcast_message(ServerMessage::Title("title".into()));
+
+        assert!(delivered.load(Ordering::SeqCst));
+        let message: ServerMessage = read_message(&mut BufReader::new(waiting_side)).unwrap();
+        assert_eq!(
+            message,
+            ServerMessage::WaitFinished {
+                status: 0,
+                errors: vec!["oops".into()],
+            }
+        );
+        let message: ServerMessage = read_message(&mut BufReader::new(other_side)).unwrap();
+        assert_eq!(message, ServerMessage::Title("title".into()));
+    }
+
+    #[test]
+    fn pings_fail_once_the_waiting_client_is_gone() {
+        let hub = Arc::new(ClientHub::default());
+        let (id, mut client_side, mut events) = attach(&hub);
+        let (sink, delivered) = wait_sink(&hub, id);
+        sink.send(CliResponse::Ping).unwrap();
+
+        write_message(&mut client_side, &ClientMessage::Detach).unwrap();
+        assert!(matches!(
+            next_event(&mut events),
+            ServerEvent::Disconnected { .. }
+        ));
+        assert!(sink.send(CliResponse::Ping).is_err());
+        assert!(sink.send(CliResponse::Exit { status: 0 }).is_err());
+        assert!(!delivered.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn wait_only_clients_receive_no_frames_or_titles() {
+        let hub = Arc::new(ClientHub::default());
+        hub.state.lock().last_title = Some("title".into());
+        let (event_sender, mut events) = unbounded();
+        let (server_side, mut client_side) = UnixStream::pair().unwrap();
+        let (cols, rows) = WAIT_ONLY_SIZE;
+        write_message(
+            &mut client_side,
+            &ClientMessage::Hello {
+                version: PROTOCOL_VERSION,
+                cols,
+                rows,
+            },
+        )
+        .unwrap();
+        serve_client(server_side, &hub, &event_sender).unwrap();
+        write_message(
+            &mut client_side,
+            &ClientMessage::OpenAndWait {
+                paths: Vec::new(),
+                quit_session: false,
+            },
+        )
+        .unwrap();
+        let ServerEvent::OpenAndWait { id, .. } = next_event(&mut events) else {
+            panic!("a wait-only client must not report a size");
+        };
+
+        hub.broadcast_frame(Arc::new(CellGrid::new(4, 2, Rgb::default())));
+        assert!(hub.send_message_to(id, ServerMessage::Shutdown));
+        let message: ServerMessage = read_message(&mut BufReader::new(client_side)).unwrap();
+        assert_eq!(message, ServerMessage::Shutdown);
     }
 
     fn move_mouse(writer: &mut UnixStream, events: &mut UnboundedReceiver<ServerEvent>) {
