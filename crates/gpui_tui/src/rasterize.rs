@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use gpui::{
     AtlasKey, Bounds, ContentMask, Hsla, IsZero, MonochromeSprite, Path, Point, PrimitiveBatch,
-    Quad, Rgba, ScaledPixels, Scene, Underline,
+    Quad, Rgba, ScaledPixels, Scene, Style, Underline,
 };
 
 use crate::{
@@ -185,6 +185,7 @@ pub(crate) fn rasterize_scene(
         canvas,
         scratch,
         carets: Vec::new(),
+        toggle_boxes: Vec::new(),
     };
     for batch in scene.batches() {
         match batch {
@@ -214,6 +215,7 @@ pub(crate) fn rasterize_scene(
             | PrimitiveBatch::Surfaces(_) => {}
         }
     }
+    rasterizer.toggle_boxes();
     (rasterizer.grid, rasterizer.carets)
 }
 
@@ -365,6 +367,13 @@ struct Rasterizer<'a> {
     canvas: Rgb,
     scratch: &'a mut RasterScratch,
     carets: Vec<CaretCandidate>,
+    toggle_boxes: Vec<ToggleBox>,
+}
+
+struct ToggleBox {
+    row: i32,
+    cols: Range<i32>,
+    color: Rgba,
 }
 
 impl Rasterizer<'_> {
@@ -523,27 +532,31 @@ impl Rasterizer<'_> {
         let (first_row, last_row) = (rows.start, rows.end - 1);
         let edges = quad.border_widths;
         let color = quad.border_color.to_rgb();
-        if rows.len() == 1
-            && cols.len() <= MAX_GLYPH_COLS
-            && edges.left.0 > 0.
-            && quad.corner_radii.is_zero()
-        {
-            let is_top_border_strip = clipped.top() <= full.top();
-            if !is_top_border_strip {
+        if rows.len() == 1 && cols.len() <= Style::MAX_TOGGLE_BOX_COLUMNS && edges.left.0 > 0. {
+            if quad.corner_radii.is_zero() {
+                let is_top_border_strip = clipped.top() <= full.top();
+                if !is_top_border_strip {
+                    return;
+                }
+                let covered_cell = self.grid.cell(first_col, first_row).copied();
+                self.hollow_cells(first_row, cols, color);
+                if let Some(covered_cell) = covered_cell {
+                    self.push_caret(
+                        first_col,
+                        first_row,
+                        CursorShape::Block,
+                        color,
+                        covered_cell,
+                        false,
+                    );
+                }
                 return;
             }
-            let covered_cell = self.grid.cell(first_col, first_row).copied();
-            self.hollow_cells(first_row, cols, color);
-            if let Some(covered_cell) = covered_cell {
-                self.push_caret(
-                    first_col,
-                    first_row,
-                    CursorShape::Block,
-                    color,
-                    covered_cell,
-                    false,
-                );
-            }
+            self.toggle_boxes.push(ToggleBox {
+                row: first_row,
+                cols,
+                color,
+            });
             return;
         }
         let is_boxed = [edges.top, edges.right, edges.bottom, edges.left]
@@ -604,6 +617,36 @@ impl Rasterizer<'_> {
             }
             if is_edge_row && let Some(rules) = self.rules_in_row(row) {
                 rules.push(first_col + 1..last_col);
+            }
+        }
+    }
+
+    fn toggle_boxes(&mut self) {
+        for ToggleBox { row, cols, color } in std::mem::take(&mut self.toggle_boxes) {
+            let mark = cols.clone().find_map(|col| {
+                self.grid
+                    .cell_mut(col, row)
+                    .filter(|cell| {
+                        !matches!(
+                            cell.glyph.as_char(),
+                            Some(' ' | '☐' | '│' | '▌' | '─' | '┌' | '┐' | '└' | '┘')
+                        )
+                    })
+                    .map(|cell| cell.fg)
+            });
+            for col in cols.clone() {
+                self.clear_char(col, row);
+            }
+            match mark {
+                Some(mark_color) => {
+                    if let Some(cell) = self.grid.cell_mut(cols.start, row) {
+                        cell.glyph = '☑'.into();
+                        cell.fg = mark_color;
+                    }
+                }
+                None => {
+                    self.line_char(cols.start, row, '☐', color);
+                }
             }
         }
     }
@@ -1086,6 +1129,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn wide_left_bars_inside_a_toggle_box_are_not_read_as_a_check_mark() {
+        let atlas = TuiAtlas::default();
+        let mut scene = Scene::default();
+        scene.insert_primitive(toggle_box(0., 16.));
+        scene.insert_primitive(left_bordered_quad(8., 32., 1., CELL_WIDTH));
+        scene.finish();
+        let grid = rasterize(&scene, &atlas, 6, 1).0;
+        assert_eq!(grid.row_text(0), "☐     ");
+    }
+
+    #[test]
+    fn empty_toggle_boxes_render_as_ballot_boxes() {
+        let atlas = TuiAtlas::default();
+        let mut scene = Scene::default();
+        for width in [16., 16., 32.] {
+            scene.insert_primitive(toggle_box(0., width));
+        }
+        scene.finish();
+        let grid = rasterize(&scene, &atlas, 4, 1).0;
+        assert_eq!(grid.row_text(0), "☐  │");
+    }
+
+    #[test]
+    fn toggle_boxes_holding_a_mark_render_as_checked() {
+        let atlas = TuiAtlas::default();
+        let mut scene = Scene::default();
+        scene.insert_primitive(toggle_box(0., 16.));
+        scene.push_layer(scaled_bounds(0., 0., 16., 16.));
+        scene.insert_primitive(glyph_sprite(&atlas, '✓', 8.));
+        scene.pop_layer();
+        scene.finish();
+        let grid = rasterize(&scene, &atlas, 4, 1).0;
+        assert_eq!(grid.row_text(0), "☑   ");
+    }
+
+    fn toggle_box(x: f32, width: f32) -> Quad {
+        Quad {
+            corner_radii: gpui::Corners::all(ScaledPixels(1.25)),
+            ..hollow_cursor(x, width, Hsla::white())
+        }
+    }
+
     fn hollow_cursor(x: f32, width: f32, color: Hsla) -> Quad {
         Quad {
             bounds: scaled_bounds(x, 0., width, 16.),
@@ -1175,6 +1261,30 @@ mod tests {
         let tint = Rgb::default().blend(cursor.opacity(HOLLOW_CURSOR_TINT));
         assert_eq!(grid.cell(0, 0).unwrap().bg, tint);
         assert_eq!(carets.len(), 1);
+    }
+
+    #[test]
+    fn one_row_toggle_boxes_still_render_as_checkboxes() {
+        let atlas = TuiAtlas::default();
+        let mut scene = Scene::default();
+        scene.insert_primitive(glyph_sprite(&atlas, 'x', 40.));
+        scene.insert_primitive(toggle_box(0., 16.));
+        scene.insert_primitive(toggle_box(16., 16.));
+        scene.insert_primitive(hollow_cursor(40., 8., Hsla::white()));
+        scene.push_layer(scaled_bounds(0., 0., 16., 16.));
+        scene.insert_primitive(glyph_sprite(&atlas, '✓', 8.));
+        scene.pop_layer();
+        scene.finish();
+        let (grid, carets) = rasterize(&scene, &atlas, 6, 1);
+        assert_eq!(grid.row_text(0), "☑ ☐  x");
+        assert_eq!(tinted_cols(&grid), [5]);
+        assert_eq!(
+            carets
+                .iter()
+                .map(|caret| (caret.cell.col, caret.shape))
+                .collect::<Vec<_>>(),
+            [(5, CursorShape::Block)]
+        );
     }
 
     #[test]

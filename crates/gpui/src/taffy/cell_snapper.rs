@@ -579,6 +579,9 @@ fn snap_edges<T>(
 }
 
 impl Style {
+    #[expect(missing_docs)]
+    pub const MAX_TOGGLE_BOX_COLUMNS: usize = 2;
+
     pub(crate) fn is_framed_surface(&self) -> bool {
         !self.box_shadow.is_empty()
             && !self.border_widths.any(|width| width.is_zero())
