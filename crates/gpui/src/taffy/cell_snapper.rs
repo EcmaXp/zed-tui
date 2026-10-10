@@ -38,6 +38,16 @@ impl CellNode {
             Side::Right => self.rounds_up_right_margin,
         }
     }
+
+    fn rounds_up_any_margin(&self) -> bool {
+        self.rounds_up_left_margin || self.rounds_up_right_margin
+    }
+
+    fn has_rule_spacing(&self) -> bool {
+        [self.left, self.right]
+            .iter()
+            .any(|edge| matches!(edge, Edge::RuleSpacing(_) | Edge::NestedRuleSpacing(_)))
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -165,10 +175,17 @@ impl CellSnapper {
         let hairline_width = positive_length(taffy_style.size.width)
             .filter(|width| *width < self.cell_size.width / 2.0);
         snap_to_cells(taffy_style, style, self.cell_size, self.viewport_width);
+        let mut nests_rule_spacing = false;
+        let mut rounds_up_a_margin = false;
         let content: Vec<LayoutId> = children
             .iter()
             .copied()
-            .filter(|child| !self.cell_nodes.get(child).is_some_and(|node| node.is_empty))
+            .filter(|child| {
+                let node = self.cell_nodes.get(child);
+                nests_rule_spacing |= node.is_some_and(CellNode::has_rule_spacing);
+                rounds_up_a_margin |= node.is_some_and(CellNode::rounds_up_any_margin);
+                !node.is_some_and(|node| node.is_empty)
+            })
             .collect();
         let is_framed = style.is_framed_surface();
         let draws_rules = !self.is_toggle_box(taffy_style)
@@ -187,8 +204,14 @@ impl CellSnapper {
         if is_framed {
             keep_left_frame_edge_only(taffy_style, self.cell_size.width);
         }
-        let mut dropped_spacings = self.redundant_rule_spacings(taffy_style, &content);
-        dropped_spacings.extend(self.redundant_margins(taffy_style, &content));
+        let mut dropped_spacings = if nests_rule_spacing {
+            self.redundant_rule_spacings(taffy_style, &content)
+        } else {
+            Vec::new()
+        };
+        if rounds_up_a_margin {
+            dropped_spacings.extend(self.redundant_margins(taffy_style, &content));
+        }
         let gap_closers = self.gaps_beside_rules(taffy_style, unsnapped, &content);
         let node = self.cell_node(taffy_style, unsnapped, &content, false);
         let is_in_flow = taffy_style.position != taffy::style::Position::Absolute;
