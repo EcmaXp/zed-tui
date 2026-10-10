@@ -5,6 +5,7 @@ use std::{
     path::Path,
     sync::{Arc, mpsc},
     thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result};
@@ -17,6 +18,7 @@ use crate::tui::protocol::{
     ClientMessage, FrameDecoder, KeyCode, PROTOCOL_VERSION, ServerMessage, TermEvent, read_message,
     write_message,
 };
+const RESIZE_FRAME_WAIT: Duration = Duration::from_millis(100);
 const ATTRIBUTE_CODES: [(CellAttrs, &str); 2] = [(CellAttrs::BOLD, "1"), (CellAttrs::ITALIC, "3")];
 
 pub enum Exit {
@@ -308,8 +310,27 @@ impl<W: Write> Renderer<W> {
         }
     }
 
-    fn apply(&mut self, message: &ServerMessage) {
-        self.decoder.apply(&mut self.grid, message);
+    fn apply(&mut self, message: &ServerMessage) -> io::Result<bool> {
+        match message {
+            ServerMessage::FullFrame(..) => {
+                self.decoder.apply(&mut self.grid, message);
+                return Ok(true);
+            }
+            ServerMessage::Shutdown | ServerMessage::Error(_) => {}
+        }
+        Ok(false)
+    }
+
+    fn resize(&mut self, cols: u16, rows: u16) {
+        self.terminal.cols = cols;
+        self.terminal.rows = rows;
+        self.drawn_size = None;
+    }
+
+    fn grid_fills_terminal(&self) -> bool {
+        self.grid
+            .as_ref()
+            .is_some_and(|grid| grid.cols == self.terminal.cols && grid.rows == self.terminal.rows)
     }
 
     fn render(&mut self) -> io::Result<()> {
@@ -388,10 +409,13 @@ pub fn attach(socket: &Path) -> Result<Exit> {
     let (render_sender, render_receiver) = mpsc::channel();
     thread::Builder::new()
         .name("Socket reader".to_owned())
-        .spawn(move || {
-            while let Ok(message) = read_message::<ServerMessage>(&mut reader) {
-                if render_sender.send(message).is_err() {
-                    break;
+        .spawn({
+            let render_sender = render_sender.clone();
+            move || {
+                while let Ok(message) = read_message::<ServerMessage>(&mut reader) {
+                    if render_sender.send(RenderEvent::Server(message)).is_err() {
+                        break;
+                    }
                 }
             }
         })?;
@@ -418,6 +442,7 @@ pub fn attach(socket: &Path) -> Result<Exit> {
 
     while let Ok(first) = events.recv() {
         let mut inputs = Vec::new();
+        let mut resize = None;
         for event in std::iter::once(first).chain(events.try_iter()) {
             let event = match event {
                 ClientEvent::Exit(exit) => return Ok(exit),
@@ -430,15 +455,21 @@ pub fn attach(socket: &Path) -> Result<Exit> {
                     }
                     inputs.extend(term_key(&key));
                 }
-                event::Event::Resize(..)
-                | event::Event::Mouse(_)
+                event::Event::Resize(cols, rows) => resize = Some((cols, rows)),
+                event::Event::Mouse(_)
                 | event::Event::FocusGained
                 | event::Event::FocusLost
                 | event::Event::Paste(_) => {}
             }
         }
-        for input in inputs {
-            if write_message(&mut *socket_writer.lock(), &ClientMessage::Input(input)).is_err() {
+        let mut messages: Vec<ClientMessage> =
+            inputs.into_iter().map(ClientMessage::Input).collect();
+        if let Some((cols, rows)) = resize {
+            render_sender.send(RenderEvent::Resized(cols, rows)).ok();
+            messages.push(ClientMessage::Resize { cols, rows });
+        }
+        for message in &messages {
+            if write_message(&mut *socket_writer.lock(), message).is_err() {
                 return Ok(Exit::Disconnected);
             }
         }
@@ -446,20 +477,49 @@ pub fn attach(socket: &Path) -> Result<Exit> {
     Ok(Exit::Disconnected)
 }
 
+enum RenderEvent {
+    Server(ServerMessage),
+    Resized(u16, u16),
+}
+
 fn render_messages<W: Write>(
     renderer: &mut Renderer<W>,
-    messages: &mpsc::Receiver<ServerMessage>,
+    events: &mpsc::Receiver<RenderEvent>,
 ) -> Exit {
-    while let Ok(message) = messages.recv() {
-        if let Some(exit) = exit_of(&message) {
-            return exit;
+    let mut resize_deadline: Option<Instant> = None;
+    loop {
+        let timeout = resize_deadline.map_or(Duration::MAX, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        });
+        let event = match events.recv_timeout(timeout) {
+            Ok(event) => Some(event),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Exit::Disconnected,
+        };
+        let mut is_frame = false;
+        match event {
+            Some(RenderEvent::Resized(cols, rows)) => {
+                renderer.resize(cols, rows);
+                resize_deadline = Some(Instant::now() + RESIZE_FRAME_WAIT);
+            }
+            Some(RenderEvent::Server(message)) => {
+                if let Some(exit) = exit_of(&message) {
+                    return exit;
+                }
+                match renderer.apply(&message) {
+                    Ok(frame) => is_frame = frame,
+                    Err(_) => return Exit::Disconnected,
+                }
+            }
+            None => {}
         }
-        renderer.apply(&message);
-        if renderer.render().is_err() {
+        let resized_frame_arrived = is_frame && renderer.grid_fills_terminal();
+        resize_deadline =
+            resize_deadline.filter(|deadline| !resized_frame_arrived && Instant::now() < *deadline);
+        if resize_deadline.is_none() && renderer.render().is_err() {
             return Exit::Disconnected;
         }
     }
-    Exit::Disconnected
 }
 
 fn term_modifiers(modifiers: event::KeyModifiers) -> Modifiers {
@@ -836,5 +896,75 @@ mod tests {
         renderer.grid = Some(grid.clone());
         emulator.feed(&mut renderer);
         assert_eq!(shown_at(&emulator), None);
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedOutput(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedOutput {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn full_frame(cols: u16, rows: u16) -> RenderEvent {
+        let mut grid = CellGrid::new(cols, rows, Rgb::new(40, 44, 52));
+        text_row(&mut grid, 0, 0, "hello");
+        RenderEvent::Server(crate::tui::protocol::FrameEncoder.full_frame(&grid))
+    }
+
+    #[test]
+    fn a_resize_waits_for_the_resized_frame_before_repainting() {
+        let output = SharedOutput::default();
+        let (sender, receiver) = mpsc::channel();
+        let render_thread = thread::spawn({
+            let output = output.clone();
+            move || {
+                let mut renderer = Renderer::new(output, 20, 4);
+                render_messages(&mut renderer, &receiver);
+            }
+        });
+        let take_output = || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while output.0.lock().is_empty() {
+                assert!(Instant::now() < deadline, "nothing was rendered");
+                thread::sleep(Duration::from_millis(5));
+            }
+            String::from_utf8(std::mem::take(&mut *output.0.lock())).unwrap()
+        };
+
+        sender.send(full_frame(20, 4)).unwrap();
+        assert!(take_output().contains("hello"));
+
+        sender.send(RenderEvent::Resized(30, 6)).unwrap();
+        thread::sleep(RESIZE_FRAME_WAIT / 3);
+        assert!(output.0.lock().is_empty());
+        sender.send(full_frame(30, 6)).unwrap();
+        assert_eq!(take_output().matches("\x1b[2J").count(), 1);
+
+        sender.send(RenderEvent::Resized(25, 5)).unwrap();
+        assert!(take_output().contains("\x1b[2J"));
+
+        drop(sender);
+        render_thread.join().unwrap();
+    }
+
+    #[test]
+    fn resizing_redraws_everything() {
+        let mut grid = CellGrid::new(20, 4, Rgb::new(40, 44, 52));
+        mutate(&mut grid, &mut Random::new(9), 10);
+        let mut renderer = Renderer::new(Vec::new(), 20, 4);
+        renderer.grid = Some(grid.clone());
+        Emulator::new(20, 4).feed(&mut renderer);
+
+        let mut emulator = Emulator::new(20, 4);
+        renderer.resize(20, 4);
+        emulator.feed(&mut renderer);
+        emulator.assert_shows(&grid, 20);
     }
 }

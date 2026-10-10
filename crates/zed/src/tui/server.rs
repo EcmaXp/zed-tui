@@ -18,6 +18,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
+use collections::HashMap;
 use futures::{
     StreamExt as _,
     channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded},
@@ -149,7 +150,7 @@ impl ClientHub {
 
 enum ServerEvent {
     Resized { id: u64, cols: u16, rows: u16 },
-    Disconnected,
+    Disconnected { id: u64 },
     Input(TermEvent),
 }
 
@@ -233,24 +234,48 @@ async fn handle_events(
     hub: Arc<ClientHub>,
     mut events: UnboundedReceiver<ServerEvent>,
 ) {
+    let mut sizes: HashMap<u64, (u16, u16)> = HashMap::default();
+
     while let Some(event) = events.next().await {
-        handle_event(event, &platform, &hub);
+        handle_event(event, &platform, &hub, &mut sizes);
     }
 }
 
-fn handle_event(event: ServerEvent, platform: &TuiPlatform, hub: &Arc<ClientHub>) {
+fn handle_event(
+    event: ServerEvent,
+    platform: &TuiPlatform,
+    hub: &Arc<ClientHub>,
+    sizes: &mut HashMap<u64, (u16, u16)>,
+) {
     match event {
         ServerEvent::Resized { id, cols, rows } => {
-            platform.resize(cols, rows);
-            hub.send_last_frame_to(id, (cols, rows));
+            let attached = sizes.insert(id, (cols, rows)).is_none();
+            if let Some(shared) = apply_shared_size(platform, sizes)
+                && attached
+            {
+                hub.send_last_frame_to(id, shared);
+            }
         }
-        ServerEvent::Disconnected => {}
+        ServerEvent::Disconnected { id } => {
+            sizes.remove(&id);
+            apply_shared_size(platform, sizes);
+        }
         ServerEvent::Input(event) => {
             if let Some(input) = translate(event) {
                 platform.handle_input(input);
             }
         }
     }
+}
+
+fn apply_shared_size(
+    platform: &TuiPlatform,
+    sizes: &HashMap<u64, (u16, u16)>,
+) -> Option<(u16, u16)> {
+    let cols = sizes.values().map(|(cols, _)| *cols).min()?.max(1);
+    let rows = sizes.values().map(|(_, rows)| *rows).min()?.max(1);
+    platform.resize(cols, rows);
+    Some((cols, rows))
 }
 
 fn accept_clients(
@@ -333,7 +358,9 @@ fn serve_client(
         .spawn(move || {
             read_from_client(id, reader, &events);
             hub.remove(id);
-            events.unbounded_send(ServerEvent::Disconnected).log_err();
+            events
+                .unbounded_send(ServerEvent::Disconnected { id })
+                .log_err();
             log::info!("client {id} disconnected");
         })?;
     Ok(())
@@ -353,6 +380,7 @@ fn read_from_client(
     loop {
         let event = match read_message(&mut reader) {
             Ok(ClientMessage::Input(event)) => ServerEvent::Input(event),
+            Ok(ClientMessage::Resize { cols, rows }) => ServerEvent::Resized { id, cols, rows },
             Ok(ClientMessage::Hello { .. }) => continue,
             Err(error) => {
                 log::debug!("client {id} disconnected: {error:#}");
@@ -520,6 +548,20 @@ mod tests {
         assert!(matches!(message, ServerMessage::FullFrame(..)));
         decoder.apply(&mut mirrored, &message);
         assert_eq!(mirrored.as_ref(), Some(&second));
+
+        write_message(
+            &mut client_writer,
+            &ClientMessage::Resize { cols: 3, rows: 1 },
+        )
+        .unwrap();
+        assert!(matches!(
+            next_event(&mut events),
+            ServerEvent::Resized {
+                cols: 3,
+                rows: 1,
+                ..
+            }
+        ));
 
         let key = TermEvent::Key {
             code: KeyCode::Function(1),

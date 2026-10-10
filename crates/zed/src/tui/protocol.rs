@@ -40,6 +40,7 @@ pub enum TermEvent {
 pub enum ClientMessage {
     Hello { version: u32, cols: u16, rows: u16 },
     Input(TermEvent),
+    Resize { cols: u16, rows: u16 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,6 +241,10 @@ mod tests {
                     ..Default::default()
                 },
             }),
+            ClientMessage::Resize {
+                cols: 100,
+                rows: 30,
+            },
         ];
         let mut buffer = Vec::new();
         for message in &messages {
