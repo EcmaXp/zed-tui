@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use crossterm::{cursor, event, style, terminal};
-use gpui::Modifiers;
+use gpui::{CursorStyle, Modifiers};
 use gpui_tui::{Cell, CellAttrs, CellGrid, CursorShape, Glyph, Rgb};
 use parking_lot::Mutex;
 
@@ -20,9 +20,13 @@ use crate::tui::protocol::{
 };
 const PUSH_TITLE: &str = "\x1b[22;0t";
 const POP_TITLE: &str = "\x1b[23;0t";
+const POINTER_RESET: &[u8] = b"\x1b]22;text\x1b\\";
 const CURSOR_SHAPE_RESET: &[u8] = b"\x1b[0 q";
 const KEYBOARD_FLAGS_QUERY: &str = "\x1b[?u";
+const VERSION_QUERY: &str = "\x1b[>0q";
 const DEVICE_ATTRIBUTES_QUERY: &str = "\x1b[c";
+const MAX_VERSION_REPLY: usize = 64;
+const GHOSTTY_VERSION_PREFIXES: [&[u8]; 2] = [b"ghostty", b"libghostty"];
 const QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 const RESIZE_FRAME_WAIT: Duration = Duration::from_millis(100);
 const ATTRIBUTE_CODES: [(CellAttrs, &str); 2] = [(CellAttrs::BOLD, "1"), (CellAttrs::ITALIC, "3")];
@@ -34,10 +38,16 @@ pub enum Exit {
     Rejected(String),
 }
 
+#[derive(Clone, Copy, Default)]
+struct TerminalFeatures {
+    ghostty: bool,
+}
+
 #[derive(Default)]
 struct TerminalSetup {
     entered: bool,
     keyboard_enhanced: bool,
+    features: TerminalFeatures,
 }
 
 impl TerminalSetup {
@@ -56,6 +66,7 @@ impl TerminalSetup {
             event::EnableBracketedPaste,
         )?;
         let replies = query(output)?;
+        self.features = replies.features;
         if replies.keyboard_flags {
             crossterm::execute!(
                 output,
@@ -71,6 +82,9 @@ impl TerminalSetup {
     fn undo(&self, output: &mut impl Write) {
         if self.keyboard_enhanced {
             crossterm::execute!(output, event::PopKeyboardEnhancementFlags).ok();
+        }
+        if self.features.ghostty {
+            output.write_all(POINTER_RESET).ok();
         }
         if self.entered {
             output.write_all(CURSOR_SHAPE_RESET).ok();
@@ -109,6 +123,7 @@ impl Drop for TerminalGuard {
 
 fn query_terminal(stdout: &mut impl Write) -> io::Result<QueryReplies> {
     let mut query = KEYBOARD_FLAGS_QUERY.to_owned();
+    query.push_str(VERSION_QUERY);
     query.push_str(DEVICE_ATTRIBUTES_QUERY);
     stdout.write_all(query.as_bytes())?;
     stdout.flush()?;
@@ -119,9 +134,31 @@ fn query_terminal(stdout: &mut impl Write) -> io::Result<QueryReplies> {
 struct QueryReplies {
     device_attributes: bool,
     keyboard_flags: bool,
+    features: TerminalFeatures,
+    version: Option<Vec<u8>>,
 }
 
 impl vte::Perform for QueryReplies {
+    fn hook(&mut self, _params: &vte::Params, intermediates: &[u8], ignore: bool, action: char) {
+        self.version = (!ignore && intermediates == b">" && action == '|').then(Vec::new);
+    }
+
+    fn put(&mut self, byte: u8) {
+        if let Some(version) = &mut self.version
+            && version.len() < MAX_VERSION_REPLY
+        {
+            version.push(byte);
+        }
+    }
+
+    fn unhook(&mut self) {
+        if let Some(version) = self.version.take() {
+            self.features.ghostty |= GHOSTTY_VERSION_PREFIXES
+                .iter()
+                .any(|prefix| version.starts_with(prefix));
+        }
+    }
+
     fn csi_dispatch(
         &mut self,
         _params: &vte::Params,
@@ -260,6 +297,8 @@ struct Terminal<W: Write> {
     cursor: Option<(usize, u16)>,
     cursor_visible: bool,
     cursor_shape: Option<CursorShape>,
+    features: TerminalFeatures,
+    pointer: Option<&'static str>,
 }
 
 impl<W: Write> Terminal<W> {
@@ -405,6 +444,8 @@ impl<W: Write> Renderer<W> {
                 cursor: None,
                 cursor_visible: false,
                 cursor_shape: None,
+                features: TerminalFeatures::default(),
+                pointer: None,
             },
             grid: None,
             drawn_size: None,
@@ -420,6 +461,7 @@ impl<W: Write> Renderer<W> {
             }
             ServerMessage::Clipboard(text) => self.copy_to_clipboard(text)?,
             ServerMessage::Title(title) => self.set_title(title)?,
+            ServerMessage::Pointer(style) => self.set_pointer(*style)?,
             ServerMessage::Shutdown | ServerMessage::Error(_) => {}
         }
         Ok(false)
@@ -493,6 +535,16 @@ impl<W: Write> Renderer<W> {
         )?;
         self.terminal.output.flush()
     }
+
+    fn set_pointer(&mut self, style: CursorStyle) -> io::Result<()> {
+        let name = pointer_name(style);
+        if !self.terminal.features.ghostty || self.terminal.pointer == Some(name) {
+            return Ok(());
+        }
+        self.terminal.pointer = Some(name);
+        write!(self.terminal.output, "\x1b]22;{name}\x1b\\")?;
+        self.terminal.output.flush()
+    }
 }
 
 fn cursor_shape_sequence(shape: CursorShape) -> &'static [u8] {
@@ -500,6 +552,32 @@ fn cursor_shape_sequence(shape: CursorShape) -> &'static [u8] {
         CursorShape::Block => b"\x1b[2 q",
         CursorShape::Underline => b"\x1b[4 q",
         CursorShape::Bar => b"\x1b[6 q",
+    }
+}
+
+fn pointer_name(style: CursorStyle) -> &'static str {
+    match style {
+        CursorStyle::Arrow => "default",
+        CursorStyle::IBeam => "text",
+        CursorStyle::Crosshair => "crosshair",
+        CursorStyle::ClosedHand => "grabbing",
+        CursorStyle::OpenHand => "grab",
+        CursorStyle::PointingHand => "pointer",
+        CursorStyle::ResizeLeft => "w-resize",
+        CursorStyle::ResizeRight => "e-resize",
+        CursorStyle::ResizeLeftRight => "ew-resize",
+        CursorStyle::ResizeUp => "n-resize",
+        CursorStyle::ResizeDown => "s-resize",
+        CursorStyle::ResizeUpDown => "ns-resize",
+        CursorStyle::ResizeUpLeftDownRight => "nwse-resize",
+        CursorStyle::ResizeUpRightDownLeft => "nesw-resize",
+        CursorStyle::ResizeColumn => "col-resize",
+        CursorStyle::ResizeRow => "row-resize",
+        CursorStyle::IBeamCursorForVerticalLayout => "vertical-text",
+        CursorStyle::OperationNotAllowed => "not-allowed",
+        CursorStyle::DragLink => "alias",
+        CursorStyle::DragCopy => "copy",
+        CursorStyle::ContextualMenu => "context-menu",
     }
 }
 
@@ -526,9 +604,10 @@ fn exit_of(message: &ServerMessage) -> Option<Exit> {
     match message {
         ServerMessage::Shutdown => Some(Exit::ServerShutdown),
         ServerMessage::Error(error) => Some(Exit::Rejected(error.clone())),
-        ServerMessage::FullFrame(..) | ServerMessage::Clipboard(_) | ServerMessage::Title(_) => {
-            None
-        }
+        ServerMessage::FullFrame(..)
+        | ServerMessage::Clipboard(_)
+        | ServerMessage::Title(_)
+        | ServerMessage::Pointer(_) => None,
     }
 }
 
@@ -538,8 +617,9 @@ pub fn attach(socket: &Path) -> Result<Exit> {
     let socket_writer = Arc::new(Mutex::new(stream.try_clone()?));
     let mut reader = BufReader::new(stream);
 
-    let _guard = TerminalGuard::enter()?;
+    let guard = TerminalGuard::enter()?;
     let mut renderer = Renderer::new(io::stdout(), cols, rows);
+    renderer.terminal.features = guard.0.features;
     let (render_sender, render_receiver) = mpsc::channel();
     thread::Builder::new()
         .name("Socket reader".to_owned())
@@ -1008,6 +1088,137 @@ mod tests {
     }
 
     #[test]
+    fn pointer_shapes_use_osc22_with_st_only_on_change() {
+        let mut renderer = Renderer::new(Vec::new(), 10, 2);
+        renderer.terminal.features.ghostty = true;
+        for style in [
+            CursorStyle::IBeam,
+            CursorStyle::IBeam,
+            CursorStyle::PointingHand,
+        ] {
+            renderer.apply(&ServerMessage::Pointer(style)).unwrap();
+        }
+        assert_eq!(
+            renderer.terminal.output,
+            b"\x1b]22;text\x1b\\\x1b]22;pointer\x1b\\"
+        );
+    }
+
+    #[test]
+    fn pointer_shapes_are_not_sent_to_other_terminals() {
+        let mut renderer = Renderer::new(Vec::new(), 10, 2);
+        renderer
+            .apply(&ServerMessage::Pointer(CursorStyle::PointingHand))
+            .unwrap();
+        assert!(renderer.terminal.output.is_empty());
+    }
+
+    #[test]
+    fn every_cursor_style_maps_to_a_ghostty_shape_name() {
+        const GHOSTTY_W3C_SHAPES: [&str; 34] = [
+            "default",
+            "context-menu",
+            "help",
+            "pointer",
+            "progress",
+            "wait",
+            "cell",
+            "crosshair",
+            "text",
+            "vertical-text",
+            "alias",
+            "copy",
+            "move",
+            "no-drop",
+            "not-allowed",
+            "grab",
+            "grabbing",
+            "all-scroll",
+            "col-resize",
+            "row-resize",
+            "n-resize",
+            "e-resize",
+            "s-resize",
+            "w-resize",
+            "ne-resize",
+            "nw-resize",
+            "se-resize",
+            "sw-resize",
+            "ew-resize",
+            "ns-resize",
+            "nesw-resize",
+            "nwse-resize",
+            "zoom-in",
+            "zoom-out",
+        ];
+        let styles = [
+            CursorStyle::Arrow,
+            CursorStyle::IBeam,
+            CursorStyle::Crosshair,
+            CursorStyle::ClosedHand,
+            CursorStyle::OpenHand,
+            CursorStyle::PointingHand,
+            CursorStyle::ResizeLeft,
+            CursorStyle::ResizeRight,
+            CursorStyle::ResizeLeftRight,
+            CursorStyle::ResizeUp,
+            CursorStyle::ResizeDown,
+            CursorStyle::ResizeUpDown,
+            CursorStyle::ResizeUpLeftDownRight,
+            CursorStyle::ResizeUpRightDownLeft,
+            CursorStyle::ResizeColumn,
+            CursorStyle::ResizeRow,
+            CursorStyle::IBeamCursorForVerticalLayout,
+            CursorStyle::OperationNotAllowed,
+            CursorStyle::DragLink,
+            CursorStyle::DragCopy,
+            CursorStyle::ContextualMenu,
+        ];
+        for style in styles {
+            assert!(
+                GHOSTTY_W3C_SHAPES.contains(&pointer_name(style)),
+                "{style:?} maps to {:?}",
+                pointer_name(style)
+            );
+        }
+    }
+
+    #[test]
+    fn up_left_down_right_resizes_use_the_nwse_shape() {
+        assert_eq!(
+            pointer_name(CursorStyle::ResizeUpLeftDownRight),
+            "nwse-resize"
+        );
+        assert_eq!(
+            pointer_name(CursorStyle::ResizeUpRightDownLeft),
+            "nesw-resize"
+        );
+    }
+
+    #[test]
+    fn ghostty_pointer_is_reset_on_exit() {
+        let contains_reset = |bytes: &[u8]| {
+            bytes
+                .windows(POINTER_RESET.len())
+                .any(|window| window == POINTER_RESET)
+        };
+        for ghostty in [true, false] {
+            let mut setup = TerminalSetup::default();
+            setup
+                .run(&mut FailingWriter::failing_on_flush(0), |_| {
+                    Ok(QueryReplies {
+                        features: TerminalFeatures { ghostty },
+                        ..QueryReplies::default()
+                    })
+                })
+                .unwrap();
+            let mut undo = Vec::new();
+            setup.undo(&mut undo);
+            assert_eq!(contains_reset(&undo), ghostty, "{undo:?}");
+        }
+    }
+
+    #[test]
     fn keyboard_flags_come_from_the_flags_report() {
         assert!(parse_replies(&[b"\x1b[?0u\x1b[?62;22c"]).keyboard_flags);
         assert!(parse_replies(&[b"\x1b[?69;2$y\x1b[?15u\x1b[?62c"]).keyboard_flags);
@@ -1021,11 +1232,46 @@ mod tests {
     }
 
     #[test]
+    fn ghostty_comes_from_the_version_report() {
+        assert!(
+            parse_replies(&[b"\x1bP>|ghostty 1.2.0\x1b\\\x1b[?62;22c"])
+                .features
+                .ghostty
+        );
+        assert!(
+            parse_replies(&[b"\x1bP>|libghostty\x1b\\\x1b[?62;22c"])
+                .features
+                .ghostty
+        );
+        assert!(
+            !parse_replies(&[b"\x1bP>|XTerm(390)\x1b\\\x1b[?64;1;28c"])
+                .features
+                .ghostty
+        );
+        assert!(
+            !parse_replies(&[b"\x1bP>|tmux 3.5a\x1b\\\x1b[?62;22c"])
+                .features
+                .ghostty
+        );
+        assert!(
+            !parse_replies(&[b"\x1bP1$r0m\x1b\\ghostty\x1b[?62;22c"])
+                .features
+                .ghostty
+        );
+        assert!(!parse_replies(&[b"\x1b[?62;22c"]).features.ghostty);
+    }
+
+    #[test]
     fn rendered_frames_match_an_emulated_terminal() {
-        for (seed, terminal_cols) in [(1, 40), (2, 40), (3, 33), (4, 27), (5, 44), (6, 40)] {
+        let cases = [(1, 40), (2, 40), (3, 33), (4, 27), (5, 44), (6, 40)];
+        for (ghostty, (seed, terminal_cols)) in [false, true]
+            .into_iter()
+            .flat_map(|ghostty| cases.map(|case| (ghostty, case)))
+        {
             let mut random = Random::new(seed);
             let mut grid = CellGrid::new(40, 12, Rgb::new(40, 44, 52));
             let mut renderer = Renderer::new(Vec::new(), terminal_cols, 12);
+            renderer.terminal.features.ghostty = ghostty;
             let mut emulator = Emulator::new(terminal_cols, 12);
             paint_run(&mut grid, &mut random);
             mutate(&mut grid, &mut random, 60);

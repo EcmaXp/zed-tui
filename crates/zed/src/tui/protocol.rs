@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 
 use anyhow::{Context as _, Result, bail};
-use gpui::Modifiers;
+use gpui::{CursorStyle, Modifiers};
 use gpui_tui::{
     Cell, CellAttrs, CellGrid, CursorPosition, CursorShape, Glyph, Rgb, UnderlineColor,
 };
@@ -104,6 +104,7 @@ pub enum ServerMessage {
     Title(String),
     Shutdown,
     Error(String),
+    Pointer(CursorStyle),
 }
 
 mod wire_cursor {
@@ -277,6 +278,7 @@ impl FrameDecoder {
             }
             ServerMessage::Clipboard(_)
             | ServerMessage::Title(_)
+            | ServerMessage::Pointer(_)
             | ServerMessage::Shutdown
             | ServerMessage::Error(_) => {}
         }
@@ -319,6 +321,27 @@ mod tests {
         let mut reader = buffer.as_slice();
         for message in &messages {
             let decoded: ClientMessage = read_message(&mut reader).unwrap();
+            assert_eq!(&decoded, message);
+        }
+    }
+
+    #[test]
+    fn pointer_messages_round_trip() {
+        let messages = [
+            CursorStyle::Arrow,
+            CursorStyle::IBeam,
+            CursorStyle::PointingHand,
+            CursorStyle::ResizeUpLeftDownRight,
+            CursorStyle::ContextualMenu,
+        ]
+        .map(ServerMessage::Pointer);
+        let mut buffer = Vec::new();
+        for message in &messages {
+            write_message(&mut buffer, message).unwrap();
+        }
+        let mut reader = buffer.as_slice();
+        for message in &messages {
+            let decoded: ServerMessage = read_message(&mut reader).unwrap();
             assert_eq!(&decoded, message);
         }
     }

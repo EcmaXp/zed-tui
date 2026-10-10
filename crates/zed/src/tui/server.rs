@@ -23,7 +23,7 @@ use futures::{
     StreamExt as _,
     channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded},
 };
-use gpui::App;
+use gpui::{App, CursorStyle};
 use gpui_tui::{CellGrid, TuiPlatform};
 use parking_lot::Mutex;
 use util::ResultExt as _;
@@ -108,11 +108,25 @@ struct HubState {
     clients: Vec<ClientHandle>,
     last_frame: Option<Arc<CellGrid>>,
     last_title: Option<String>,
+    pointer: CursorStyle,
+    pointer_owner: Option<u64>,
 }
 
 impl HubState {
     fn client(&self, id: u64) -> Option<&ClientHandle> {
         self.clients.iter().find(|client| client.id == id)
+    }
+
+    fn send_pointer_to_owner(&self) {
+        let Some(owner) = self.pointer_owner else {
+            return;
+        };
+        if let Some(client) = self.client(owner) {
+            client
+                .sender
+                .send(Outgoing::Message(ServerMessage::Pointer(self.pointer)))
+                .log_err();
+        }
     }
 }
 
@@ -154,8 +168,25 @@ impl ClientHub {
         }
     }
 
+    fn set_pointer(&self, style: CursorStyle) {
+        let mut state = self.state.lock();
+        state.pointer = style;
+        state.send_pointer_to_owner();
+    }
+
+    fn claim_pointer(&self, id: u64) {
+        let mut state = self.state.lock();
+        if state.pointer_owner.replace(id) != Some(id) {
+            state.send_pointer_to_owner();
+        }
+    }
+
     fn remove(&self, id: u64) {
-        self.state.lock().clients.retain(|client| client.id != id);
+        let mut state = self.state.lock();
+        state.clients.retain(|client| client.id != id);
+        if state.pointer_owner == Some(id) {
+            state.pointer_owner = None;
+        }
     }
 }
 
@@ -233,6 +264,10 @@ pub fn start_session(
     platform.on_clipboard_write({
         let hub = hub.clone();
         move |text| hub.broadcast_message(ServerMessage::Clipboard(text))
+    });
+    platform.on_cursor_style_change({
+        let hub = hub.clone();
+        move |style| hub.set_pointer(style)
     });
 
     let started = Started {
@@ -392,7 +427,7 @@ fn serve_client(
     thread::Builder::new()
         .name(format!("ClientReader-{id}"))
         .spawn(move || {
-            let detached = read_from_client(id, reader, &events);
+            let detached = read_from_client(id, reader, &hub, &events);
             hub.remove(id);
             events
                 .unbounded_send(ServerEvent::Disconnected { id })
@@ -411,11 +446,17 @@ fn is_closed_connection(error: &anyhow::Error) -> bool {
 fn read_from_client(
     id: u64,
     mut reader: BufReader<UnixStream>,
+    hub: &ClientHub,
     events: &UnboundedSender<ServerEvent>,
 ) -> bool {
     loop {
         let event = match read_message(&mut reader) {
-            Ok(ClientMessage::Input(event)) => ServerEvent::Input(event),
+            Ok(ClientMessage::Input(event)) => {
+                if matches!(event, TermEvent::Mouse { .. }) {
+                    hub.claim_pointer(id);
+                }
+                ServerEvent::Input(event)
+            }
             Ok(ClientMessage::Resize { cols, rows }) => ServerEvent::Resized { id, cols, rows },
             Ok(ClientMessage::Detach) => return true,
             Ok(ClientMessage::Hello { .. }) => continue,
@@ -484,7 +525,7 @@ pub fn spawn_daemon(session_paths: &SessionPaths, paths: &[PathBuf]) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::protocol::{FrameDecoder, KeyCode};
+    use crate::tui::protocol::{FrameDecoder, KeyCode, MouseAction};
     use gpui::Modifiers;
     use gpui_tui::Rgb;
 
@@ -658,5 +699,85 @@ mod tests {
         hub.send_last_frame_to(id, (3, 1));
         let message: ServerMessage = read_message(&mut client_reader).unwrap();
         assert_eq!(frame_size(&message), Some((3, 1)));
+    }
+
+    fn move_mouse(writer: &mut UnixStream, events: &mut UnboundedReceiver<ServerEvent>) {
+        let mouse = TermEvent::Mouse {
+            action: MouseAction::Moved,
+            col: 1,
+            row: 1,
+            modifiers: Modifiers::default(),
+        };
+        write_message(writer, &ClientMessage::Input(mouse)).unwrap();
+        assert!(matches!(
+            next_event(events),
+            ServerEvent::Input(TermEvent::Mouse { .. })
+        ));
+    }
+
+    #[test]
+    fn pointer_shapes_reach_only_the_client_that_moved_the_mouse() {
+        let hub = Arc::new(ClientHub::default());
+        let (first, first_side, mut first_events) = attach(&hub);
+        let (second, second_side, mut second_events) = attach(&hub);
+        let mut first_writer = first_side.try_clone().unwrap();
+        let mut second_writer = second_side.try_clone().unwrap();
+        let mut first_reader = BufReader::new(first_side);
+        let mut second_reader = BufReader::new(second_side);
+        let next =
+            |reader: &mut BufReader<UnixStream>| -> ServerMessage { read_message(reader).unwrap() };
+        let marker = |text: &str| {
+            hub.broadcast_message(ServerMessage::Title(text.into()));
+            ServerMessage::Title(text.into())
+        };
+
+        hub.set_pointer(CursorStyle::IBeam);
+        let unowned = marker("unowned");
+        assert_eq!(next(&mut first_reader), unowned);
+        assert_eq!(next(&mut second_reader), unowned);
+
+        move_mouse(&mut first_writer, &mut first_events);
+        assert_eq!(hub.state.lock().pointer_owner, Some(first));
+        assert_eq!(
+            next(&mut first_reader),
+            ServerMessage::Pointer(CursorStyle::IBeam)
+        );
+        hub.set_pointer(CursorStyle::PointingHand);
+        assert_eq!(
+            next(&mut first_reader),
+            ServerMessage::Pointer(CursorStyle::PointingHand)
+        );
+        move_mouse(&mut first_writer, &mut first_events);
+        let owned_by_first = marker("owned by first");
+        assert_eq!(next(&mut first_reader), owned_by_first);
+        assert_eq!(next(&mut second_reader), owned_by_first);
+
+        move_mouse(&mut second_writer, &mut second_events);
+        assert_eq!(hub.state.lock().pointer_owner, Some(second));
+        assert_eq!(
+            next(&mut second_reader),
+            ServerMessage::Pointer(CursorStyle::PointingHand)
+        );
+        hub.set_pointer(CursorStyle::Arrow);
+        assert_eq!(
+            next(&mut second_reader),
+            ServerMessage::Pointer(CursorStyle::Arrow)
+        );
+
+        write_message(&mut second_writer, &ClientMessage::Detach).unwrap();
+        assert!(matches!(
+            next_event(&mut second_events),
+            ServerEvent::Disconnected { .. }
+        ));
+        assert_eq!(hub.state.lock().pointer_owner, None);
+        hub.set_pointer(CursorStyle::IBeam);
+        let detached = marker("detached");
+        assert_eq!(next(&mut first_reader), detached);
+
+        move_mouse(&mut first_writer, &mut first_events);
+        assert_eq!(
+            next(&mut first_reader),
+            ServerMessage::Pointer(CursorStyle::IBeam)
+        );
     }
 }
