@@ -1,7 +1,8 @@
 use crate::{
     self as gpui, App, BackgroundExecutor, BoxShadow, Context, DispatchPhase, FocusHandle,
-    ForegroundExecutor, InteractiveElement as _, IntoElement, IsZero as _, ParentElement as _,
-    Render, Styled as _, TestAppContext, TestDispatcher, Window, black, div, point, px, red,
+    ForegroundExecutor, InteractiveElement as _, IntoElement, IsZero as _, KeyDownEvent, Keystroke,
+    MouseMoveEvent, ParentElement as _, PlatformInput, Render, Styled as _, TestAppContext,
+    TestDispatcher, Window, black, div, point, px, red,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -45,6 +46,88 @@ fn framed_surfaces_paint_all_four_borders_outside_a_cell_grid(cx: &mut crate::Te
     assert!(
         !border_widths.any(|width| width.is_zero()),
         "{border_widths:?}"
+    );
+}
+
+struct KeyDownRenderCounter {
+    focus_handle: FocusHandle,
+    renders: Rc<Cell<usize>>,
+    renders_at_key_down: Rc<Cell<Option<usize>>>,
+}
+
+impl Render for KeyDownRenderCounter {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        let renders = self.renders.clone();
+        let renders_at_key_down = self.renders_at_key_down.clone();
+        div()
+            .size_full()
+            .track_focus(&self.focus_handle)
+            .on_key_down(move |_, _, _| renders_at_key_down.set(Some(renders.get())))
+    }
+}
+
+#[gpui::test]
+fn test_switching_to_keyboard_input_redraws_after_dispatching_the_key(cx: &mut TestAppContext) {
+    let renders = Rc::new(Cell::new(0));
+    let renders_at_key_down = Rc::new(Cell::new(None));
+    let window = cx.add_window({
+        let renders = renders.clone();
+        let renders_at_key_down = renders_at_key_down.clone();
+        move |_, cx| KeyDownRenderCounter {
+            focus_handle: cx.focus_handle(),
+            renders,
+            renders_at_key_down,
+        }
+    });
+    window
+        .update(cx, |this, window, cx| {
+            window.activate_window();
+            let focus_handle = this.focus_handle.clone();
+            window.focus(&focus_handle, cx);
+        })
+        .unwrap();
+    cx.executor().run_until_parked();
+
+    window
+        .update(cx, |_, window, cx| {
+            window.dispatch_event(
+                PlatformInput::MouseMove(MouseMoveEvent {
+                    position: point(px(5.), px(5.)),
+                    pressed_button: None,
+                    modifiers: Default::default(),
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+    cx.executor().run_until_parked();
+    let renders_before_key = renders.get();
+
+    window
+        .update(cx, |_, window, cx| {
+            window.dispatch_event(
+                PlatformInput::KeyDown(KeyDownEvent {
+                    keystroke: Keystroke::parse("a").expect("valid keystroke"),
+                    is_held: false,
+                    prefer_character_input: false,
+                }),
+                cx,
+            );
+            assert!(window.last_input_was_keyboard());
+        })
+        .unwrap();
+    cx.executor().run_until_parked();
+
+    assert_eq!(
+        renders_at_key_down.get(),
+        Some(renders_before_key),
+        "the first key after mouse input should be dispatched without drawing the window first"
+    );
+    assert_eq!(
+        renders.get(),
+        renders_before_key + 1,
+        "the window should still redraw once after the key for the new input modality"
     );
 }
 

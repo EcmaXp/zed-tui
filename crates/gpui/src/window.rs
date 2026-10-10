@@ -5429,7 +5429,10 @@ impl Window {
             PlatformInput::Touch(_) => InputModality::Touch,
             _ => self.last_input_modality,
         };
-        if self.last_input_modality != old_modality {
+        let modality_changed = self.last_input_modality != old_modality;
+        let refresh_after_key_dispatch =
+            modality_changed && self.last_input_modality == InputModality::Keyboard;
+        if modality_changed && !refresh_after_key_dispatch {
             self.refresh();
         }
 
@@ -5555,6 +5558,9 @@ impl Window {
             self.dispatch_key_event(any_key_event, cx);
         } else if let Some(touch_event) = event.touch_event() {
             self.dispatch_touch_event(touch_event, cx);
+        }
+        if refresh_after_key_dispatch {
+            self.refresh();
         }
         if let PlatformInput::LongPress(long_press) = &event {
             match long_press.phase {
