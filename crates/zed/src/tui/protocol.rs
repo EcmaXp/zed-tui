@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::tui::frame_diff::{GridScroll, changed_ranges, find_moves};
 
-pub const PROTOCOL_VERSION: u32 = 15;
+pub const PROTOCOL_VERSION: u32 = 1;
 pub const WAIT_ONLY_SIZE: (u16, u16) = (0, 0);
 const MAX_MESSAGE_LEN: usize = 64 * 1024 * 1024;
 const PATCH_MERGE_GAP: usize = 8;
@@ -773,7 +773,7 @@ mod tests {
             "a161656178",
             "a16177a26173016165816178",
             "a161706c506f696e74696e6748616e64",
-            "a16548656c6c6fa36776657273696f6e0f64636f6c73185064726f77731818",
+            "a16548656c6c6fa36776657273696f6e0164636f6c73185064726f77731818",
             "a16169a1616ba26163a161636171616d01",
         ];
         assert_eq!(actual, expected);
