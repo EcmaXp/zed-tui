@@ -1580,6 +1580,8 @@ impl Window {
         let capslock = platform_window.capslock();
         let content_size = platform_window.content_size();
         let scale_factor = platform_window.scale_factor();
+        let mut layout_engine = TaffyLayoutEngine::new();
+        layout_engine.set_cell_size(cx.text_system().cell_size(), scale_factor);
         let appearance = platform_window.appearance();
         let text_system = Arc::new(WindowTextSystem::new(cx.text_system().clone()));
         let invalidator = WindowInvalidator::new(handle.window_id());
@@ -2032,7 +2034,7 @@ impl Window {
             rem_size: px(16.),
             rem_size_override_stack: SmallVec::new(),
             viewport_size: content_size,
-            layout_engine: Some(TaffyLayoutEngine::new()),
+            layout_engine: Some(layout_engine),
             root: None,
             element_id_stack: SmallVec::default(),
             text_style_stack: Vec::new(),

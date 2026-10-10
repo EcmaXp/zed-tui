@@ -13,6 +13,28 @@ use gpui_tui::{CellAttrs, CellGrid, CursorPosition, CursorShape, Rgb, TuiPlatfor
 
 struct Hello;
 
+struct PaddedList;
+
+impl Render for PaddedList {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(0x202020))
+            .text_color(rgb(0xffffff))
+            .text_size(px(10.))
+            .line_height(gpui::relative(1.618))
+            .children((0..5).map(|index| {
+                div()
+                    .border_1()
+                    .border_color(rgb(0x404040))
+                    .py(px(2.))
+                    .child(format!("item {index}"))
+            }))
+    }
+}
+
 fn view_frame<V: Render>(cols: u16, rows: u16, view: impl FnOnce() -> V + 'static) -> CellGrid {
     first_frame(TuiPlatform::new(cols, rows), move |cx: &mut App| {
         cx.open_window(WindowOptions::default(), move |_, cx| {
@@ -63,6 +85,49 @@ fn renders_gpui_elements_into_cells() {
     assert_eq!(first.fg, Rgb::new(255, 255, 255));
     assert_eq!(first.bg, Rgb::new(0x20, 0x20, 0x20));
     assert_eq!(grid.cell(0, 1).expect("cell").bg, Rgb::new(255, 0, 0));
+}
+
+#[test]
+fn list_items_take_one_row_each_and_side_borders_take_a_column() {
+    let grid = view_frame(20, 8, || PaddedList);
+    for index in 0..5 {
+        assert_eq!(
+            grid.row_text(index),
+            format!("│item {index}            │"),
+            "{}",
+            grid.text()
+        );
+    }
+}
+
+struct CollapsedFrame;
+
+impl Render for CollapsedFrame {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .bg(rgb(0x202020))
+            .text_color(rgb(0xffffff))
+            .text_size(px(16.))
+            .line_height(px(16.))
+            .child(
+                div()
+                    .w(px(96.))
+                    .border_1()
+                    .border_color(rgb(0x808080))
+                    .child("Run Debug")
+                    .child("Spawn"),
+            )
+    }
+}
+
+#[test]
+fn collapsed_frames_do_not_draw_rules_between_text_on_their_edge_rows() {
+    let grid = view_frame(20, 4, || CollapsedFrame);
+    let rows: Vec<String> = (0..2)
+        .map(|row| grid.row_text(row).chars().take(12).collect())
+        .collect();
+    assert_eq!(rows, ["┌Run Debug ┐", "└Spawn     ┘"], "{}", grid.text());
 }
 
 #[derive(Debug, Default, PartialEq)]
