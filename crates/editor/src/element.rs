@@ -2777,6 +2777,11 @@ impl EditorElement {
         }
 
         let editor_font_size = self.style.text.font_size.to_pixels(window.rem_size()) * 1.2;
+        let button_size = if window.text_system().cell_size().is_some() {
+            ButtonSize::Compact
+        } else {
+            ButtonSize::Default
+        };
 
         let max_line_number_length = self
             .editor
@@ -2826,6 +2831,7 @@ impl EditorElement {
                 let toggle = IconButton::new(("expand", ix), icon_name)
                     .icon_color(Color::Custom(cx.theme().colors().editor_line_number))
                     .icon_size(IconSize::Custom(rems(editor_font_size / window.rem_size())))
+                    .size(button_size)
                     .width(width)
                     .on_click(move |_, window, cx| {
                         editor.update(cx, |editor, cx| {
@@ -4070,7 +4076,7 @@ impl EditorElement {
         }
 
         // Add spacing around `target_bounds` and `max_target_bounds`.
-        let mut extend_amount = Edges::all(MENU_GAP);
+        let mut extend_amount = Edges::all(popover_gap(line_height, window));
         if y_flipped {
             extend_amount.bottom = line_height;
         } else {
@@ -4288,6 +4294,7 @@ impl EditorElement {
                 },
             };
 
+            let gap = popover_gap(line_height, window);
             let mut laid_out_popovers = popovers
                 .into_iter()
                 .map(|(popover_type, element, size)| {
@@ -4297,9 +4304,9 @@ impl EditorElement {
                     let position = current_position;
                     window.defer_draw(element, current_position, 1, None);
                     if !y_flipped {
-                        current_position.y += size.height + MENU_GAP;
+                        current_position.y += size.height + gap;
                     } else {
-                        current_position.y -= MENU_GAP;
+                        current_position.y -= gap;
                     }
                     (popover_type, Bounds::new(position, size))
                 })
@@ -7065,6 +7072,14 @@ impl Gutter<'_> {
     }
 }
 
+fn popover_gap(line_height: Pixels, window: &Window) -> Pixels {
+    if window.text_system().cell_size().is_some() {
+        line_height
+    } else {
+        MENU_GAP
+    }
+}
+
 pub fn render_breadcrumb_text(
     mut segments: Vec<HighlightedText>,
     breadcrumb_font: Option<Font>,
@@ -7124,9 +7139,14 @@ pub fn render_breadcrumb_text(
     let breadcrumbs_stack = h_flex()
         .gap_1()
         .when(multibuffer_header, |this| {
+            let border_color = cx.theme().colors().border;
             this.pl_2()
                 .border_l_1()
-                .border_color(cx.theme().colors().border.opacity(0.6))
+                .border_color(if window.text_system().cell_size().is_some() {
+                    border_color
+                } else {
+                    border_color.opacity(0.6)
+                })
         })
         .children(breadcrumbs);
 
@@ -11334,6 +11354,7 @@ fn compute_auto_height_layout(
 
 #[cfg(test)]
 mod tests {
+    mod fork_tests;
     use super::*;
     use crate::{
         Editor, FoldPlaceholder, HighlightKey, Inlay, MultiBuffer, NavigationOverlayKey,

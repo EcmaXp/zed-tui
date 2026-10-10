@@ -1371,6 +1371,7 @@ impl DiagnosticPopover {
         let keyboard_grace = Rc::clone(&self.keyboard_grace);
         let this = cx.entity().downgrade();
         let bounds_cell = self.last_bounds.clone();
+        let renders_to_cell_grid = window.text_system().cell_size().is_some();
         div()
             .id("diagnostic")
             .occlude()
@@ -1419,7 +1420,7 @@ impl DiagnosticPopover {
                     .pl_2()
                     .pr_8()
                     .bg(self.background_color)
-                    .border_1()
+                    .when_else(renders_to_cell_grid, Styled::border_l_1, Styled::border_1)
                     .border_color(self.border_color)
                     .rounded_lg()
                     .child(
