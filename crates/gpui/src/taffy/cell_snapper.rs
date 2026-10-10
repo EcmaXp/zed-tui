@@ -16,6 +16,7 @@ pub(super) struct CellSnapper {
 #[derive(Clone, Copy)]
 struct CellNode {
     is_empty: bool,
+    is_in_flow: bool,
     left: Edge,
     right: Edge,
     rounds_up_left_margin: bool,
@@ -72,6 +73,7 @@ struct Snapped {
     node: CellNode,
     nested_rule_spacing_owners: Vec<(Side, LayoutId)>,
     dropped_spacings: Vec<(LayoutId, Side, Spacing)>,
+    gap_closers: Vec<(LayoutId, Side)>,
 }
 
 impl CellSnapper {
@@ -103,6 +105,9 @@ impl CellSnapper {
         let snapped = self.snap(&mut taffy_style, style, children);
         for (node, side, spacing) in snapped.dropped_spacings {
             drop_spacing(tree, node, side, spacing);
+        }
+        for (node, side) in snapped.gap_closers {
+            close_gap(tree, node, side, taffy_style.gap.width);
         }
         if let Some(min_width) = width_around_fixed_children(tree, &taffy_style, children) {
             let min_width = if min_width > self.viewport_width {
@@ -184,6 +189,7 @@ impl CellSnapper {
         }
         let mut dropped_spacings = self.redundant_rule_spacings(taffy_style, &content);
         dropped_spacings.extend(self.redundant_margins(taffy_style, &content));
+        let gap_closers = self.gaps_beside_rules(taffy_style, unsnapped, &content);
         let node = self.cell_node(taffy_style, unsnapped, &content, false);
         let is_in_flow = taffy_style.position != taffy::style::Position::Absolute;
         let is_rule_margin = |margin: taffy::style::LengthPercentageAuto| {
@@ -231,6 +237,7 @@ impl CellSnapper {
             node,
             nested_rule_spacing_owners,
             dropped_spacings,
+            gap_closers,
         }
     }
 
@@ -425,6 +432,40 @@ impl CellSnapper {
         redundant
     }
 
+    fn gaps_beside_rules(
+        &self,
+        style: &taffy::style::Style,
+        unsnapped: HorizontalSpacing,
+        content: &[LayoutId],
+    ) -> Vec<(LayoutId, Side)> {
+        let mut closers = Vec::new();
+        let rounds_up_gap = positive_length(unsnapped.gap_width)
+            .is_some_and(|gap| gap < self.cell_size.width)
+            && positive_length(style.gap.width).is_some();
+        let stays_on_one_line = style.flex_wrap == taffy::style::FlexWrap::NoWrap;
+        let Some(flow) = Flow::of(style, content)
+            .filter(|flow| flow.is_row && rounds_up_gap && stays_on_one_line)
+        else {
+            return closers;
+        };
+        for (before, after) in flow.pairs() {
+            let (Some(before_node), Some(after_node)) =
+                (self.cell_nodes.get(&before), self.cell_nodes.get(&after))
+            else {
+                continue;
+            };
+            if !before_node.is_in_flow || !after_node.is_in_flow {
+                continue;
+            }
+            match (before_node.right, after_node.left) {
+                (Edge::Blank, Edge::Rule) => closers.push((after, Side::Left)),
+                (Edge::Rule, Edge::Blank) => closers.push((before, Side::Right)),
+                _ => {}
+            }
+        }
+        closers
+    }
+
     fn cell_node(
         &self,
         style: &taffy::style::Style,
@@ -460,6 +501,7 @@ impl CellSnapper {
         };
         CellNode {
             is_empty,
+            is_in_flow,
             left,
             right: edge(style.padding.right, content.last(), Side::Right),
             rounds_up_left_margin: rounds_up(unsnapped.margin_left),
@@ -573,6 +615,32 @@ fn drop_spacing(tree: &mut TaffyTree<NodeContext>, node: LayoutId, side: Side, s
         (Spacing::Padding, Side::Right) => style.padding.right = zero_padding,
         (Spacing::Margin, Side::Left) => style.margin.left = zero_margin,
         (Spacing::Margin, Side::Right) => style.margin.right = zero_margin,
+    }
+    tree.set_style(node.into(), style).expect(EXPECT_MESSAGE);
+}
+
+fn close_gap(
+    tree: &mut TaffyTree<NodeContext>,
+    node: LayoutId,
+    side: Side,
+    gap: taffy::style::LengthPercentage,
+) {
+    let Some(gap) = positive_length(gap) else {
+        return;
+    };
+    let style = tree.style(node.into()).expect(EXPECT_MESSAGE);
+    let margin = match side {
+        Side::Left => style.margin.left,
+        Side::Right => style.margin.right,
+    };
+    if length_value(margin) != Some(0.) {
+        return;
+    }
+    let mut style = style.clone();
+    let pulled_into_gap = taffy::style::LengthPercentageAuto::length(-gap);
+    match side {
+        Side::Left => style.margin.left = pulled_into_gap,
+        Side::Right => style.margin.right = pulled_into_gap,
     }
     tree.set_style(node.into(), style).expect(EXPECT_MESSAGE);
 }
@@ -1039,6 +1107,7 @@ mod tests {
             child,
             CellNode {
                 is_empty: false,
+                is_in_flow: true,
                 left: Edge::Content,
                 right: Edge::Blank,
                 rounds_up_left_margin: false,
@@ -1376,6 +1445,7 @@ mod tests {
             child,
             CellNode {
                 is_empty: false,
+                is_in_flow: true,
                 left: Edge::Blank,
                 right: Edge::Blank,
                 rounds_up_left_margin: false,

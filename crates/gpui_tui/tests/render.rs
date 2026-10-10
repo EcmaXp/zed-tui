@@ -729,9 +729,94 @@ fn rule_padding_drops_beside_an_already_blank_neighbor_in_block_and_column_flows
     assert_eq!(row, " a │ b");
 }
 
+fn input_box(label: &'static str) -> gpui::Div {
+    div()
+        .flex()
+        .border_1()
+        .border_color(rgb(0x808080))
+        .pl(px(5.))
+        .pr(px(2.5))
+        .child(label)
+}
+
+#[test]
+fn rounded_up_gaps_close_beside_a_rule_whose_neighbor_is_already_blank() {
+    let row = spaced_row_text(|| {
+        div()
+            .flex()
+            .gap(px(5.))
+            .child(square_button("x"))
+            .child(input_box("fn"))
+            .child(square_button("y"))
+            .into_any_element()
+    });
+    assert_eq!(row, "x │ fn │ y");
+
+    let row = spaced_row_text(|| {
+        div()
+            .flex()
+            .gap(px(5.))
+            .child(input_box("fn"))
+            .child(padded("y"))
+            .into_any_element()
+    });
+    assert_eq!(row, "│ fn │ y");
+}
+
+#[test]
+fn gaps_stay_away_from_rules_and_when_a_cell_wide() {
+    let row = spaced_row_text(|| {
+        div()
+            .flex()
+            .gap(px(5.))
+            .child(square_button("x"))
+            .child("y")
+            .into_any_element()
+    });
+    assert_eq!(row, "x  y");
+
+    let row = spaced_row_text(|| {
+        div()
+            .flex()
+            .gap(px(8.))
+            .child(square_button("x"))
+            .child(input_box("fn"))
+            .into_any_element()
+    });
+    assert_eq!(row, "x  │ fn │");
+}
+
 fn spaced_rows(row: fn() -> gpui::AnyElement) -> Vec<String> {
     let grid = view_frame(30, 3, move || SpacedRow(row));
     trimmed_rows(&grid, 0..2)
+}
+
+#[test]
+fn gaps_beside_rules_stay_open_in_rows_that_wrap() {
+    let rows = spaced_rows(|| {
+        div()
+            .flex()
+            .flex_wrap()
+            .w(px(56.))
+            .gap(px(5.))
+            .child(square_button("x"))
+            .child(input_box("fn"))
+            .into_any_element()
+    });
+    assert_eq!(rows, ["x", "│ fn │"]);
+}
+
+#[test]
+fn gaps_beside_rules_ignore_absolutely_positioned_neighbors() {
+    let row = spaced_row_text(|| {
+        div()
+            .flex()
+            .gap(px(5.))
+            .child(div().absolute().flex().w(px(16.)))
+            .child(input_box("fn"))
+            .into_any_element()
+    });
+    assert_eq!(row, "│ fn │");
 }
 
 #[derive(Debug, Default, PartialEq)]
