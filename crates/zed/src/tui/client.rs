@@ -60,6 +60,7 @@ pub enum Exit {
 #[derive(Clone, Copy, Default)]
 struct TerminalFeatures {
     left_right_margins: bool,
+    rectangle_copy: bool,
     ghostty: bool,
     margin_mode: bool,
 }
@@ -202,7 +203,10 @@ impl vte::Perform for QueryReplies {
         }
         let mut values = params.iter().map(|param| param.first().copied());
         match (intermediates, action) {
-            (b"?", 'c') => self.device_attributes = true,
+            (b"?", 'c') => {
+                self.device_attributes = true;
+                self.features.rectangle_copy |= values.skip(1).any(|value| value == Some(28));
+            }
             (b"?", 'u') => self.keyboard_flags = true,
             (b"?$", 'y') => {
                 self.features.left_right_margins |=
@@ -845,6 +849,29 @@ impl<W: Write> Terminal<W> {
         Ok(())
     }
 
+    fn move_cells(&mut self, scroll: &GridScroll) -> io::Result<()> {
+        if !self.features.rectangle_copy {
+            return self.scroll(scroll);
+        }
+        let columns = scroll.columns.clone().unwrap_or(0..self.cols as usize);
+        let distance = scroll.shift.unsigned_abs();
+        let (source_top, source_bottom, destination_top) = if scroll.shift > 0 {
+            (scroll.top + distance, scroll.bottom, scroll.top)
+        } else {
+            (scroll.top, scroll.bottom - distance, scroll.top + distance)
+        };
+        write!(
+            self.body,
+            "\x1b[{};{};{};{};1;{};{};1$v",
+            source_top + 1,
+            columns.start + 1,
+            source_bottom,
+            columns.end,
+            destination_top + 1,
+            columns.start + 1,
+        )
+    }
+
     fn scroll(&mut self, scroll: &GridScroll) -> io::Result<()> {
         self.pen
             .write_style(&mut self.body, Style::blank(PenColor::Default))?;
@@ -1424,8 +1451,13 @@ impl<W: Write> Renderer<W> {
         let shows_whole_grid =
             visible_cols == grid.cols as usize && visible_rows == grid.rows as usize;
         let trusts_server_moves = was_in_sync && shows_whole_grid && frames_since_render == 1;
-        let column_windows = terminal.features.left_right_margins;
+        let rectangle_copy = terminal.features.rectangle_copy;
+        let column_windows = rectangle_copy || terminal.features.left_right_margins;
         let move_screen = |scroll: &GridScroll, screen: &mut CellGrid| {
+            if rectangle_copy {
+                scroll.copy(screen);
+                return;
+            }
             scroll.apply(screen, unknown_cell());
             let columns = scroll.columns.clone().unwrap_or(0..screen.cols as usize);
             for row in scroll.exposed_rows() {
@@ -1467,7 +1499,7 @@ impl<W: Write> Renderer<W> {
             moves
         };
         for scroll in &moves {
-            terminal.scroll(scroll)?;
+            terminal.move_cells(scroll)?;
         }
         for row in 0..visible_rows as u16 {
             let cells = grid.row(row);
@@ -2012,7 +2044,7 @@ fn term_mouse(mouse: &event::MouseEvent) -> TermEvent {
 mod tests {
     use super::*;
     use crate::tui::frame_diff::find_scroll;
-    use crate::tui::test_support::{Random, source_lines, text_row};
+    use crate::tui::test_support::{Random, source_lines, split_panes, text_row};
     use alacritty_terminal::{
         Term,
         event::VoidListener,
@@ -2050,8 +2082,53 @@ mod tests {
         fn feed(&mut self, renderer: &mut Renderer<Vec<u8>>) -> usize {
             renderer.render().unwrap();
             let bytes = std::mem::take(&mut renderer.terminal.output);
-            self.processor.advance(&mut self.term, &bytes);
+            let mut rest = bytes.as_slice();
+            while let Some(end) = rest.windows(2).position(|pair| pair == b"$v") {
+                let start = rest[..end]
+                    .windows(2)
+                    .rposition(|pair| pair == b"\x1b[")
+                    .unwrap();
+                self.processor.advance(&mut self.term, &rest[..start]);
+                let params: Vec<usize> = std::str::from_utf8(&rest[start + 2..end])
+                    .unwrap()
+                    .split(';')
+                    .map(|param| param.parse().unwrap())
+                    .collect();
+                self.copy_rectangle(&params);
+                rest = &rest[end + 2..];
+            }
+            self.processor.advance(&mut self.term, rest);
             bytes.len()
+        }
+
+        fn copy_rectangle(&mut self, params: &[usize]) {
+            let [
+                top,
+                left,
+                bottom,
+                right,
+                1,
+                destination_top,
+                destination_left,
+                1,
+            ] = params
+            else {
+                panic!("unexpected rectangle copy {params:?}");
+            };
+            let grid = self.term.grid_mut();
+            let copied: Vec<Vec<_>> = (*top..=*bottom)
+                .map(|row| {
+                    (*left..=*right)
+                        .map(|col| grid[Line(row as i32 - 1)][Column(col - 1)].clone())
+                        .collect()
+                })
+                .collect();
+            for (row_offset, cells) in copied.into_iter().enumerate() {
+                for (col_offset, cell) in cells.into_iter().enumerate() {
+                    grid[Line((destination_top + row_offset) as i32 - 1)]
+                        [Column(destination_left + col_offset - 1)] = cell;
+                }
+            }
         }
 
         fn assert_shows(&self, grid: &CellGrid, cols: u16) {
@@ -2889,6 +2966,55 @@ mod tests {
     }
 
     #[test]
+    fn rectangle_copies_replace_scroll_regions_when_supported() {
+        let mut renderer = Renderer::new(Vec::new(), 60, 14);
+        renderer.terminal.features.rectangle_copy = true;
+        let mut emulator = Emulator::new(60, 14);
+        renderer.grid = Some(editor_frame(0));
+        emulator.feed(&mut renderer);
+
+        let scroll = find_scroll(&editor_frame(0), &editor_frame(3), 14, 60, true).unwrap();
+        let columns = scroll.columns.unwrap();
+        renderer.grid = Some(editor_frame(3));
+        renderer.render().unwrap();
+        let output = output_text(&renderer);
+        let expected = format!("\x1b[5;1;13;{};1;2;1;1$v", columns.end);
+        assert!(output.contains(&expected), "{output:?}");
+        assert!(!output.contains("\x1b[2;13r"), "{output:?}");
+        emulator.feed(&mut renderer);
+        emulator.assert_shows(&editor_frame(3), 60);
+    }
+
+    #[test]
+    fn split_panes_scroll_correctly_with_and_without_rectangle_copies() {
+        let lines = source_lines(400, 5);
+        let mut bytes_by_capability = Vec::new();
+        for rectangle_copy in [false, true] {
+            let mut random = Random::new(3);
+            let mut renderer = Renderer::new(Vec::new(), 60, 14);
+            renderer.terminal.features.rectangle_copy = rectangle_copy;
+            let mut emulator = Emulator::new(60, 14);
+            let (mut left, mut right) = (0, 0);
+            let mut bytes = 0;
+            for _ in 0..150 {
+                left = (left + random.next(9)).saturating_sub(4).min(250);
+                if random.next(2) == 0 {
+                    right = (right + random.next(9)).saturating_sub(4).min(250);
+                }
+                let grid = split_panes(&lines, left, right);
+                renderer.grid = Some(grid.clone());
+                bytes += emulator.feed(&mut renderer);
+                emulator.assert_shows(&grid, 60);
+            }
+            bytes_by_capability.push(bytes);
+        }
+        let [plain, rectangles] = bytes_by_capability[..] else {
+            unreachable!()
+        };
+        assert!(rectangles < plain, "{bytes_by_capability:?}");
+    }
+
+    #[test]
     fn scrolls_from_the_server_are_drawn_without_a_second_search() {
         let mut encoder = crate::tui::protocol::FrameEncoder::default();
         let mut renderer = Renderer::new(Vec::new(), 60, 14);
@@ -3104,6 +3230,9 @@ mod tests {
     #[test]
     fn margin_support_comes_from_the_mode_report() {
         assert!(parse_replies(&[b"\x1b[?62;22c"]).device_attributes);
+        assert!(parse_replies(&[b"\x1b[?64;1;28c"]).features.rectangle_copy);
+        assert!(!parse_replies(&[b"\x1b[?28;1c"]).features.rectangle_copy);
+        assert!(!parse_replies(&[b"\x1b[?62;22c"]).features.rectangle_copy);
         assert!(!parse_replies(&[b"\x1b[?69;2$y"]).device_attributes);
         assert!(
             parse_replies(&[b"\x1b[?69;2$y\x1b[?62;22c"])
