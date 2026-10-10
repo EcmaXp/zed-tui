@@ -7,12 +7,17 @@ use std::{
         unix::net::UnixStream,
     },
     path::Path,
-    sync::{Arc, OnceLock, mpsc},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU8, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result};
+use collections::HashMap;
 use crossterm::{cursor, event, style, terminal};
 use gpui::{CursorStyle, Modifiers};
 use gpui_tui::{Cell, CellAttrs, CellGrid, CursorShape, Glyph, Rgb};
@@ -38,8 +43,13 @@ const CURSOR_SHAPE_RESET: &[u8] = b"\x1b[0 q";
 const KEYBOARD_FLAGS_QUERY: &str = "\x1b[?u";
 const VERSION_QUERY: &str = "\x1b[>0q";
 const DEVICE_ATTRIBUTES_QUERY: &str = "\x1b[c";
+const FIRST_PALETTE_SLOT: u8 = 16;
+const PALETTE_SLOTS: u8 = u8::MAX - FIRST_PALETTE_SLOT + 1;
+const MAX_OSC_PARAMS: usize = 16;
 const MAX_VERSION_REPLY: usize = 64;
 const GHOSTTY_VERSION_PREFIXES: [&[u8]; 2] = [b"ghostty", b"libghostty"];
+const OSC_PALETTE_PAIRS: usize = (MAX_OSC_PARAMS - 1) / 2;
+const OSC_RESET_SLOTS: usize = MAX_OSC_PARAMS - 1;
 const SYNCHRONIZED_FRAME_BYTES: usize = 512;
 const QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 const HANGUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -70,6 +80,8 @@ struct TerminalSetup {
     entered: bool,
     keyboard_enhanced: bool,
     features: TerminalFeatures,
+    original_palette: HashMap<u8, String>,
+    palette_slots_used: Arc<AtomicU8>,
 }
 
 impl TerminalSetup {
@@ -89,6 +101,7 @@ impl TerminalSetup {
         )?;
         let replies = query(output)?;
         self.features = replies.features;
+        self.original_palette = replies.palette;
         if replies.features.ghostty && replies.features.left_right_margins {
             self.features.margin_mode = true;
             output.write_all(MARGIN_MODE_ON)?;
@@ -107,6 +120,8 @@ impl TerminalSetup {
     }
 
     fn undo(&self, output: &mut impl Write) {
+        let used = self.palette_slots_used.load(Ordering::Relaxed);
+        write!(output, "{}", palette_restore(used, &self.original_palette)).ok();
         if self.keyboard_enhanced {
             crossterm::execute!(output, event::PopKeyboardEnhancementFlags).ok();
         }
@@ -154,6 +169,9 @@ impl Drop for TerminalGuard {
 
 fn query_terminal(stdout: &mut impl Write) -> io::Result<QueryReplies> {
     let mut query = MARGIN_QUERY.to_owned();
+    for slot in 0..=u8::MAX {
+        query.push_str(&format!("\x1b]4;{slot};?\x07"));
+    }
     query.push_str(KEYBOARD_FLAGS_QUERY);
     query.push_str(VERSION_QUERY);
     query.push_str(DEVICE_ATTRIBUTES_QUERY);
@@ -164,6 +182,7 @@ fn query_terminal(stdout: &mut impl Write) -> io::Result<QueryReplies> {
 
 #[derive(Default)]
 struct QueryReplies {
+    palette: HashMap<u8, String>,
     device_attributes: bool,
     keyboard_flags: bool,
     features: TerminalFeatures,
@@ -188,6 +207,18 @@ impl vte::Perform for QueryReplies {
             self.features.ghostty |= GHOSTTY_VERSION_PREFIXES
                 .iter()
                 .any(|prefix| version.starts_with(prefix));
+        }
+    }
+
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        if let [b"4", slot, spec] = params
+            && spec.starts_with(b"rgb:")
+            && let Some(slot) = std::str::from_utf8(slot)
+                .ok()
+                .and_then(|slot| slot.parse::<u8>().ok())
+        {
+            self.palette
+                .insert(slot, String::from_utf8_lossy(spec).into_owned());
         }
     }
 
@@ -220,7 +251,11 @@ impl vte::Perform for QueryReplies {
 static RESTORE_ON_SIGNAL: OnceLock<Vec<u8>> = OnceLock::new();
 
 fn restore_on_signal(setup: &TerminalSetup) {
-    let restore = signal_restore(setup.features.margin_mode, setup.features.ghostty);
+    let restore = signal_restore(
+        &setup.original_palette,
+        setup.features.margin_mode,
+        setup.features.ghostty,
+    );
     if restore.is_empty() || RESTORE_ON_SIGNAL.set(restore).is_err() {
         return;
     }
@@ -246,8 +281,12 @@ extern "C" fn write_restore_and_reraise(signal: libc::c_int) {
     }
 }
 
-fn signal_restore(margin_mode: bool, ghostty: bool) -> Vec<u8> {
-    let mut restore = Vec::new();
+fn signal_restore(original: &HashMap<u8, String>, margin_mode: bool, ghostty: bool) -> Vec<u8> {
+    let mut restore = if original.is_empty() {
+        Vec::new()
+    } else {
+        palette_restore(PALETTE_SLOTS, original).into_bytes()
+    };
     if margin_mode {
         restore.extend_from_slice(MARGIN_MODE_OFF);
     }
@@ -256,6 +295,109 @@ fn signal_restore(margin_mode: bool, ghostty: bool) -> Vec<u8> {
     }
     restore.extend_from_slice(CURSOR_SHAPE_RESET);
     restore
+}
+
+fn palette_restore(slots_used: u8, original: &HashMap<u8, String>) -> String {
+    let slots = (FIRST_PALETTE_SLOT..=u8::MAX).take(usize::from(slots_used));
+    let (mut known, mut unknown) = (Vec::new(), Vec::new());
+    for slot in slots {
+        match original.get(&slot) {
+            Some(spec) => known.push((slot, spec)),
+            None => unknown.push(slot),
+        }
+    }
+    let mut restore = Vec::new();
+    write_osc4(&mut restore, known).ok();
+    for chunk in unknown.chunks(OSC_RESET_SLOTS) {
+        restore.extend_from_slice(b"\x1b]104");
+        for slot in chunk {
+            write!(restore, ";{slot}").ok();
+        }
+        restore.push(b'\x07');
+    }
+    String::from_utf8_lossy(&restore).into_owned()
+}
+
+fn write_osc4<T: std::fmt::Display>(
+    output: &mut impl Write,
+    definitions: impl IntoIterator<Item = (u8, T)>,
+) -> io::Result<()> {
+    let definitions: Vec<(u8, T)> = definitions.into_iter().collect();
+    for chunk in definitions.chunks(OSC_PALETTE_PAIRS) {
+        output.write_all(b"\x1b]4")?;
+        for (slot, spec) in chunk {
+            write!(output, ";{slot};{spec}")?;
+        }
+        output.write_all(b"\x07")?;
+    }
+    Ok(())
+}
+
+struct RgbSpec(Rgb);
+
+impl std::fmt::Display for RgbSpec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let Rgb { r, g, b } = self.0;
+        write!(formatter, "rgb:{r:02x}/{g:02x}/{b:02x}")
+    }
+}
+
+#[derive(Default)]
+struct Palette {
+    enabled: bool,
+    slots: HashMap<Rgb, u8>,
+    slots_used: Arc<AtomicU8>,
+    definitions: Vec<(u8, Rgb)>,
+}
+
+impl Palette {
+    fn new(original: &HashMap<u8, String>, slots_used: Arc<AtomicU8>) -> Self {
+        Self {
+            enabled: !original.is_empty(),
+            slots_used,
+            ..Self::default()
+        }
+    }
+
+    fn slot_for(&mut self, color: Rgb) -> Option<u8> {
+        if !self.enabled {
+            return None;
+        }
+        if let Some(slot) = self.slots.get(&color) {
+            return Some(*slot);
+        }
+        let slot = u8::try_from(FIRST_PALETTE_SLOT as usize + self.slots.len()).ok()?;
+        self.definitions.push((slot, color));
+        self.slots.insert(color, slot);
+        self.slots_used
+            .fetch_max(slot - FIRST_PALETTE_SLOT + 1, Ordering::Relaxed);
+        Some(slot)
+    }
+
+    fn write_definitions(&mut self, output: &mut impl Write) -> io::Result<()> {
+        write_osc4(
+            output,
+            self.definitions
+                .drain(..)
+                .map(|(slot, color)| (slot, RgbSpec(color))),
+        )
+    }
+
+    fn forget_if_full(&mut self) {
+        if self.slots.len() >= usize::from(PALETTE_SLOTS) {
+            self.slots.clear();
+        }
+    }
+
+    fn param(&mut self, layer: Layer, color: PenColor) -> SgrParam {
+        let PenColor::Color(rgb) = color else {
+            return SgrParam::Code(layer.default_code());
+        };
+        match self.slot_for(rgb) {
+            Some(slot) => SgrParam::Indexed(layer.extended_code(), slot),
+            None => SgrParam::Color(layer.extended_code(), rgb),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -396,7 +538,7 @@ impl Style {
 
 impl Pen {
     fn shows(&self, style: &Style) -> bool {
-        self.plan(style).is_none()
+        self.plan(style, &mut SgrParam::of).is_none()
     }
 
     fn after(&self, style: &Style, wanted: CellAttrs, resets: bool) -> Pen {
@@ -417,7 +559,13 @@ impl Pen {
         pen
     }
 
-    fn push_changes(&self, style: &Style, wanted: CellAttrs, sink: &mut impl SgrSink) {
+    fn push_changes(
+        &self,
+        style: &Style,
+        wanted: CellAttrs,
+        sink: &mut impl SgrSink,
+        color: &mut impl FnMut(Layer, PenColor) -> SgrParam,
+    ) {
         for (flag, on, off) in ATTRIBUTE_CODES {
             if self.attrs.contains(flag) && !wanted.contains(flag) {
                 sink.push(SgrParam::Code(off));
@@ -431,28 +579,32 @@ impl Pen {
             _ => {}
         }
         if let Some(fg) = style.fg.filter(|fg| self.fg != Some(*fg)) {
-            sink.push(SgrParam::of(Layer::Foreground, fg));
+            sink.push(color(Layer::Foreground, fg));
         }
         if self.bg != style.bg {
-            sink.push(SgrParam::of(Layer::Background, style.bg));
+            sink.push(color(Layer::Background, style.bg));
         }
         if let Some(underline) = style
             .underline
             .filter(|underline| self.underline != *underline)
         {
-            sink.push(SgrParam::of(Layer::Underline, underline));
+            sink.push(color(Layer::Underline, underline));
         }
     }
 
-    fn plan(&self, style: &Style) -> Option<SgrPlan> {
+    fn plan(
+        &self,
+        style: &Style,
+        color: &mut impl FnMut(Layer, PenColor) -> SgrParam,
+    ) -> Option<SgrPlan> {
         let wanted = (self.attrs - style.relevant) | (style.attrs & style.relevant);
         let mut changes = ParamLength::default();
-        self.push_changes(style, wanted, &mut changes);
+        self.push_changes(style, wanted, &mut changes, color);
         if changes.count == 0 {
             return None;
         }
         let mut reset = ParamLength::default();
-        push_reset(style, wanted, &mut reset);
+        push_reset(style, wanted, &mut reset, color);
         let reset_len = usize::from(reset.count > 0) + reset.len();
         let resets = reset_len < changes.len();
         Some(SgrPlan {
@@ -467,6 +619,7 @@ impl Pen {
         output: &mut impl Write,
         style: &Style,
         plan: &SgrPlan,
+        color: &mut impl FnMut(Layer, PenColor) -> SgrParam,
     ) -> io::Result<()> {
         output.write_all(b"\x1b[")?;
         let mut writer = ParamWriter {
@@ -475,9 +628,9 @@ impl Pen {
             result: Ok(()),
         };
         if plan.resets {
-            push_reset(style, plan.wanted, &mut writer);
+            push_reset(style, plan.wanted, &mut writer, color);
         } else {
-            self.push_changes(style, plan.wanted, &mut writer);
+            self.push_changes(style, plan.wanted, &mut writer, color);
         }
         writer.result?;
         output.write_all(b"m")?;
@@ -485,17 +638,30 @@ impl Pen {
         Ok(())
     }
 
-    fn write_style(&mut self, output: &mut impl Write, style: Style) -> io::Result<()> {
-        match self.plan(&style) {
-            Some(plan) => self.write_plan(output, &style, &plan),
-            None => Ok(()),
+    fn write_style(
+        &mut self,
+        output: &mut impl Write,
+        palette: &mut Palette,
+        style: Style,
+    ) -> io::Result<()> {
+        if !palette.enabled {
+            return match self.plan(&style, &mut SgrParam::of) {
+                Some(plan) => self.write_plan(output, &style, &plan, &mut SgrParam::of),
+                None => Ok(()),
+            };
         }
+        let mut color = |layer, color| palette.param(layer, color);
+        let Some(plan) = self.plan(&style, &mut color) else {
+            return Ok(());
+        };
+        self.write_plan(output, &style, &plan, &mut color)
     }
 }
 
 #[derive(Clone, Copy)]
 enum SgrParam {
     Code(&'static str),
+    Indexed(&'static str, u8),
     Color(&'static str, Rgb),
 }
 
@@ -510,6 +676,7 @@ impl SgrParam {
     fn len(self) -> usize {
         match self {
             Self::Code(code) => code.len(),
+            Self::Indexed(code, slot) => code.len() + 3 + decimal_len(usize::from(slot)),
             Self::Color(code, Rgb { r, g, b }) => {
                 code.len()
                     + 5
@@ -523,6 +690,11 @@ impl SgrParam {
     fn write(self, output: &mut impl Write) -> io::Result<()> {
         match self {
             Self::Code(code) => output.write_all(code.as_bytes()),
+            Self::Indexed(code, slot) => {
+                output.write_all(code.as_bytes())?;
+                output.write_all(b";5;")?;
+                write_decimal(output, usize::from(slot))
+            }
             Self::Color(code, Rgb { r, g, b }) => {
                 output.write_all(code.as_bytes())?;
                 output.write_all(b";2;")?;
@@ -588,7 +760,12 @@ struct SgrPlan {
     wanted: CellAttrs,
 }
 
-fn push_reset(style: &Style, wanted: CellAttrs, sink: &mut impl SgrSink) {
+fn push_reset(
+    style: &Style,
+    wanted: CellAttrs,
+    sink: &mut impl SgrSink,
+    color: &mut impl FnMut(Layer, PenColor) -> SgrParam,
+) {
     for (flag, on, _) in ATTRIBUTE_CODES {
         if wanted.contains(flag) {
             sink.push(SgrParam::Code(on));
@@ -603,7 +780,7 @@ fn push_reset(style: &Style, wanted: CellAttrs, sink: &mut impl SgrSink) {
         (Layer::Underline, style.underline),
     ] {
         if let Some(pen_color @ PenColor::Color(_)) = pen_color {
-            sink.push(SgrParam::of(layer, pen_color));
+            sink.push(color(layer, pen_color));
         }
     }
 }
@@ -845,6 +1022,7 @@ struct Terminal<W: Write> {
     cursor_visible: bool,
     cursor_shape: Option<CursorShape>,
     features: TerminalFeatures,
+    palette: Palette,
     pointer: Option<&'static str>,
     draw_scratch: DrawScratch,
 }
@@ -853,6 +1031,7 @@ impl<W: Write> Terminal<W> {
     fn clear(&mut self) -> io::Result<()> {
         self.body.write_all(b"\x1b[m\x1b[2J")?;
         self.pen = Pen::default();
+        self.palette.forget_if_full();
         self.cursor = None;
         Ok(())
     }
@@ -881,8 +1060,11 @@ impl<W: Write> Terminal<W> {
     }
 
     fn scroll(&mut self, scroll: &GridScroll) -> io::Result<()> {
-        self.pen
-            .write_style(&mut self.body, Style::blank(PenColor::Default))?;
+        self.pen.write_style(
+            &mut self.body,
+            &mut self.palette,
+            Style::blank(PenColor::Default),
+        )?;
         let whole_screen =
             scroll.top == 0 && scroll.bottom == self.rows as usize && scroll.columns.is_none();
         if scroll.columns.is_some() && !self.features.margin_mode {
@@ -916,7 +1098,8 @@ impl<W: Write> Terminal<W> {
         erase: Option<PenColor>,
     ) -> io::Result<()> {
         if let Some(erase) = erase {
-            self.pen.write_style(&mut self.body, Style::blank(erase))?;
+            self.pen
+                .write_style(&mut self.body, &mut self.palette, Style::blank(erase))?;
         }
         self.move_to(shift.start, row)?;
         let final_byte = if shift.shift > 0 { '@' } else { 'P' };
@@ -924,13 +1107,14 @@ impl<W: Write> Terminal<W> {
     }
 
     fn flush_frame(&mut self, force_synchronize: bool) -> io::Result<()> {
-        if self.body.is_empty() {
+        if self.body.is_empty() && self.palette.definitions.is_empty() {
             return Ok(());
         }
         let synchronize = force_synchronize || self.body.len() >= SYNCHRONIZED_FRAME_BYTES;
         if synchronize {
             crossterm::queue!(self.output, terminal::BeginSynchronizedUpdate)?;
         }
+        self.palette.write_definitions(&mut self.output)?;
         self.output.write_all(&self.body)?;
         self.body.clear();
         if synchronize {
@@ -1005,7 +1189,7 @@ impl<W: Write> Terminal<W> {
             has_clusters,
             ..
         } = scratch;
-        if *steps <= 2 || *has_clusters || styles.len() < 2 {
+        if self.palette.enabled || *steps <= 2 || *has_clusters || styles.len() < 2 {
             return None;
         }
         let start = DrawState {
@@ -1105,6 +1289,7 @@ impl<W: Write> Terminal<W> {
     ) -> io::Result<usize> {
         let cols = self.cols as usize;
         let visible_cols = cells.len().min(cols);
+        let identifies_styles = !self.palette.enabled;
         scratch.segments.clear();
         scratch.text.clear();
         scratch.styles.clear();
@@ -1141,7 +1326,11 @@ impl<W: Write> Terminal<W> {
                     (SegmentKind::Erase(blank_run), 3 + decimal_len(blank_run))
                 };
                 let style = Style::blank(background);
-                let style_id = style_id_of(&mut scratch.styles, style);
+                let style_id = if identifies_styles {
+                    style_id_of(&mut scratch.styles, style)
+                } else {
+                    0
+                };
                 scratch.segments.push(DrawSegment {
                     col,
                     style,
@@ -1208,7 +1397,11 @@ impl<W: Write> Terminal<W> {
                     *last_cursor_after = cursor_after;
                 }
                 _ => {
-                    let style_id = style_id_of(&mut scratch.styles, style);
+                    let style_id = if identifies_styles {
+                        style_id_of(&mut scratch.styles, style)
+                    } else {
+                        0
+                    };
                     scratch.segments.push(DrawSegment {
                         col,
                         style,
@@ -1230,7 +1423,8 @@ impl<W: Write> Terminal<W> {
 
     fn draw_segment(&mut self, row: u16, segment: &DrawSegment, text: &[u8]) -> io::Result<()> {
         self.move_to(segment.col, row)?;
-        self.pen.write_style(&mut self.body, segment.style)?;
+        self.pen
+            .write_style(&mut self.body, &mut self.palette, segment.style)?;
         self.write_segment_content(row, segment, text)
     }
 
@@ -1246,7 +1440,8 @@ impl<W: Write> Terminal<W> {
         }
         self.cursor = Some((segment.col, row));
         if let Some(sgr) = &plan.sgr {
-            self.pen.write_plan(&mut self.body, &segment.style, sgr)?;
+            self.pen
+                .write_plan(&mut self.body, &segment.style, sgr, &mut SgrParam::of)?;
         }
         self.write_segment_content(row, segment, text)
     }
@@ -1351,7 +1546,7 @@ impl DrawState {
         let sgr = if shown {
             None
         } else {
-            self.pen.plan(&segment.style)
+            self.pen.plan(&segment.style, &mut SgrParam::of)
         };
         if let Some(plan) = &sgr {
             self.pen = self.pen.after(&segment.style, plan.wanted, plan.resets);
@@ -1409,6 +1604,7 @@ impl<W: Write> Renderer<W> {
                 cursor_visible: false,
                 cursor_shape: None,
                 features: TerminalFeatures::default(),
+                palette: Palette::default(),
                 pointer: None,
                 draw_scratch: DrawScratch::default(),
             },
@@ -1659,11 +1855,12 @@ pub fn ansi_text(grid: &CellGrid) -> io::Result<String> {
     let mut output = Vec::new();
     for row in 0..grid.rows {
         let mut pen = Pen::default();
+        let mut palette = Palette::default();
         for cell in grid.row(row) {
             if cell.is_wide_continuation() {
                 continue;
             }
-            pen.write_style(&mut output, Style::of_cell(cell, false))?;
+            pen.write_style(&mut output, &mut palette, Style::of_cell(cell, false))?;
             cell.glyph.write_to(&mut output)?;
         }
         crossterm::queue!(output, style::ResetColor)?;
@@ -1750,6 +1947,10 @@ pub fn attach(socket: &Path, wait: Option<ClientMessage>) -> Result<Exit> {
     let guard = TerminalGuard::enter()?;
     let mut renderer = Renderer::new(TerminalOutput::stdout()?, cols, rows);
     renderer.terminal.features = guard.0.features;
+    renderer.terminal.palette = Palette::new(
+        &guard.0.original_palette,
+        guard.0.palette_slots_used.clone(),
+    );
     let (render_sender, render_receiver) = mpsc::channel();
     thread::Builder::new()
         .name("Socket reader".to_owned())
@@ -2180,6 +2381,15 @@ mod tests {
                     b: rgb.b,
                 })
             };
+            let resolve = |color: ansi::Color| match color {
+                ansi::Color::Indexed(index) => {
+                    self.term.colors()[index as usize].map_or(color, ansi::Color::Spec)
+                }
+                ansi::Color::Named(name) if (name as usize) < FIRST_PALETTE_SLOT as usize => {
+                    self.term.colors()[name as usize].map_or(color, ansi::Color::Spec)
+                }
+                other => other,
+            };
             for row in 0..grid.rows {
                 for col in 0..grid.cols.min(cols) {
                     let Some(expected) = grid.cell(col as i32, row as i32) else {
@@ -2206,7 +2416,7 @@ mod tests {
                     } else {
                         spec(expected.bg)
                     };
-                    assert_eq!(shown.bg, background, "{at}");
+                    assert_eq!(resolve(shown.bg), background, "{at}");
                     let underline = expected.attrs.contains(CellAttrs::UNDERLINE);
                     let curly = underline
                         && self.styled_underlines
@@ -2222,7 +2432,11 @@ mod tests {
                             .underline
                             .rgb()
                             .filter(|color| self.styled_underlines && *color != expected.fg);
-                        assert_eq!(shown.underline_color(), color.map(spec), "{at}");
+                        assert_eq!(
+                            shown.underline_color().map(resolve),
+                            color.map(spec),
+                            "{at}"
+                        );
                     }
                     if !expected.is_plain_blank() {
                         let foreground = if expected.attrs.contains(CellAttrs::DEFAULT_FOREGROUND) {
@@ -2230,7 +2444,7 @@ mod tests {
                         } else {
                             spec(expected.fg)
                         };
-                        assert_eq!(shown.fg, foreground, "{at}");
+                        assert_eq!(resolve(shown.fg), foreground, "{at}");
                         let bold = expected.attrs.contains(CellAttrs::BOLD);
                         assert_eq!(shown.flags.contains(Flags::BOLD), bold, "{at}");
                         let italic = expected.attrs.contains(CellAttrs::ITALIC);
@@ -2521,10 +2735,37 @@ mod tests {
             assert!(!output.contains("?69") && !undo.contains("?69"));
         }
         assert_eq!(
-            signal_restore(true, false),
+            signal_restore(&HashMap::default(), true, false),
             [MARGIN_MODE_OFF, CURSOR_SHAPE_RESET].concat()
         );
-        assert_eq!(signal_restore(false, false), CURSOR_SHAPE_RESET);
+        assert_eq!(
+            signal_restore(&HashMap::default(), false, false),
+            CURSOR_SHAPE_RESET
+        );
+    }
+
+    #[test]
+    fn palette_slots_replace_truecolor_codes() {
+        let mut renderer = Renderer::new(Vec::new(), 60, 14);
+        renderer.terminal.palette.enabled = true;
+        let mut emulator = Emulator::new(60, 14);
+        let mut grid = editor_frame(0);
+        for (index, cell) in grid.cells.iter_mut().enumerate() {
+            cell.fg = [Rgb::new(198, 120, 221), Rgb::new(97, 175, 239)][index % 2];
+        }
+        renderer.grid = Some(grid.clone());
+        renderer.render().unwrap();
+        let output = output_text(&renderer);
+        assert!(output.contains("\x1b]4;16;rgb:c6/78/dd;"), "{output:?}");
+        assert!(output.contains("\x1b[38;5;16;48;5;17m"), "{output:?}");
+        assert!(output.contains("\x1b[38;5;18m"), "{output:?}");
+        assert!(!output.contains("38;2;"), "{output:?}");
+        emulator.feed(&mut renderer);
+        emulator.assert_shows(&grid, 60);
+        assert_eq!(
+            renderer.terminal.palette.slots_used.load(Ordering::Relaxed),
+            3
+        );
     }
 
     #[test]
@@ -2539,10 +2780,16 @@ mod tests {
                 type_color
             };
         }
-        let mut renderer = Renderer::new(Vec::new(), 40, 1);
-        let mut emulator = Emulator::new(40, 1);
-        let truecolor = render_checked(&mut renderer, &mut emulator, &grid);
+        let render = |palette_enabled: bool| {
+            let mut renderer = Renderer::new(Vec::new(), 40, 1);
+            renderer.terminal.palette.enabled = palette_enabled;
+            let mut emulator = Emulator::new(40, 1);
+            render_checked(&mut renderer, &mut emulator, &grid)
+        };
+        let truecolor = render(false);
         assert_eq!(truecolor.matches("38;2;").count(), 2, "{truecolor:?}");
+        let indexed = render(true);
+        assert_eq!(indexed.matches("38;5;").count(), 7, "{indexed:?}");
     }
 
     fn random_pen_color(random: &mut Random) -> PenColor {
@@ -2588,6 +2835,14 @@ mod tests {
     #[test]
     fn truecolor_styles_match_the_formatted_encoder() {
         let mut random = Random::new(7);
+        let mut truecolor = Palette::default();
+        let mut full = Palette {
+            enabled: true,
+            ..Palette::default()
+        };
+        for index in 0..u16::from(PALETTE_SLOTS) {
+            full.slots.insert(Rgb::new(3, index as u8, 3), 0);
+        }
         for _ in 0..20_000 {
             let pen = Pen {
                 fg: (random.next(4) != 0).then(|| random_pen_color(&mut random)),
@@ -2596,10 +2851,21 @@ mod tests {
                 attrs: random_attrs(&mut random),
             };
             let style = random_style(&mut random);
-            let mut written = pen;
-            let mut output = Vec::new();
-            written.write_style(&mut output, style).unwrap();
-            match pen.plan(&style) {
+            let (mut written, mut formatted) = (pen, pen);
+            let (mut output, mut expected) = (Vec::new(), Vec::new());
+            written
+                .write_style(&mut output, &mut truecolor, style)
+                .unwrap();
+            formatted
+                .write_style(&mut expected, &mut full, style)
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&output),
+                String::from_utf8_lossy(&expected),
+                "{pen:?} {style:?}"
+            );
+            assert_eq!(written, formatted, "{pen:?} {style:?}");
+            match pen.plan(&style, &mut SgrParam::of) {
                 Some(plan) => {
                     assert_eq!(plan.len, output.len(), "{pen:?} {output:?}");
                     assert_eq!(
@@ -2795,7 +3061,7 @@ mod tests {
         terminal.move_to(step.col, row).unwrap();
         terminal
             .pen
-            .write_style(&mut terminal.body, step.style)
+            .write_style(&mut terminal.body, &mut terminal.palette, step.style)
             .unwrap();
         match step.kind {
             ReferenceKind::Erase(count) => write!(terminal.body, "\x1b[{count}X").unwrap(),
@@ -2820,7 +3086,7 @@ mod tests {
         for step in &steps {
             draw_reference_step(terminal, row, step);
         }
-        if steps.len() <= 2 {
+        if terminal.palette.enabled || steps.len() <= 2 {
             return;
         }
         let in_order = terminal.body.split_off(start);
@@ -2919,6 +3185,50 @@ mod tests {
         assert!(regrouped > 100, "{regrouped}");
     }
 
+    #[test]
+    fn palette_falls_back_to_truecolor_when_full_and_reuses_slots_after_a_clear() {
+        let mut renderer = Renderer::new(Vec::new(), 40, 8);
+        renderer.terminal.palette.enabled = true;
+        let mut emulator = Emulator::new(40, 8);
+        let mut grid = CellGrid::new(40, 8, Rgb::new(0, 0, 0));
+        for (index, cell) in grid.cells.iter_mut().enumerate() {
+            cell.glyph = 'x'.into();
+            cell.fg = Rgb::new(index as u8, (index / 256) as u8, 7);
+        }
+        renderer.grid = Some(grid.clone());
+        let bytes = emulator.feed(&mut renderer);
+        assert!(bytes > 0);
+        emulator.assert_shows(&grid, 40);
+        assert_eq!(renderer.terminal.palette.slots.len(), 240);
+        assert_eq!(
+            renderer.terminal.palette.slots_used.load(Ordering::Relaxed),
+            240
+        );
+
+        renderer.resize(40, 8);
+        renderer.render().unwrap();
+        let output = output_text(&renderer);
+        assert!(output.contains("\x1b]4;16;rgb:00/00/07"), "{output:?}");
+        assert!(output.contains("38;2;"), "{output:?}");
+    }
+
+    #[test]
+    fn palette_slots_survive_a_resize_until_they_run_out() {
+        let mut renderer = Renderer::new(Vec::new(), 60, 14);
+        renderer.terminal.palette.enabled = true;
+        let mut emulator = Emulator::new(60, 14);
+        let grid = editor_frame(0);
+        renderer.grid = Some(grid.clone());
+        emulator.feed(&mut renderer);
+
+        renderer.resize(60, 14);
+        renderer.render().unwrap();
+        let output = output_text(&renderer);
+        assert!(!output.contains("\x1b]4;"), "{output:?}");
+        emulator.feed(&mut renderer);
+        emulator.assert_shows(&grid, 60);
+    }
+
     fn parse_replies(chunks: &[&[u8]]) -> QueryReplies {
         let mut parser = vte::Parser::new();
         let mut replies = QueryReplies::default();
@@ -2926,6 +3236,60 @@ mod tests {
             parser.advance(&mut replies, chunk);
         }
         replies
+    }
+
+    #[test]
+    fn palette_replies_are_restored_exactly() {
+        let reply = b"\x1b[?69;2$y\x1b]4;16;rgb:0000/0000/0000\x1b\\\x1b]4;17;rgb:0000/0000/5f5f\x07\x1b[?62;22c";
+        let original = parse_replies(&[reply]).palette;
+        assert_eq!(
+            original.get(&16).map(String::as_str),
+            Some("rgb:0000/0000/0000")
+        );
+        assert_eq!(
+            original.get(&17).map(String::as_str),
+            Some("rgb:0000/0000/5f5f")
+        );
+        assert_eq!(
+            palette_restore(3, &original),
+            "\x1b]4;16;rgb:0000/0000/0000;17;rgb:0000/0000/5f5f\x07\x1b]104;18\x07"
+        );
+        assert!(parse_replies(&[b"\x1b[?62;22c"]).palette.is_empty());
+    }
+
+    #[test]
+    fn palette_restore_covers_every_used_slot_through_255() {
+        let original = HashMap::from_iter([(255, "rgb:1111/2222/3333".to_owned())]);
+        let restored_slots = |used| {
+            let restore = palette_restore(used, &original);
+            let mut slots = Vec::new();
+            for sequence in restore
+                .split('\x07')
+                .filter(|sequence| !sequence.is_empty())
+            {
+                let params: Vec<&str> = sequence.split(';').collect();
+                assert!(params.len() <= 16, "{sequence:?}");
+                let step = if params[0] == "\x1b]4" { 2 } else { 1 };
+                slots.extend(
+                    params[1..]
+                        .iter()
+                        .step_by(step)
+                        .map(|slot| slot.parse::<u8>().unwrap()),
+                );
+            }
+            slots.sort();
+            (restore, slots)
+        };
+        assert_eq!(restored_slots(0).1, Vec::<u8>::new());
+        assert_eq!(restored_slots(1).1, vec![16]);
+        assert_eq!(restored_slots(239).1, (16..=254).collect::<Vec<_>>());
+        let (restore, slots) = restored_slots(PALETTE_SLOTS);
+        assert_eq!(slots, (16..=255).collect::<Vec<_>>());
+        assert!(restore.starts_with("\x1b]4;255;rgb:1111/2222/3333\x07\x1b]104;16;17;"));
+        assert_eq!(
+            signal_restore(&original, false, false),
+            [restore.as_bytes(), CURSOR_SHAPE_RESET].concat()
+        );
     }
 
     struct FailingWriter {
@@ -3256,7 +3620,11 @@ mod tests {
             let mut undo = Vec::new();
             setup.undo(&mut undo);
             assert_eq!(contains_reset(&undo), ghostty, "{undo:?}");
-            let restore = signal_restore(setup.features.margin_mode, setup.features.ghostty);
+            let restore = signal_restore(
+                &setup.original_palette,
+                setup.features.margin_mode,
+                setup.features.ghostty,
+            );
             assert_eq!(contains_reset(&restore), ghostty, "{restore:?}");
         }
     }
@@ -3327,6 +3695,26 @@ mod tests {
         assert!(!parse_replies(&[b"\x1b[?62;22c"]).features.ghostty);
     }
 
+    #[test]
+    fn replies_split_across_reads_are_parsed() {
+        let replies = parse_replies(&[
+            b"\x1b[?69;",
+            b"2$y\x1b]4;16;rgb:00",
+            b"00/0000/0000\x1b",
+            b"\\\x1b[?1u\x1bP>|gho",
+            b"stty 1.2\x1b\\\x1b[?62",
+            b";22c",
+        ]);
+        assert!(replies.features.left_right_margins);
+        assert!(replies.keyboard_flags);
+        assert!(replies.features.ghostty);
+        assert!(replies.device_attributes);
+        assert_eq!(
+            replies.palette.get(&16).map(String::as_str),
+            Some("rgb:0000/0000/0000")
+        );
+    }
+
     fn shortest_move(from: Option<(usize, u16)>, col: usize, row: u16) -> String {
         let mut output = Vec::new();
         write_shortest_move(&mut output, from, col, row).unwrap();
@@ -3373,6 +3761,7 @@ mod tests {
 
     #[test]
     fn resets_omit_the_zero_parameter() {
+        let mut palette = Palette::default();
         let mut pen = Pen::default();
         let mut output = Vec::new();
         let (red, blue) = (Rgb::new(200, 0, 0), Rgb::new(0, 0, 200));
@@ -3380,6 +3769,7 @@ mod tests {
             output.clear();
             pen.write_style(
                 &mut output,
+                &mut palette,
                 Style {
                     fg: Some(fg),
                     bg,
@@ -3450,6 +3840,13 @@ mod tests {
             let mut grid = CellGrid::new(40, 12, Rgb::new(40, 44, 52));
             let mut renderer = Renderer::new(Vec::new(), terminal_cols, 12);
             renderer.terminal.features.ghostty = ghostty;
+            renderer.terminal.palette.enabled = seed % 2 == 1;
+            if seed % 3 == 0 {
+                renderer.terminal.palette = Palette::new(
+                    &reported_palette(&[(3, "rgb:c8/78/3c")]),
+                    Default::default(),
+                );
+            }
             let mut emulator = Emulator::new(terminal_cols, 12);
             emulator.styled_underlines = ghostty;
             paint_run(&mut grid, &mut random);
@@ -3805,6 +4202,44 @@ mod tests {
     }
 
     #[test]
+    fn palette_definitions_are_batched_before_the_frame() {
+        let mut renderer = Renderer::new(Vec::new(), 60, 14);
+        renderer.terminal.palette.enabled = true;
+        let mut emulator = Emulator::new(60, 14);
+        let mut grid = editor_frame(0);
+        for (index, cell) in grid.cells.iter_mut().enumerate() {
+            cell.fg = Rgb::new((index % 20) as u8 * 10, 120, 60);
+        }
+        renderer.grid = Some(grid.clone());
+        renderer.render().unwrap();
+        let output = output_text(&renderer);
+        let body = output.strip_prefix("\x1b[?2026h").unwrap();
+        let definitions: Vec<&str> = body
+            .split('\x07')
+            .take_while(|sequence| sequence.starts_with("\x1b]4;"))
+            .collect();
+        let slots = renderer.terminal.palette.slots.len();
+        assert_eq!(definitions.len(), slots.div_ceil(OSC_PALETTE_PAIRS));
+        assert!(
+            definitions
+                .iter()
+                .all(|sequence| sequence.split(';').count() <= 1 + 2 * OSC_PALETTE_PAIRS)
+        );
+        emulator.feed(&mut renderer);
+        emulator.assert_shows(&grid, 60);
+    }
+
+    fn reported_palette(ansi: &[(u8, &str)]) -> HashMap<u8, String> {
+        let mut original: HashMap<u8, String> = (0..=u8::MAX)
+            .map(|slot| (slot, "rgb:0000/0000/0000".to_owned()))
+            .collect();
+        for (slot, spec) in ansi {
+            original.insert(*slot, (*spec).to_owned());
+        }
+        original
+    }
+
+    #[test]
     fn unchanged_frames_write_nothing() {
         let mut grid = CellGrid::new(20, 4, Rgb::new(40, 44, 52));
         mutate(&mut grid, &mut Random::new(7), 10);
@@ -3895,7 +4330,11 @@ mod tests {
         let mut undo = Vec::new();
         setup.undo(&mut undo);
         assert!(contains_reset(&undo), "{undo:?}");
-        let restore = signal_restore(setup.features.margin_mode, setup.features.ghostty);
+        let restore = signal_restore(
+            &setup.original_palette,
+            setup.features.margin_mode,
+            setup.features.ghostty,
+        );
         assert!(contains_reset(&restore), "{restore:?}");
     }
 
