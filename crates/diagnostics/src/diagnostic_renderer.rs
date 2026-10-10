@@ -267,7 +267,10 @@ impl DiagnosticBlock {
             )
             .child(
                 CopyButton::new(copy_button_id, self.copy_message.clone())
-                    .tooltip_label("Copy Diagnostic"),
+                    .tooltip_label("Copy Diagnostic")
+                    .when(bcx.window.text_system().cell_size().is_some(), |button| {
+                        button.size(ButtonSize::None)
+                    }),
             )
             .into_any_element()
     }

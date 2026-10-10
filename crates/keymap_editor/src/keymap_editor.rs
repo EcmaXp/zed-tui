@@ -622,6 +622,10 @@ impl KeymapEditor {
         })
         .detach();
 
+        let edit_column_width = window
+            .text_system()
+            .cell_size()
+            .map_or(px(36.), |cell_size| cell_size.width * 4.);
         let mut this = Self {
             workspace,
             keybindings: vec![],
@@ -654,7 +658,7 @@ impl KeymapEditor {
                 RedistributableColumnsState::new(
                     COLS,
                     vec![
-                        DefiniteLength::Absolute(AbsoluteLength::Pixels(px(36.))),
+                        DefiniteLength::Absolute(AbsoluteLength::Pixels(edit_column_width)),
                         DefiniteLength::Fraction(0.25),
                         DefiniteLength::Fraction(0.20),
                         DefiniteLength::Fraction(0.14),

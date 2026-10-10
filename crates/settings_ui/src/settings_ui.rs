@@ -3315,6 +3315,7 @@ impl SettingsWindow {
                     .p_2()
                     .pb_0p5()
                     .flex_shrink_0()
+                    .overflow_hidden()
                     .border_t_1()
                     .border_color(cx.theme().colors().border_variant)
                     .child(
