@@ -390,6 +390,7 @@ struct Terminal<W: Write> {
     cursor_shape: Option<CursorShape>,
     features: TerminalFeatures,
     pointer: Option<&'static str>,
+    draw_scratch: DrawScratch,
 }
 
 impl<W: Write> Terminal<W> {
@@ -421,12 +422,15 @@ impl<W: Write> Terminal<W> {
     }
 
     fn draw(&mut self, row: u16, cells: &[Cell], range: Range<usize>) -> io::Result<()> {
-        let mut scratch = DrawScratch::default();
-        self.plan_draw(cells, range, &mut scratch)?;
-        for segment in &scratch.segments {
-            self.draw_segment(row, segment, &scratch.text)?;
-        }
-        Ok(())
+        let mut scratch = std::mem::take(&mut self.draw_scratch);
+        let drawn = self.plan_draw(cells, range, &mut scratch).and_then(|()| {
+            for segment in &scratch.segments {
+                self.draw_segment(row, segment, &scratch.text)?;
+            }
+            Ok(())
+        });
+        self.draw_scratch = scratch;
+        drawn
     }
 
     fn plan_draw(
@@ -437,6 +441,8 @@ impl<W: Write> Terminal<W> {
     ) -> io::Result<()> {
         let cols = self.cols as usize;
         let visible_cols = cells.len().min(cols);
+        scratch.segments.clear();
+        scratch.text.clear();
         let mut col = range.start;
         while col < range.end {
             let Some(cell) = cells.get(col) else {
@@ -547,6 +553,7 @@ impl<W: Write> Renderer<W> {
                 cursor_shape: None,
                 features: TerminalFeatures::default(),
                 pointer: None,
+                draw_scratch: DrawScratch::default(),
             },
             grid: None,
             drawn_size: None,
