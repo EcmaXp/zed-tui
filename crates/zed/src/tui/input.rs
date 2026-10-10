@@ -21,6 +21,15 @@ pub struct InputTranslator {
     last_click: Option<(Instant, u16, u16, MouseButton)>,
     click_count: usize,
     pressed_button: Option<MouseButton>,
+    last_hover: Option<Hover>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct Hover {
+    col: u16,
+    row: u16,
+    pressed_button: Option<MouseButton>,
+    modifiers: Modifiers,
 }
 
 impl InputTranslator {
@@ -66,6 +75,12 @@ impl InputTranslator {
                 self.click_count = if repeated { self.click_count + 1 } else { 1 };
                 self.last_click = Some((now, col, row, button));
                 self.pressed_button = Some(button);
+                self.last_hover = Some(Hover {
+                    col,
+                    row,
+                    pressed_button: Some(button),
+                    modifiers,
+                });
                 vec![
                     PlatformInput::MouseMove(MouseMoveEvent {
                         position,
@@ -83,6 +98,12 @@ impl InputTranslator {
             }
             MouseAction::Up(button) => {
                 self.pressed_button = None;
+                self.last_hover = Some(Hover {
+                    col,
+                    row,
+                    pressed_button: None,
+                    modifiers,
+                });
                 vec![PlatformInput::MouseUp(MouseUpEvent {
                     button: gpui_button(button),
                     position,
@@ -90,21 +111,34 @@ impl InputTranslator {
                     click_count: self.click_count.max(1),
                 })]
             }
-            MouseAction::Drag(button) => vec![PlatformInput::MouseMove(MouseMoveEvent {
-                position,
+            MouseAction::Drag(button) => self.hover(Hover {
+                col,
+                row,
                 pressed_button: Some(gpui_button(button)),
                 modifiers,
-            })],
-            MouseAction::Moved => vec![PlatformInput::MouseMove(MouseMoveEvent {
-                position,
+            }),
+            MouseAction::Moved => self.hover(Hover {
+                col,
+                row,
                 pressed_button: self.pressed_button,
                 modifiers,
-            })],
+            }),
             MouseAction::ScrollUp => vec![scroll(position, 0., SCROLL_LINES, modifiers)],
             MouseAction::ScrollDown => vec![scroll(position, 0., -SCROLL_LINES, modifiers)],
             MouseAction::ScrollLeft => vec![scroll(position, SCROLL_LINES, 0., modifiers)],
             MouseAction::ScrollRight => vec![scroll(position, -SCROLL_LINES, 0., modifiers)],
         }
+    }
+
+    fn hover(&mut self, hover: Hover) -> Vec<PlatformInput> {
+        if self.last_hover.replace(hover) == Some(hover) {
+            return Vec::new();
+        }
+        vec![PlatformInput::MouseMove(MouseMoveEvent {
+            position: cell_center(hover.col, hover.row),
+            pressed_button: hover.pressed_button,
+            modifiers: hover.modifiers,
+        })]
     }
 }
 
@@ -282,5 +316,68 @@ mod tests {
         assert_eq!(first.click_count, 1);
         assert_eq!(second.click_count, 2);
         assert_eq!(first.position, point(px(28.), px(72.)));
+    }
+
+    fn mouse_moves(
+        translator: &mut InputTranslator,
+        action: MouseAction,
+        col: u16,
+        shift: bool,
+    ) -> usize {
+        translator
+            .translate(TermEvent::Mouse {
+                action,
+                col,
+                row: 2,
+                modifiers: Modifiers {
+                    shift,
+                    ..Default::default()
+                },
+            })
+            .iter()
+            .filter(|translated| {
+                matches!(translated, Translated::Input(PlatformInput::MouseMove(_)))
+            })
+            .count()
+    }
+
+    #[test]
+    fn hovering_within_one_cell_moves_once() {
+        let mut translator = InputTranslator::default();
+        let left = MouseButtonKind::Left;
+        assert_eq!(
+            mouse_moves(&mut translator, MouseAction::Moved, 5, false),
+            1
+        );
+        assert_eq!(
+            mouse_moves(&mut translator, MouseAction::Moved, 5, false),
+            0
+        );
+        assert_eq!(
+            mouse_moves(&mut translator, MouseAction::Moved, 6, false),
+            1
+        );
+        assert_eq!(mouse_moves(&mut translator, MouseAction::Moved, 6, true), 1);
+        assert_eq!(
+            mouse_moves(&mut translator, MouseAction::Down(left), 6, true),
+            1
+        );
+        assert_eq!(
+            mouse_moves(&mut translator, MouseAction::Drag(left), 6, true),
+            0
+        );
+        assert_eq!(
+            mouse_moves(&mut translator, MouseAction::Drag(left), 7, true),
+            1
+        );
+        assert_eq!(
+            mouse_moves(&mut translator, MouseAction::Up(left), 7, true),
+            0
+        );
+        assert_eq!(mouse_moves(&mut translator, MouseAction::Moved, 7, true), 0);
+        assert_eq!(
+            mouse_moves(&mut translator, MouseAction::Moved, 7, false),
+            1
+        );
     }
 }
