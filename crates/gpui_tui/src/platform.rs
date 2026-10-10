@@ -32,6 +32,7 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 #[derive(Default)]
 pub(crate) struct PlatformOutputs {
     pub(crate) frame_sink: RefCell<Option<Box<dyn FnMut(CellGrid)>>>,
+    pub(crate) icon_glyphs: RefCell<Option<Box<dyn Fn(&str) -> Option<char>>>>,
 }
 
 #[derive(Debug)]
@@ -185,6 +186,10 @@ impl TuiPlatform {
 
     pub fn set_frame_sink(&self, sink: impl FnMut(CellGrid) + 'static) {
         *self.outputs.frame_sink.borrow_mut() = Some(Box::new(sink));
+    }
+
+    pub fn set_icon_glyphs(&self, glyphs: impl Fn(&str) -> Option<char> + 'static) {
+        *self.outputs.icon_glyphs.borrow_mut() = Some(Box::new(glyphs));
     }
 
     pub(crate) fn focused_window(&self) -> Option<TuiWindowHandle> {

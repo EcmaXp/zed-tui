@@ -73,9 +73,15 @@ struct RasterScratch {
     line_cursors: Vec<LineCursor>,
 }
 
-pub(crate) fn rasterize_scene(scene: &Scene, atlas: &TuiAtlas, cols: u16, rows: u16) -> CellGrid {
+pub(crate) fn rasterize_scene(
+    scene: &Scene,
+    atlas: &TuiAtlas,
+    icon_glyph: &dyn Fn(&str) -> Option<char>,
+    cols: u16,
+    rows: u16,
+) -> CellGrid {
     let scratch = &mut RasterScratch::default();
-    layout_text(scene, atlas, scratch);
+    layout_text(scene, atlas, icon_glyph, scratch);
     let mut rasterizer = Rasterizer {
         grid: CellGrid::new(cols, rows, Rgb::default()),
         scratch,
@@ -135,6 +141,7 @@ fn text_candidate(
     id: SpriteId,
     sprite: &MonochromeSprite,
     atlas: &TuiAtlas,
+    icon_glyph: &dyn Fn(&str) -> Option<char>,
 ) -> Option<TextCandidate> {
     let key = atlas.key_for(sprite.tile.tile_id)?;
     let bounds = to_bounds(&sprite.bounds);
@@ -156,7 +163,12 @@ fn text_candidate(
             }
             (col, row, glyph, attrs)
         }
-        AtlasKey::Svg(_) | AtlasKey::Image(_) => return None,
+        AtlasKey::Svg(params) => {
+            let glyph = Glyph::from_char(icon_glyph(&params.path)?);
+            let (col, row) = cell_of(center.x, center.y);
+            (col, row, glyph, CellAttrs::empty())
+        }
+        AtlasKey::Image(_) => return None,
     };
     let partly_hidden = bounds.top() < mask.top() || bounds.bottom() > mask.bottom();
     let cell_center_y = device_cell_center(col, row).y;
@@ -178,7 +190,12 @@ fn text_candidate(
     })
 }
 
-fn layout_text(scene: &Scene, atlas: &TuiAtlas, scratch: &mut RasterScratch) {
+fn layout_text(
+    scene: &Scene,
+    atlas: &TuiAtlas,
+    icon_glyph: &dyn Fn(&str) -> Option<char>,
+    scratch: &mut RasterScratch,
+) {
     let RasterScratch {
         candidates,
         placements,
@@ -190,7 +207,7 @@ fn layout_text(scene: &Scene, atlas: &TuiAtlas, scratch: &mut RasterScratch) {
             .monochrome_sprites
             .iter()
             .enumerate()
-            .filter_map(|(id, sprite)| text_candidate(id, sprite, atlas)),
+            .filter_map(|(id, sprite)| text_candidate(id, sprite, atlas, icon_glyph)),
     );
     candidates.sort_unstable_by(|a, b| {
         a.placement
@@ -467,7 +484,7 @@ mod tests {
     };
 
     fn rasterize(scene: &Scene, atlas: &TuiAtlas, cols: u16, rows: u16) -> CellGrid {
-        rasterize_scene(scene, atlas, cols, rows)
+        rasterize_scene(scene, atlas, &chevron_icon, cols, rows)
     }
 
     fn fill_quad(x: f32, y: f32, width: f32, height: f32, color: Hsla) -> Quad {
@@ -477,6 +494,10 @@ mod tests {
             background: color.into(),
             ..Default::default()
         }
+    }
+
+    fn chevron_icon(path: &str) -> Option<char> {
+        path.ends_with("chevron_right.svg").then_some('▸')
     }
 
     fn rgb(r: u8, g: u8, b: u8) -> Rgb {
@@ -678,6 +699,43 @@ mod tests {
         scene.finish();
         let grid = rasterize(&scene, &atlas, 8, 1);
         assert_eq!(grid.row_text(0), "  ab cd ");
+    }
+
+    #[test]
+    fn icons_and_labels_in_different_layers_keep_a_gap() {
+        use gpui::PlatformAtlas as _;
+        let atlas = TuiAtlas::default();
+        let icon_tile = atlas
+            .get_or_insert_with(
+                AtlasKey::Svg(gpui::RenderSvgParams {
+                    path: "icons/chevron_right.svg".into(),
+                    size: Size::new(DevicePixels(9), DevicePixels(9)),
+                }),
+                &mut || Ok(None),
+            )
+            .unwrap()
+            .unwrap();
+        let mut scene = Scene::default();
+        scene.push_layer(scaled_bounds(0., 0., 64., 16.));
+        scene.insert_primitive(glyph_sprite(&atlas, 'a', 19.5));
+        scene.pop_layer();
+        scene.insert_primitive(Quad {
+            bounds: scaled_bounds(0., 0., 64., 16.),
+            content_mask: full_mask(),
+            ..Default::default()
+        });
+        scene.insert_primitive(MonochromeSprite {
+            order: 0,
+            pad: 0,
+            bounds: scaled_bounds(8., 4., 9., 9.),
+            content_mask: full_mask(),
+            color: Hsla::white(),
+            tile: icon_tile,
+            transformation: gpui::TransformationMatrix::unit(),
+        });
+        scene.finish();
+        let grid = rasterize(&scene, &atlas, 6, 1);
+        assert_eq!(grid.row_text(0), " ▸ a  ");
     }
 
     #[test]
