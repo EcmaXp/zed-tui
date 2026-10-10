@@ -377,6 +377,35 @@ impl Pen {
     }
 }
 
+fn decimal_len(value: usize) -> usize {
+    value
+        .checked_ilog10()
+        .map_or(1, |exponent| exponent as usize + 1)
+}
+
+fn write_csi(output: &mut impl Write, value: usize, final_byte: char) -> io::Result<()> {
+    output.write_all(b"\x1b[")?;
+    write_decimal(output, value)?;
+    output.write_all(final_byte.encode_utf8(&mut [0; 4]).as_bytes())
+}
+
+fn write_decimal(output: &mut impl Write, value: usize) -> io::Result<()> {
+    let mut digits = [0u8; 20];
+    let mut start = digits.len();
+    let mut rest = value;
+    loop {
+        start -= 1;
+        if let Some(digit) = digits.get_mut(start) {
+            *digit = b'0' + (rest % 10) as u8;
+        }
+        rest /= 10;
+        if rest == 0 || start == 0 {
+            break;
+        }
+    }
+    output.write_all(digits.get(start..).unwrap_or_default())
+}
+
 fn underline_code(attrs: CellAttrs) -> Option<&'static str> {
     if !attrs.contains(CellAttrs::UNDERLINE) {
         None
@@ -399,6 +428,152 @@ fn unknown_cell() -> Cell {
     Cell {
         glyph: '\0'.into(),
         ..Cell::blank(Rgb::default())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CursorStep {
+    Stay,
+    Absolute { line: usize, column: usize },
+    Newlines(usize),
+    Relative(char, usize),
+    Line(usize),
+    Column(usize),
+    CarriageReturn,
+    Backspace,
+    CarriageReturnThenRight(usize),
+}
+
+impl CursorStep {
+    fn len(self) -> usize {
+        match self {
+            Self::Stay => 0,
+            Self::Absolute { line: 1, column: 1 } => 3,
+            Self::Absolute { line: 1, column } => 4 + decimal_len(column),
+            Self::Absolute { line, column: 1 } => 3 + decimal_len(line),
+            Self::Absolute { line, column } => 4 + decimal_len(line) + decimal_len(column),
+            Self::Newlines(count) => count,
+            Self::Relative(final_byte, 1) => 2 + final_byte.len_utf8(),
+            Self::Relative(final_byte, distance) => {
+                2 + decimal_len(distance) + final_byte.len_utf8()
+            }
+            Self::Line(number) | Self::Column(number) => 3 + decimal_len(number),
+            Self::CarriageReturn | Self::Backspace => 1,
+            Self::CarriageReturnThenRight(distance) => 1 + Self::Relative('C', distance).len(),
+        }
+    }
+
+    fn write(self, output: &mut impl Write) -> io::Result<()> {
+        match self {
+            Self::Stay => Ok(()),
+            Self::Absolute { line: 1, column: 1 } => output.write_all(b"\x1b[H"),
+            Self::Absolute { line: 1, column } => {
+                output.write_all(b"\x1b[;")?;
+                write_decimal(output, column)?;
+                output.write_all(b"H")
+            }
+            Self::Absolute { line, column: 1 } => write_csi(output, line, 'H'),
+            Self::Absolute { line, column } => {
+                output.write_all(b"\x1b[")?;
+                write_decimal(output, line)?;
+                output.write_all(b";")?;
+                write_decimal(output, column)?;
+                output.write_all(b"H")
+            }
+            Self::Newlines(count) => (0..count).try_for_each(|_| output.write_all(b"\n")),
+            Self::Relative(final_byte, 1) => {
+                output.write_all(b"\x1b[")?;
+                output.write_all(final_byte.encode_utf8(&mut [0; 4]).as_bytes())
+            }
+            Self::Relative(final_byte, distance) => write_csi(output, distance, final_byte),
+            Self::Line(number) => write_csi(output, number, 'd'),
+            Self::Column(number) => write_csi(output, number, 'G'),
+            Self::CarriageReturn => output.write_all(b"\r"),
+            Self::Backspace => output.write_all(b"\x08"),
+            Self::CarriageReturnThenRight(distance) => {
+                output.write_all(b"\r")?;
+                Self::Relative('C', distance).write(output)
+            }
+        }
+    }
+
+    fn shortest<const N: usize>(steps: [Self; N]) -> Self {
+        steps
+            .into_iter()
+            .min_by_key(|step| step.len())
+            .unwrap_or(Self::Stay)
+    }
+}
+
+fn write_shortest_move(
+    output: &mut impl Write,
+    from: Option<(usize, u16)>,
+    col: usize,
+    row: u16,
+) -> io::Result<()> {
+    shortest_move_steps(from, col, row)
+        .into_iter()
+        .try_for_each(|step| step.write(output))
+}
+
+fn shortest_move_steps(from: Option<(usize, u16)>, col: usize, row: u16) -> [CursorStep; 2] {
+    let line = row as usize + 1;
+    let absolute = CursorStep::Absolute {
+        line,
+        column: col + 1,
+    };
+    let Some((current_col, current_row)) = from else {
+        return [absolute, CursorStep::Stay];
+    };
+    let (vertical, line_start) = match row.cmp(&current_row) {
+        std::cmp::Ordering::Equal => (CursorStep::Stay, None),
+        std::cmp::Ordering::Greater => {
+            let distance = (row - current_row) as usize;
+            let vertical = CursorStep::shortest([
+                CursorStep::Newlines(distance),
+                CursorStep::Relative('B', distance),
+                CursorStep::Line(line),
+            ]);
+            (
+                vertical,
+                (col == 0).then_some(CursorStep::Relative('E', distance)),
+            )
+        }
+        std::cmp::Ordering::Less => {
+            let distance = (current_row - row) as usize;
+            let vertical =
+                CursorStep::shortest([CursorStep::Relative('A', distance), CursorStep::Line(line)]);
+            (
+                vertical,
+                (col == 0).then_some(CursorStep::Relative('F', distance)),
+            )
+        }
+    };
+    let horizontal = if col == current_col {
+        CursorStep::Stay
+    } else if col == 0 {
+        CursorStep::CarriageReturn
+    } else if col + 1 == current_col {
+        CursorStep::Backspace
+    } else {
+        let relative = if col > current_col {
+            CursorStep::Relative('C', col - current_col)
+        } else {
+            CursorStep::Relative('D', current_col - col)
+        };
+        CursorStep::shortest([
+            CursorStep::Column(col + 1),
+            CursorStep::CarriageReturnThenRight(col),
+            relative,
+        ])
+    };
+    let single = line_start.map_or(absolute, |line_start| {
+        CursorStep::shortest([absolute, line_start])
+    });
+    if vertical.len() + horizontal.len() <= single.len() {
+        [vertical, horizontal]
+    } else {
+        [single, CursorStep::Stay]
     }
 }
 
@@ -439,7 +614,7 @@ impl<W: Write> Terminal<W> {
         if self.cursor == Some((col, row)) {
             return Ok(());
         }
-        write!(self.body, "\x1b[{};{}H", row + 1, col + 1)?;
+        write_shortest_move(&mut self.body, self.cursor, col, row)?;
         self.cursor = Some((col, row));
         Ok(())
     }
@@ -1383,6 +1558,61 @@ mod tests {
         output
     }
 
+    #[test]
+    fn decimals_are_written_like_display() {
+        for value in [0, 1, 9, 10, 99, 100, 255, 1000, 65535, usize::MAX] {
+            let mut output = Vec::new();
+            write_decimal(&mut output, value).unwrap();
+            assert_eq!(String::from_utf8(output).unwrap(), value.to_string());
+            assert_eq!(decimal_len(value), value.to_string().len());
+        }
+    }
+
+    #[test]
+    fn cursor_step_lengths_match_their_bytes() {
+        let numbers = [0, 1, 2, 9, 10, 11, 99, 100, 101, 999, 1000, 65535];
+        let mut steps = vec![
+            CursorStep::Stay,
+            CursorStep::CarriageReturn,
+            CursorStep::Backspace,
+        ];
+        for &first in &numbers {
+            steps.extend([
+                CursorStep::Newlines(first),
+                CursorStep::Line(first),
+                CursorStep::Column(first),
+                CursorStep::CarriageReturnThenRight(first),
+            ]);
+            steps.extend(
+                ['A', 'B', 'C', 'D', 'E', 'F', 'S', 'T', '@', 'P', 'b']
+                    .map(|final_byte| CursorStep::Relative(final_byte, first)),
+            );
+            for &second in &numbers {
+                steps.push(CursorStep::Absolute {
+                    line: first,
+                    column: second,
+                });
+            }
+        }
+        for step in steps {
+            let mut output = Vec::new();
+            step.write(&mut output).unwrap();
+            assert_eq!(step.len(), output.len(), "{:?}", String::from_utf8(output));
+        }
+        let mut random = Random::new(11);
+        for _ in 0..5_000 {
+            let from = (random.next(5) != 0).then(|| (random.next(300), random.next(120) as u16));
+            let (col, row) = (random.next(300), random.next(120) as u16);
+            let mut output = Vec::new();
+            write_shortest_move(&mut output, from, col, row).unwrap();
+            let planned: usize = shortest_move_steps(from, col, row)
+                .into_iter()
+                .map(CursorStep::len)
+                .sum();
+            assert_eq!(planned, output.len());
+        }
+    }
+
     fn parse_replies(chunks: &[&[u8]]) -> QueryReplies {
         let mut parser = vte::Parser::new();
         let mut replies = QueryReplies::default();
@@ -1655,6 +1885,12 @@ mod tests {
         assert!(!parse_replies(&[b"\x1b[?62;22c"]).features.ghostty);
     }
 
+    fn shortest_move(from: Option<(usize, u16)>, col: usize, row: u16) -> String {
+        let mut output = Vec::new();
+        write_shortest_move(&mut output, from, col, row).unwrap();
+        String::from_utf8(output).unwrap()
+    }
+
     #[test]
     fn closing_the_terminal_is_noticed_even_with_input_pending() {
         let (mut master, mut slave) = (0, 0);
@@ -1676,6 +1912,21 @@ mod tests {
         unsafe { libc::close(master) };
         assert_eq!(receiver.recv_timeout(Duration::from_secs(5)), Ok(true));
         unsafe { libc::close(slave) };
+    }
+
+    #[test]
+    fn cursor_moves_pick_the_shortest_sequence() {
+        assert_eq!(shortest_move(None, 4, 2), "\x1b[3;5H");
+        assert_eq!(shortest_move(Some((9, 2)), 0, 3), "\n\r");
+        assert_eq!(shortest_move(Some((9, 2)), 9, 3), "\n");
+        assert_eq!(shortest_move(Some((9, 2)), 8, 2), "\x08");
+        assert_eq!(shortest_move(Some((9, 2)), 10, 2), "\x1b[C");
+        assert_eq!(shortest_move(Some((9, 2)), 40, 2), "\x1b[41G");
+        assert_eq!(shortest_move(Some((9, 30)), 9, 2), "\x1b[3d");
+        assert_eq!(shortest_move(None, 0, 0), "\x1b[H");
+        assert_eq!(shortest_move(None, 4, 0), "\x1b[;5H");
+        assert_eq!(shortest_move(Some((9, 12)), 0, 17), "\x1b[5E");
+        assert_eq!(shortest_move(Some((9, 20)), 0, 12), "\x1b[8F");
     }
 
     #[test]
