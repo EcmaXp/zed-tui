@@ -2777,7 +2777,7 @@ impl EditorElement {
         }
 
         let editor_font_size = self.style.text.font_size.to_pixels(window.rem_size()) * 1.2;
-        let button_size = if window.text_system().cell_size().is_some() {
+        let button_size = if window.text_system().renders_to_cell_grid() {
             ButtonSize::Compact
         } else {
             ButtonSize::Default
@@ -7073,7 +7073,7 @@ impl Gutter<'_> {
 }
 
 fn popover_gap(line_height: Pixels, window: &Window) -> Pixels {
-    if window.text_system().cell_size().is_some() {
+    if window.text_system().renders_to_cell_grid() {
         line_height
     } else {
         MENU_GAP
@@ -7142,7 +7142,7 @@ pub fn render_breadcrumb_text(
             let border_color = cx.theme().colors().border;
             this.pl_2()
                 .border_l_1()
-                .border_color(if window.text_system().cell_size().is_some() {
+                .border_color(if window.text_system().renders_to_cell_grid() {
                     border_color
                 } else {
                     border_color.opacity(0.6)
@@ -9928,7 +9928,7 @@ impl Element for EditorElement {
                             }
                             None => full_height,
                         };
-                        let header_bottom_padding = if window.text_system().cell_size().is_some() {
+                        let header_bottom_padding = if window.text_system().renders_to_cell_grid() {
                             Pixels::ZERO
                         } else {
                             BUFFER_HEADER_PADDING.to_pixels(window.rem_size())

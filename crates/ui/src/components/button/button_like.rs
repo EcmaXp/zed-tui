@@ -281,7 +281,7 @@ impl ButtonStyle {
             }
             ButtonStyle::Tinted(tint) => {
                 let mut styles = tint.button_like_style(cx);
-                styles.background = if cx.text_system().cell_size().is_some() {
+                styles.background = if cx.text_system().renders_to_cell_grid() {
                     cell_grid_tint_hover(styles.background, Color::from(tint).color(cx))
                 } else {
                     cx.theme().darken(styles.background, 0.05, 0.2)

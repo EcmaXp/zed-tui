@@ -224,6 +224,10 @@ mod unix {
         Ok(Resolved { paths, root })
     }
 
+    fn current_dir() -> Result<PathBuf> {
+        std::env::current_dir().context("reading the current directory")
+    }
+
     fn find_running(
         session: Option<&str>,
         path: Option<PathBuf>,
@@ -236,22 +240,22 @@ mod unix {
         if allow_only && let [only] = sessions.as_slice() {
             return Ok(only.name.clone());
         }
-        let current_dir = std::env::current_dir().context("reading the current directory")?;
+        let current_dir = current_dir()?;
         let target = server::canonical_target(&path.unwrap_or_default(), &current_dir);
         if let Some(covering) = server::deepest_covering(&sessions, &target) {
             return Ok(covering.name.clone());
         }
+        if sessions.is_empty() {
+            anyhow::bail!("no session is running");
+        }
         let names = sessions
             .iter()
             .map(|session| session.name.as_str())
-            .collect::<Vec<_>>();
-        if names.is_empty() {
-            anyhow::bail!("no session is running");
-        }
+            .collect::<Vec<_>>()
+            .join(", ");
         anyhow::bail!(
-            "no running session covers {}; running sessions: {}",
+            "no running session covers {}; running sessions: {names}",
             target.display(),
-            names.join(", ")
         )
     }
 
@@ -334,7 +338,7 @@ mod unix {
         if cli.wait && cli.paths.is_empty() {
             anyhow::bail!("--wait needs a file to open");
         }
-        let current_dir = std::env::current_dir().context("reading the current directory")?;
+        let current_dir = current_dir()?;
         let targets = cli
             .paths
             .iter()
@@ -412,7 +416,7 @@ mod unix {
     }
 
     fn absolute_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
-        let current_dir = std::env::current_dir().context("reading the current directory")?;
+        let current_dir = current_dir()?;
         if paths.is_empty() {
             return Ok(vec![current_dir]);
         }

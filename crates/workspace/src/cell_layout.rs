@@ -137,8 +137,25 @@ pub(crate) fn dock_size_for_pointer(
 }
 
 impl Workspace {
+    pub(crate) fn resize_dock_to_pointer(
+        &mut self,
+        position: DockPosition,
+        pointer: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let size = dock_size_for_pointer(
+            position,
+            pointer,
+            self.bounds,
+            window.text_system().cell_size(),
+        );
+        self.resize_dock(position, size, window, cx);
+        self.serialize_workspace(window, cx);
+    }
+
     pub(crate) fn zoom_hides_layout(&self, window: &Window) -> bool {
-        self.zoomed.is_some() && window.text_system().cell_size().is_some()
+        self.zoomed.is_some() && window.text_system().renders_to_cell_grid()
     }
 
     fn zoomed_item_focus_handle(&self, cx: &App) -> Option<FocusHandle> {

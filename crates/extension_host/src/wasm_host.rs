@@ -565,10 +565,6 @@ struct EpochGate {
     wake_sender: Mutex<mpsc::Sender<()>>,
 }
 
-struct InFlightCall {
-    in_flight_calls: Arc<AtomicUsize>,
-}
-
 impl EpochGate {
     fn new<Sleep: Future<Output = ()>>(
         mut sleep: impl FnMut() -> Sleep,
@@ -597,7 +593,7 @@ impl EpochGate {
         (gate, ticker)
     }
 
-    fn enter(&self) -> InFlightCall {
+    fn enter(&self) -> impl Drop + use<> {
         if self.in_flight_calls.fetch_add(1, Ordering::SeqCst) == 0 {
             let mut wake_sender = self
                 .wake_sender
@@ -609,15 +605,10 @@ impl EpochGate {
                 log::error!("wasm epoch ticker stopped: {error}");
             }
         }
-        InFlightCall {
-            in_flight_calls: self.in_flight_calls.clone(),
-        }
-    }
-}
-
-impl Drop for InFlightCall {
-    fn drop(&mut self) {
-        self.in_flight_calls.fetch_sub(1, Ordering::SeqCst);
+        let in_flight_calls = self.in_flight_calls.clone();
+        util::defer(move || {
+            in_flight_calls.fetch_sub(1, Ordering::SeqCst);
+        })
     }
 }
 

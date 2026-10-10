@@ -498,6 +498,11 @@ impl TextSystem {
         self.platform_text_system.cell_size()
     }
 
+    /// Whether text lays out on a terminal cell grid instead of in pixels.
+    pub fn renders_to_cell_grid(&self) -> bool {
+        self.cell_size().is_some()
+    }
+
     /// Get the number of font size units per 'em square',
     /// Per MDN: "an abstract square whose height is the intended distance between
     /// lines of type in the same type size"

@@ -165,7 +165,7 @@ fn write_root(session_paths: &SessionPaths, root: &Path) -> Result<()> {
         .with_context(|| format!("writing {}", session_paths.root.display()))
 }
 
-pub fn read_root(session_paths: &SessionPaths) -> Option<PathBuf> {
+fn read_root(session_paths: &SessionPaths) -> Option<PathBuf> {
     let bytes = fs::read(&session_paths.root).ok()?;
     Some(PathBuf::from(OsString::from_vec(bytes)))
 }

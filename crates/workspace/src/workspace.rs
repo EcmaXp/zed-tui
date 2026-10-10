@@ -9768,30 +9768,26 @@ impl Render for Workspace {
                                                 Some(e.event.position);
 
                                             let position = e.drag(cx).0;
-                                            let size = cell_layout::dock_size_for_pointer(
+                                            workspace.resize_dock_to_pointer(
                                                 position,
                                                 e.event.position,
-                                                workspace.bounds,
-                                                window.text_system().cell_size(),
+                                                window,
+                                                cx,
                                             );
-                                            workspace.resize_dock(position, size, window, cx);
-                                            workspace.serialize_workspace(window, cx);
                                         }
                                     },
                                 ))
                                 .when(
-                                    window.text_system().cell_size().is_some(),
+                                    window.text_system().renders_to_cell_grid(),
                                     |this| {
                                         this.on_drop(cx.listener(
                                             |workspace, dock: &DraggedDock, window, cx| {
-                                                let size = cell_layout::dock_size_for_pointer(
+                                                workspace.resize_dock_to_pointer(
                                                     dock.0,
                                                     window.mouse_position(),
-                                                    workspace.bounds,
-                                                    window.text_system().cell_size(),
+                                                    window,
+                                                    cx,
                                                 );
-                                                workspace.resize_dock(dock.0, size, window, cx);
-                                                workspace.serialize_workspace(window, cx);
                                             },
                                         ))
                                     },

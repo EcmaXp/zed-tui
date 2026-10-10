@@ -1371,7 +1371,7 @@ impl DiagnosticPopover {
         let keyboard_grace = Rc::clone(&self.keyboard_grace);
         let this = cx.entity().downgrade();
         let bounds_cell = self.last_bounds.clone();
-        let renders_to_cell_grid = window.text_system().cell_size().is_some();
+        let renders_to_cell_grid = window.text_system().renders_to_cell_grid();
         div()
             .id("diagnostic")
             .occlude()

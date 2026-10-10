@@ -221,7 +221,7 @@ impl CellSnapper {
         }
         let gap_closers = self.gaps_beside_rules(taffy_style, unsnapped, &content);
         let node = self.cell_node(taffy_style, unsnapped, &content, false);
-        let is_in_flow = taffy_style.position != taffy::style::Position::Absolute;
+        let is_in_flow = node.is_in_flow;
         let is_rule_margin = |margin: taffy::style::LengthPercentageAuto| {
             is_in_flow
                 && positive_length(margin).is_some_and(|margin| margin <= self.cell_size.width)

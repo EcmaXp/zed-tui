@@ -296,7 +296,7 @@ impl Render for ModalLayer {
         }
 
         let fade_out_background =
-            active_modal.modal.fade_out_background(cx) && cx.text_system().cell_size().is_none();
+            active_modal.modal.fade_out_background(cx) && !cx.text_system().renders_to_cell_grid();
         div()
             .absolute()
             .size_full()

@@ -173,21 +173,30 @@ replay() {
     save_state
 }
 
+remove_state_files() {
+    rm -f "$state" "$commit_list"
+    rmdir "$dir" 2>/dev/null || true
+}
+
 clear_state() {
     cd "$(dirname "$common")"
     if [[ -d "$worktree" ]]; then
         git worktree remove "$worktree" || echo "zed-tui-sync: left $worktree in place" >&2
     fi
-    rm -f "$state" "$commit_list"
-    rmdir "$dir" 2>/dev/null || true
+    remove_state_files
+}
+
+backup_ref() {
+    local name="$1" stamp="$2" commit="$3"
+    git update-ref -m "zed-tui-sync backup" "refs/backup/zed-tui-sync/$name/$stamp" "$commit" ""
+    echo "Backup: $name was $commit (refs/backup/zed-tui-sync/$name/$stamp)"
 }
 
 backup_branch() {
     local name="$1" stamp="$2" old
     old="$(git rev-parse --verify --quiet "refs/heads/$name" || true)"
     [[ -n "$old" ]] || return 0
-    git update-ref -m "zed-tui-sync backup" "refs/backup/zed-tui-sync/$name/$stamp" "$old" ""
-    echo "Backup: $name was $old (refs/backup/zed-tui-sync/$name/$stamp)"
+    backup_ref "$name" "$stamp" "$old"
 }
 
 move_branch() {
@@ -242,8 +251,7 @@ finish() {
         new_head="$(git -C "$worktree" rev-parse HEAD)"
     fi
     if [[ "$new_head" != "$old_head" ]]; then
-        git update-ref -m "zed-tui-sync backup" "refs/backup/zed-tui-sync/$branch/$stamp" "$old_head" ""
-        echo "Backup: $branch was $old_head (refs/backup/zed-tui-sync/$branch/$stamp)"
+        backup_ref "$branch" "$stamp" "$old_head"
         git update-ref -m "zed-tui-sync onto $onto_name" "refs/heads/$branch" "$new_head" "$old_head"
     fi
     git update-ref -m "zed-tui-sync" "refs/zed-tui-sync/base/$branch" "$onto_commit"
@@ -275,8 +283,7 @@ case "$action" in
             git -C "$worktree" cherry-pick --abort 2>/dev/null || true
             git worktree remove --force "$worktree"
         fi
-        rm -f "$state" "$commit_list"
-        rmdir "$dir" 2>/dev/null || true
+        remove_state_files
         echo "zed-tui-sync: aborted; every ref is unchanged"
         exit 0
         ;;

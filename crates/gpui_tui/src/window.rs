@@ -611,7 +611,7 @@ impl PlatformWindow for TuiWindow {
     fn draw(&self, scene: &Scene) {
         let mut state = self.0.state.borrow_mut();
         let state = &mut *state;
-        let (cols, rows) = crate::cells_for_size(state.bounds.size);
+        let (cols, rows) = cells_for_size(state.bounds.size);
         let outputs = state.outputs.clone();
         let icon_glyphs = outputs.icon_glyphs.borrow();
         let icon_glyph = |path: &str| icon_glyphs.as_ref().and_then(|glyphs| glyphs(path));

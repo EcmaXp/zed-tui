@@ -163,7 +163,7 @@ impl Render for ZedPromptRenderer {
                 .occlude()
                 .absolute()
                 .inset_0()
-                .when(window.text_system().cell_size().is_none(), |this| {
+                .when(!window.text_system().renders_to_cell_grid(), |this| {
                     this.bg(gpui::black().opacity(0.2))
                 })
                 .map(|this| match decorations {

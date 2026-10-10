@@ -2420,7 +2420,7 @@ fn is_font_size_keybinding(binding: &KeyBinding) -> bool {
 
 fn filter_disabled_bindings(bindings: Vec<KeyBinding>, cx: &App) -> Vec<KeyBinding> {
     let disable_ai = DisableAiSettings::get_global(cx).disable_ai;
-    let renders_to_cell_grid = cx.text_system().cell_size().is_some();
+    let renders_to_cell_grid = cx.text_system().renders_to_cell_grid();
     if !disable_ai && !renders_to_cell_grid {
         return bindings;
     }

@@ -412,6 +412,7 @@ struct Palette {
     defined_ansi: [Option<Rgb>; FIRST_PALETTE_SLOT as usize],
     ansi: HashMap<Rgb, u8>,
     uses: HashMap<Rgb, ColorUse>,
+    assignable_uses: u32,
     uses_changed: bool,
 }
 
@@ -437,29 +438,30 @@ impl Palette {
         }
         self.uses_changed = true;
         let reported_ansi = &self.reported_ansi;
-        self.uses
-            .entry(color)
-            .or_insert_with(|| {
-                let perceptual = Perceptual::of(color);
-                let mut nearest: Vec<(f32, u8)> = if is_gray(color) {
-                    Vec::new()
-                } else {
-                    COLORED_ANSI_SLOTS
-                        .into_iter()
-                        .filter_map(|slot| {
-                            let reported = reported_ansi[usize::from(slot)].as_ref()?;
-                            Some((perceptual.near_match_distance(reported)?, slot))
-                        })
-                        .collect()
-                };
-                nearest.sort_by(|a, b| a.0.total_cmp(&b.0));
-                ColorUse {
-                    count: 0,
-                    lightness: perceptual.lab.l,
-                    nearest_ansi_slots: nearest.into_iter().map(|(_, slot)| slot).collect(),
-                }
-            })
-            .count += 1;
+        let usage = self.uses.entry(color).or_insert_with(|| {
+            let perceptual = Perceptual::of(color);
+            let mut nearest: Vec<(f32, u8)> = if is_gray(color) {
+                Vec::new()
+            } else {
+                COLORED_ANSI_SLOTS
+                    .into_iter()
+                    .filter_map(|slot| {
+                        let reported = reported_ansi[usize::from(slot)].as_ref()?;
+                        Some((perceptual.near_match_distance(reported)?, slot))
+                    })
+                    .collect()
+            };
+            nearest.sort_by(|a, b| a.0.total_cmp(&b.0));
+            ColorUse {
+                count: 0,
+                lightness: perceptual.lab.l,
+                nearest_ansi_slots: nearest.into_iter().map(|(_, slot)| slot).collect(),
+            }
+        });
+        usage.count += 1;
+        if is_gray(color) || !usage.nearest_ansi_slots.is_empty() {
+            self.assignable_uses += 1;
+        }
     }
 
     fn best_ansi(&self) -> HashMap<Rgb, u8> {
@@ -504,7 +506,6 @@ impl Palette {
         if !std::mem::take(&mut self.uses_changed) {
             return Vec::new();
         }
-        let best = self.best_ansi();
         let uses_of = |assignment: &HashMap<Rgb, u8>| -> u32 {
             assignment
                 .keys()
@@ -512,9 +513,14 @@ impl Palette {
                 .map(|usage| usage.count)
                 .sum()
         };
-        let (current_uses, best_uses) = (uses_of(&self.ansi), uses_of(&best));
-        if best_uses < current_uses + current_uses / ANSI_SWITCH_GAIN_DIVISOR + MIN_ANSI_SWITCH_USES
-        {
+        let current_uses = uses_of(&self.ansi);
+        let required_uses =
+            current_uses + current_uses / ANSI_SWITCH_GAIN_DIVISOR + MIN_ANSI_SWITCH_USES;
+        if self.assignable_uses < required_uses {
+            return Vec::new();
+        }
+        let best = self.best_ansi();
+        if uses_of(&best) < required_uses {
             return Vec::new();
         }
         let moved: Vec<Rgb> = self
@@ -831,12 +837,6 @@ impl Pen {
         palette: &mut Palette,
         style: Style,
     ) -> io::Result<()> {
-        if !palette.enabled {
-            return match self.plan(&style, &mut SgrParam::of) {
-                Some(plan) => self.write_plan(output, &style, &plan, &mut SgrParam::of),
-                None => Ok(()),
-            };
-        }
         let mut color = |layer, color| palette.param(layer, color);
         let Some(plan) = self.plan(&style, &mut color) else {
             return Ok(());
@@ -1553,11 +1553,7 @@ impl<W: Write> Terminal<W> {
                     (SegmentKind::Erase(blank_run), 3 + decimal_len(blank_run))
                 };
                 let style = Style::blank(background);
-                let style_id = if identifies_styles {
-                    style_id_of(&mut scratch.styles, style)
-                } else {
-                    0
-                };
+                let style_id = style_id_of(&mut scratch.styles, style, identifies_styles);
                 scratch.segments.push(DrawSegment {
                     col,
                     style,
@@ -1624,11 +1620,7 @@ impl<W: Write> Terminal<W> {
                     *last_cursor_after = cursor_after;
                 }
                 _ => {
-                    let style_id = if identifies_styles {
-                        style_id_of(&mut scratch.styles, style)
-                    } else {
-                        0
-                    };
+                    let style_id = style_id_of(&mut scratch.styles, style, identifies_styles);
                     scratch.segments.push(DrawSegment {
                         col,
                         style,
@@ -1720,7 +1712,10 @@ struct DrawScratch {
     deferred: Vec<usize>,
 }
 
-fn style_id_of(styles: &mut Vec<Style>, style: Style) -> usize {
+fn style_id_of(styles: &mut Vec<Style>, style: Style, identifies_styles: bool) -> usize {
+    if !identifies_styles {
+        return 0;
+    }
     match styles.iter().position(|known| *known == style) {
         Some(style_id) => style_id,
         None => {
@@ -2381,13 +2376,7 @@ impl MoveThrottle {
 }
 
 fn is_move(input: &TermEvent) -> bool {
-    matches!(
-        input,
-        TermEvent::Mouse {
-            action: MouseAction::Moved | MouseAction::Drag(_),
-            ..
-        }
-    )
+    matches!(input, TermEvent::Mouse { action, .. } if action.is_move())
 }
 
 enum RenderEvent {

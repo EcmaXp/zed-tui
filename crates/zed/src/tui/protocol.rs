@@ -66,6 +66,12 @@ pub enum MouseAction {
     ScrollRight,
 }
 
+impl MouseAction {
+    pub fn is_move(self) -> bool {
+        matches!(self, Self::Moved | Self::Drag(_))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TermEvent {
     #[serde(rename = "k")]
@@ -150,11 +156,7 @@ fn is_superseded_by(event: &TermEvent, next: &TermEvent) -> bool {
                 modifiers: next_modifiers,
                 ..
             },
-        ) => {
-            matches!(action, MouseAction::Moved | MouseAction::Drag(_))
-                && action == next_action
-                && modifiers == next_modifiers
-        }
+        ) => action.is_move() && action == next_action && modifiers == next_modifiers,
         _ => false,
     }
 }
@@ -399,6 +401,7 @@ fn encode_cells(cells: &[Cell]) -> Vec<Span> {
     let mut foreground_open = false;
     for cell in cells {
         let is_continuation = cell.is_wide_continuation();
+        let cell_underline = underline_color(cell);
         if let Some(Span(fg, bg, attrs, text, underline)) = spans.last_mut() {
             if is_continuation {
                 text.push(CONTINUATION);
@@ -407,7 +410,7 @@ fn encode_cells(cells: &[Cell]) -> Vec<Span> {
             let is_blank = cell.is_plain_blank();
             if *bg == u32::from(cell.bg)
                 && *attrs == cell.attrs.bits()
-                && *underline == underline_color(cell)
+                && *underline == cell_underline
                 && (is_blank || foreground_open || *fg == u32::from(cell.fg))
             {
                 if foreground_open && !is_blank {
@@ -430,7 +433,7 @@ fn encode_cells(cells: &[Cell]) -> Vec<Span> {
             u32::from(cell.bg),
             attrs.bits(),
             text,
-            underline_color(cell),
+            cell_underline,
         ));
         foreground_open = cell.is_plain_blank() || is_continuation;
     }
@@ -459,6 +462,7 @@ fn decode_spans<'a>(
                 UnderlineColor::of(color(index))
             });
             let (fg, bg) = (color(*fg), color(*bg));
+            let span_attrs = CellAttrs::from_bits_truncate(*attrs);
             let mut chars = text.chars().peekable();
             let mut cluster = String::new();
             std::iter::from_fn(move || {
@@ -475,17 +479,9 @@ fn decode_spans<'a>(
                     while chars.next_if_eq(&CLUSTER_EXTEND).is_some() {
                         cluster.extend(chars.next());
                     }
-                    (
-                        Glyph::from_cluster(&cluster),
-                        CellAttrs::from_bits_truncate(*attrs),
-                        underline,
-                    )
+                    (Glyph::from_cluster(&cluster), span_attrs, underline)
                 } else {
-                    (
-                        Glyph::from_char(ch),
-                        CellAttrs::from_bits_truncate(*attrs),
-                        underline,
-                    )
+                    (Glyph::from_char(ch), span_attrs, underline)
                 };
                 Some(Cell {
                     glyph,

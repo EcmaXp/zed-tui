@@ -244,6 +244,12 @@ impl Cell {
         self.attrs.contains(CellAttrs::WIDE_CONTINUATION)
     }
 
+    pub(crate) fn clear_text(&mut self) {
+        self.glyph = ' '.into();
+        self.attrs = CellAttrs::empty();
+        self.underline = UnderlineColor::default();
+    }
+
     pub fn blank(bg: Rgb) -> Self {
         Self {
             glyph: Glyph::from_char(' '),
@@ -333,7 +339,7 @@ impl CellGrid {
         }
     }
 
-    pub fn index(&self, col: i32, row: i32) -> Option<usize> {
+    fn index(&self, col: i32, row: i32) -> Option<usize> {
         if col < 0 || row < 0 || col >= self.cols as i32 || row >= self.rows as i32 {
             return None;
         }

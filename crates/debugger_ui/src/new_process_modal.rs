@@ -575,7 +575,7 @@ impl Render for NewProcessModal {
                 key_context.add("RunModal");
                 key_context
             })
-            .when(window.text_system().cell_size().is_none(), |this| {
+            .when(!window.text_system().renders_to_cell_grid(), |this| {
                 this.size_full()
             })
             .w(rems(34.))

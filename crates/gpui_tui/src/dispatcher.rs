@@ -1,12 +1,13 @@
 use std::{
     collections::BinaryHeap,
-    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc},
+    sync::{Arc, mpsc},
     thread,
     time::{Duration, Instant},
 };
 
 use gpui::{PlatformDispatcher, Priority, RunnableVariant, profiler};
 use gpui_util::{ResultExt as _, post_inc};
+use parking_lot::{Condvar, Mutex};
 
 const MIN_THREADS: usize = 2;
 
@@ -64,16 +65,12 @@ impl<T> TimerQueue<T> {
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, TimerQueueState<T>> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
     fn push(&self, duration: Duration, payload: T) {
         self.push_at(Instant::now() + duration, payload);
     }
 
     fn push_at(&self, due: Instant, payload: T) {
-        let mut state = self.lock();
+        let mut state = self.state.lock();
         let sequence = post_inc(&mut state.next_sequence);
         state.heap.push(TimerEntry {
             due,
@@ -91,27 +88,18 @@ impl<T> TimerQueue<T> {
     }
 
     fn pop_due(&self) -> T {
-        let mut state = self.lock();
+        let mut state = self.state.lock();
         loop {
-            let now = Instant::now();
             match state.heap.peek().map(|entry| entry.due) {
-                Some(due) if due <= now => {
+                Some(due) if due <= Instant::now() => {
                     if let Some(entry) = state.heap.pop() {
                         return entry.payload;
                     }
                 }
                 Some(due) => {
-                    state = match self.condvar.wait_timeout(state, due - now) {
-                        Ok((state, _)) => state,
-                        Err(poisoned) => poisoned.into_inner().0,
-                    };
+                    self.condvar.wait_until(&mut state, due);
                 }
-                None => {
-                    state = self
-                        .condvar
-                        .wait(state)
-                        .unwrap_or_else(PoisonError::into_inner);
-                }
+                None => self.condvar.wait(&mut state),
             }
         }
     }

@@ -984,15 +984,15 @@ fn resolve_doc_test(
 
     Some(ResolvedRunnable {
         run_range: opening.clone(),
-        extra_captures: SmallVec::from_vec(vec![
+        extra_captures: smallvec::smallvec![
             ("_comment_content".to_string(), opening_content.to_string()),
             ("_end_code_block".to_string(), closing.to_string()),
             (
                 "_end_comment_content".to_string(),
                 closing_content.to_string(),
             ),
-            ("_start".to_string(), opening_text.clone()),
-        ]),
+            ("_start".to_string(), opening_text),
+        ],
         full_range: Some(opening.start..item.end),
     })
 }
@@ -1065,7 +1065,7 @@ fn resolve_test(
 
     Some(ResolvedRunnable {
         run_range: function_name,
-        extra_captures: SmallVec::from_vec(vec![
+        extra_captures: smallvec::smallvec![
             (
                 "_attribute".to_string(),
                 buffer
@@ -1073,7 +1073,7 @@ fn resolve_test(
                     .collect(),
             ),
             ("_start".to_string(), attribute_text),
-        ]),
+        ],
         full_range: Some(attribute_item_range.start..function.end),
     })
 }

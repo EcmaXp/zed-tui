@@ -448,9 +448,7 @@ impl Rasterizer<'_> {
             };
             for cell in cells {
                 if clears_text {
-                    cell.glyph = ' '.into();
-                    cell.attrs = CellAttrs::empty();
-                    cell.underline = UnderlineColor::default();
+                    cell.clear_text();
                 }
                 cell.bg = match last_blend {
                     Some((under, blended)) if under == cell.bg => blended,
@@ -477,7 +475,7 @@ impl Rasterizer<'_> {
             self.push_caret(col, row, CursorShape::Bar, rgba, covered_cell, drew_bar);
             return;
         }
-        let col = (center.x / CELL_WIDTH).floor() as i32;
+        let (col, _) = cell_of(center.x, center.y);
         for row in rows {
             self.divider_char(col, row, rgba);
         }
@@ -494,7 +492,7 @@ impl Rasterizer<'_> {
     }
 
     fn horizontal_rule(&mut self, rect: &Bounds<f32>, color: Hsla) {
-        let row = (rect.center().y / CELL_HEIGHT).floor() as i32;
+        let (_, row) = cell_of(rect.center().x, rect.center().y);
         let rgba = color.to_rgb();
         let cols = covered_cols(rect);
         if cols.len() <= MAX_GLYPH_COLS {
@@ -766,25 +764,42 @@ impl Rasterizer<'_> {
             CellAttrs::UNDERLINE
         };
         let color = underline.color.to_rgb();
+        let mut last_underline: Option<(Rgb, UnderlineColor)> = None;
         for col in covered_cols(&rect) {
             if let Some(cell) = self.grid.cell_mut(col, row) {
                 cell.attrs.remove(CellAttrs::CURLY_UNDERLINE);
                 cell.attrs.insert(style);
-                cell.underline = UnderlineColor::of(cell.bg.blend_rgba(color));
+                cell.underline = match last_underline {
+                    Some((bg, known)) if bg == cell.bg => known,
+                    _ => {
+                        let known = UnderlineColor::of(cell.bg.blend_rgba(color));
+                        last_underline = Some((cell.bg, known));
+                        known
+                    }
+                };
             }
         }
     }
 
     fn underline_cells(&mut self, row: i32, cols: Range<i32>, color: Rgba) {
+        let mut last_underline: Option<(Rgb, Rgb, UnderlineColor)> = None;
         for col in cols {
             if let Some(cell) = self.grid.cell_mut(col, row) {
-                let underline = cell.bg.blend_rgba(color);
+                let (underline, known) = match last_underline {
+                    Some((bg, underline, known)) if bg == cell.bg => (underline, known),
+                    _ => {
+                        let underline = cell.bg.blend_rgba(color);
+                        let known = UnderlineColor::of(underline);
+                        last_underline = Some((cell.bg, underline, known));
+                        (underline, known)
+                    }
+                };
                 if cell.glyph == ' ' {
                     cell.fg = underline;
                 }
                 cell.attrs.remove(CellAttrs::CURLY_UNDERLINE);
                 cell.attrs.insert(CellAttrs::UNDERLINE);
-                cell.underline = UnderlineColor::of(underline);
+                cell.underline = known;
             }
         }
     }
@@ -844,9 +859,7 @@ impl Rasterizer<'_> {
         self.grid.split_wide_char_at(col, row);
         self.grid.split_wide_char_at(col + 1, row);
         if let Some(cell) = self.grid.cell_mut(col, row) {
-            cell.glyph = ' '.into();
-            cell.attrs = CellAttrs::empty();
-            cell.underline = UnderlineColor::default();
+            cell.clear_text();
         }
     }
 

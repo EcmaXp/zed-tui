@@ -225,7 +225,7 @@ impl RenderOnce for KeybindingHint {
 
         let kb_size = size - px(2.0);
 
-        let is_cell_grid = window.text_system().cell_size().is_some();
+        let renders_to_cell_grid = window.text_system().renders_to_cell_grid();
 
         let mut base = h_flex();
 
@@ -240,7 +240,9 @@ impl RenderOnce for KeybindingHint {
             .child(
                 h_flex()
                     .rounded_sm()
-                    .when(!is_cell_grid, |this| this.px_0p5().mr_0p5().border_1())
+                    .when(!renders_to_cell_grid, |this| {
+                        this.px_0p5().mr_0p5().border_1()
+                    })
                     .border_color(border_color)
                     .bg(bg_color)
                     .shadow(vec![BoxShadow::new(px(0.), px(1.), shadow_color)])

@@ -121,8 +121,13 @@ impl TaffyLayoutEngine {
         let measure = Box::new(measure) as Box<MeasureFn>;
         #[cfg(feature = "stacker")]
         let measure = StackSafe::new(measure);
-        if let Some(cells) = &mut self.cell_snapper {
-            return cells.request_measured_layout(&mut self.taffy, taffy_style, &style, measure);
+        if let Some(cell_snapper) = &mut self.cell_snapper {
+            return cell_snapper.request_measured_layout(
+                &mut self.taffy,
+                taffy_style,
+                &style,
+                measure,
+            );
         }
 
         self.taffy
@@ -403,7 +408,9 @@ impl TaffyLayoutEngine {
             absolute_far.map(round_half_toward_zero),
         );
         let snapped_bounds = match &self.cell_snapper {
-            Some(cells) => cells.snap_bounds(id, absolute_outer_origin, absolute_far, layout_size),
+            Some(cell_snapper) => {
+                cell_snapper.snap_bounds(id, absolute_outer_origin, absolute_far, layout_size)
+            }
             None => snapped_bounds,
         };
 

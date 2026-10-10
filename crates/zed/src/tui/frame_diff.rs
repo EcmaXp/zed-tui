@@ -65,10 +65,7 @@ impl GridScroll {
         self.copy(grid);
         let columns = self.columns.clone().unwrap_or(0..cols);
         for row in self.exposed_rows() {
-            if let Some(cells) = grid
-                .cells
-                .get_mut(row * cols + columns.start..row * cols + columns.end)
-            {
+            if let Some(cells) = grid.row_mut(row as u16).get_mut(columns.clone()) {
                 cells.fill(fill);
             }
         }
@@ -471,12 +468,21 @@ pub fn find_row_shift(shown: &[Cell], wanted: &[Cell]) -> Option<RowShift> {
         return None;
     }
     let weights = redraw_weights(wanted);
+    let matches_now: Vec<bool> = (0..cols)
+        .map(|col| shown[col].looks_like(&wanted[col]))
+        .collect();
+    let largest_gain: isize = (start..cols)
+        .filter(|&col| !matches_now[col])
+        .map(|col| weights[col])
+        .sum();
+    if largest_gain <= ROW_SHIFT_OVERHEAD {
+        return None;
+    }
     let gain = |shifted: &dyn Fn(usize) -> Option<Cell>| {
         (start..cols)
             .map(|col| {
                 let matches_after = shifted(col).is_some_and(|cell| cell.looks_like(&wanted[col]));
-                let matches_now = shown[col].looks_like(&wanted[col]);
-                weights[col] * (matches_after as isize - matches_now as isize)
+                weights[col] * (matches_after as isize - matches_now[col] as isize)
             })
             .sum::<isize>()
     };

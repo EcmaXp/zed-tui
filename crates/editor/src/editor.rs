@@ -2046,7 +2046,7 @@ impl Editor {
             merge_adjacent: true,
             ..FoldPlaceholder::default()
         };
-        let renders_to_cell_grid = window.text_system().cell_size().is_some();
+        let renders_to_cell_grid = window.text_system().renders_to_cell_grid();
         let file_header_height = if renders_to_cell_grid {
             1
         } else {

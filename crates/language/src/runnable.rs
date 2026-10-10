@@ -86,9 +86,12 @@ pub(crate) fn runnable_ranges(
                 return Some(&config.query);
             }
             Some(config.query_for_text(|text| {
-                *text_presence
-                    .entry(text.to_string())
-                    .or_insert_with(|| rope_contains(buffer.as_rope(), text))
+                if let Some(present) = text_presence.get(text) {
+                    return *present;
+                }
+                let present = rope_contains(buffer.as_rope(), text);
+                text_presence.insert(text.to_string(), present);
+                present
             }))
         },
     );
@@ -167,7 +170,7 @@ fn rope_contains(rope: &Rope, needle: &str) -> bool {
             }
             tail.truncate(tail_len);
         }
-        tail.extend_from_slice(chunk_bytes);
+        tail.extend_from_slice(&chunk_bytes[chunk_bytes.len().saturating_sub(overlap)..]);
         let keep_from = tail.len().saturating_sub(overlap);
         tail.drain(..keep_from);
     }
