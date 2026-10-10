@@ -1,9 +1,9 @@
 use std::{
     io::{self, BufReader, Write},
     ops::Range,
-    os::unix::net::UnixStream,
+    os::{fd::RawFd, unix::net::UnixStream},
     path::Path,
-    sync::{Arc, mpsc},
+    sync::{Arc, OnceLock, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -28,6 +28,7 @@ const DEVICE_ATTRIBUTES_QUERY: &str = "\x1b[c";
 const MAX_VERSION_REPLY: usize = 64;
 const GHOSTTY_VERSION_PREFIXES: [&[u8]; 2] = [b"ghostty", b"libghostty"];
 const QUERY_TIMEOUT: Duration = Duration::from_millis(500);
+const HANGUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const RESIZE_FRAME_WAIT: Duration = Duration::from_millis(100);
 const ATTRIBUTE_CODES: [(CellAttrs, &str); 2] = [(CellAttrs::BOLD, "1"), (CellAttrs::ITALIC, "3")];
 
@@ -110,6 +111,7 @@ impl TerminalGuard {
         terminal::enable_raw_mode().context("enabling raw mode")?;
         let mut guard = Self(TerminalSetup::default());
         guard.0.run(&mut io::stdout(), query_terminal)?;
+        restore_on_signal(&guard.0);
         Ok(guard)
     }
 }
@@ -175,6 +177,44 @@ impl vte::Perform for QueryReplies {
             _ => {}
         }
     }
+}
+
+static RESTORE_ON_SIGNAL: OnceLock<Vec<u8>> = OnceLock::new();
+
+fn restore_on_signal(setup: &TerminalSetup) {
+    let restore = signal_restore(setup.features.ghostty);
+    if restore.is_empty() || RESTORE_ON_SIGNAL.set(restore).is_err() {
+        return;
+    }
+    for signal in [libc::SIGHUP, libc::SIGINT, libc::SIGTERM] {
+        unsafe {
+            libc::signal(
+                signal,
+                write_restore_and_reraise as extern "C" fn(libc::c_int) as libc::sighandler_t,
+            );
+        }
+    }
+}
+
+extern "C" fn write_restore_and_reraise(signal: libc::c_int) {
+    if let Some(restore) = RESTORE_ON_SIGNAL.get() {
+        unsafe {
+            libc::write(libc::STDOUT_FILENO, restore.as_ptr().cast(), restore.len());
+        }
+    }
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+        libc::raise(signal);
+    }
+}
+
+fn signal_restore(ghostty: bool) -> Vec<u8> {
+    let mut restore = Vec::new();
+    if ghostty {
+        restore.extend_from_slice(POINTER_RESET);
+    }
+    restore.extend_from_slice(CURSOR_SHAPE_RESET);
+    restore
 }
 
 #[derive(Clone, Copy)]
@@ -692,6 +732,18 @@ pub fn attach(socket: &Path) -> Result<Exit> {
         }
     })?;
     thread::Builder::new()
+        .name("Terminal hangup".to_owned())
+        .spawn({
+            let event_sender = event_sender.clone();
+            move || {
+                if wait_for_hangup(libc::STDIN_FILENO) {
+                    event_sender
+                        .send(ClientEvent::Exit(Exit::Disconnected))
+                        .ok();
+                }
+            }
+        })?;
+    thread::Builder::new()
         .name("Terminal input".to_owned())
         .spawn(move || {
             while let Ok(event) = event::read() {
@@ -752,6 +804,26 @@ pub fn attach(socket: &Path) -> Result<Exit> {
         }
     }
     Ok(Exit::Disconnected)
+}
+
+fn wait_for_hangup(fd: RawFd) -> bool {
+    loop {
+        let mut poll_fd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut poll_fd, 1, -1) } < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return false;
+        }
+        if poll_fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            return true;
+        }
+        thread::sleep(HANGUP_POLL_INTERVAL);
+    }
 }
 
 enum RenderEvent {
@@ -1297,7 +1369,7 @@ mod tests {
     }
 
     #[test]
-    fn ghostty_pointer_is_reset_on_exit() {
+    fn ghostty_pointer_is_reset_on_exit_and_on_signal() {
         let contains_reset = |bytes: &[u8]| {
             bytes
                 .windows(POINTER_RESET.len())
@@ -1316,6 +1388,8 @@ mod tests {
             let mut undo = Vec::new();
             setup.undo(&mut undo);
             assert_eq!(contains_reset(&undo), ghostty, "{undo:?}");
+            let restore = signal_restore(setup.features.ghostty);
+            assert_eq!(contains_reset(&restore), ghostty, "{restore:?}");
         }
     }
 
@@ -1360,6 +1434,29 @@ mod tests {
                 .ghostty
         );
         assert!(!parse_replies(&[b"\x1b[?62;22c"]).features.ghostty);
+    }
+
+    #[test]
+    fn closing_the_terminal_is_noticed_even_with_input_pending() {
+        let (mut master, mut slave) = (0, 0);
+        let opened = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(opened, 0, "{}", io::Error::last_os_error());
+        unsafe { libc::write(master, b"x".as_ptr().cast(), 1) };
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || sender.send(wait_for_hangup(slave)).ok());
+        assert!(receiver.recv_timeout(Duration::from_millis(300)).is_err());
+
+        unsafe { libc::close(master) };
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(5)), Ok(true));
+        unsafe { libc::close(slave) };
     }
 
     #[test]
@@ -1592,7 +1689,7 @@ mod tests {
     }
 
     #[test]
-    fn the_cursor_shape_is_reset_on_exit() {
+    fn the_cursor_shape_is_reset_on_exit_and_on_signal() {
         let contains_reset = |bytes: &[u8]| {
             bytes
                 .windows(CURSOR_SHAPE_RESET.len())
@@ -1607,6 +1704,8 @@ mod tests {
         let mut undo = Vec::new();
         setup.undo(&mut undo);
         assert!(contains_reset(&undo), "{undo:?}");
+        let restore = signal_restore(setup.features.ghostty);
+        assert!(contains_reset(&restore), "{restore:?}");
     }
 
     #[derive(Clone, Default)]
