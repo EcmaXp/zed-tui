@@ -21,6 +21,9 @@ use crate::tui::protocol::{
 const PUSH_TITLE: &str = "\x1b[22;0t";
 const POP_TITLE: &str = "\x1b[23;0t";
 const CURSOR_SHAPE_RESET: &[u8] = b"\x1b[0 q";
+const KEYBOARD_FLAGS_QUERY: &str = "\x1b[?u";
+const DEVICE_ATTRIBUTES_QUERY: &str = "\x1b[c";
+const QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 const RESIZE_FRAME_WAIT: Duration = Duration::from_millis(100);
 const ATTRIBUTE_CODES: [(CellAttrs, &str); 2] = [(CellAttrs::BOLD, "1"), (CellAttrs::ITALIC, "3")];
 
@@ -34,10 +37,15 @@ pub enum Exit {
 #[derive(Default)]
 struct TerminalSetup {
     entered: bool,
+    keyboard_enhanced: bool,
 }
 
 impl TerminalSetup {
-    fn run(&mut self, output: &mut impl Write) -> io::Result<()> {
+    fn run<W: Write>(
+        &mut self,
+        output: &mut W,
+        query: impl FnOnce(&mut W) -> io::Result<QueryReplies>,
+    ) -> io::Result<()> {
         write!(output, "{PUSH_TITLE}")?;
         self.entered = true;
         crossterm::execute!(
@@ -47,10 +55,23 @@ impl TerminalSetup {
             event::EnableMouseCapture,
             event::EnableBracketedPaste,
         )?;
+        let replies = query(output)?;
+        if replies.keyboard_flags {
+            crossterm::execute!(
+                output,
+                event::PushKeyboardEnhancementFlags(
+                    event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                )
+            )?;
+            self.keyboard_enhanced = true;
+        }
         Ok(())
     }
 
     fn undo(&self, output: &mut impl Write) {
+        if self.keyboard_enhanced {
+            crossterm::execute!(output, event::PopKeyboardEnhancementFlags).ok();
+        }
         if self.entered {
             output.write_all(CURSOR_SHAPE_RESET).ok();
             crossterm::execute!(
@@ -74,7 +95,7 @@ impl TerminalGuard {
     fn enter() -> Result<Self> {
         terminal::enable_raw_mode().context("enabling raw mode")?;
         let mut guard = Self(TerminalSetup::default());
-        guard.0.run(&mut io::stdout())?;
+        guard.0.run(&mut io::stdout(), query_terminal)?;
         Ok(guard)
     }
 }
@@ -83,6 +104,39 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         self.0.undo(&mut io::stdout());
         terminal::disable_raw_mode().ok();
+    }
+}
+
+fn query_terminal(stdout: &mut impl Write) -> io::Result<QueryReplies> {
+    let mut query = KEYBOARD_FLAGS_QUERY.to_owned();
+    query.push_str(DEVICE_ATTRIBUTES_QUERY);
+    stdout.write_all(query.as_bytes())?;
+    stdout.flush()?;
+    Ok(read_query_reply(QUERY_TIMEOUT))
+}
+
+#[derive(Default)]
+struct QueryReplies {
+    device_attributes: bool,
+    keyboard_flags: bool,
+}
+
+impl vte::Perform for QueryReplies {
+    fn csi_dispatch(
+        &mut self,
+        _params: &vte::Params,
+        intermediates: &[u8],
+        ignore: bool,
+        action: char,
+    ) {
+        if ignore {
+            return;
+        }
+        match (intermediates, action) {
+            (b"?", 'c') => self.device_attributes = true,
+            (b"?", 'u') => self.keyboard_flags = true,
+            _ => {}
+        }
     }
 }
 
@@ -99,6 +153,37 @@ impl Layer {
             Self::Background => "48",
         }
     }
+}
+
+fn read_query_reply(timeout: Duration) -> QueryReplies {
+    let deadline = Instant::now() + timeout;
+    let mut parser = vte::Parser::new();
+    let mut replies = QueryReplies::default();
+    while !replies.device_attributes {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let mut poll_fd = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let timeout_ms = remaining.as_millis().clamp(1, i32::MAX as u128) as libc::c_int;
+        if unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) } <= 0 {
+            break;
+        }
+        let mut buffer = [0u8; 4096];
+        let count =
+            unsafe { libc::read(libc::STDIN_FILENO, buffer.as_mut_ptr().cast(), buffer.len()) };
+        match usize::try_from(count) {
+            Ok(count) if count > 0 => {
+                parser.advance(&mut replies, buffer.get(..count).unwrap_or_default())
+            }
+            _ => break,
+        }
+    }
+    replies
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -826,6 +911,15 @@ mod tests {
         mutate(grid, random, 0);
     }
 
+    fn parse_replies(chunks: &[&[u8]]) -> QueryReplies {
+        let mut parser = vte::Parser::new();
+        let mut replies = QueryReplies::default();
+        for chunk in chunks {
+            parser.advance(&mut replies, chunk);
+        }
+        replies
+    }
+
     struct FailingWriter {
         written: Vec<u8>,
         flushes: usize,
@@ -857,27 +951,50 @@ mod tests {
         }
     }
 
-    fn undo_after_setup(fail_on_flush: usize) -> (io::Result<()>, String) {
+    fn undo_after_setup(
+        fail_on_flush: usize,
+        query: impl FnOnce(&mut FailingWriter) -> io::Result<QueryReplies>,
+    ) -> (io::Result<()>, String) {
         let mut setup = TerminalSetup::default();
-        let result = setup.run(&mut FailingWriter::failing_on_flush(fail_on_flush));
+        let result = setup.run(&mut FailingWriter::failing_on_flush(fail_on_flush), query);
         let mut undo = Vec::new();
         setup.undo(&mut undo);
         (result, String::from_utf8(undo).unwrap())
     }
 
     const LEAVE_ALTERNATE_SCREEN: &str = "\x1b[?1049l";
+    const POP_KEYBOARD_FLAGS: &str = "\x1b[<1u";
+
+    fn keyboard_replies(_: &mut FailingWriter) -> io::Result<QueryReplies> {
+        Ok(QueryReplies {
+            keyboard_flags: true,
+            ..QueryReplies::default()
+        })
+    }
 
     #[test]
     fn a_failed_startup_undoes_only_the_steps_it_started() {
-        let (result, undo) = undo_after_setup(1);
+        let (result, undo) = undo_after_setup(1, keyboard_replies);
         assert!(result.is_err());
         assert!(undo.contains(LEAVE_ALTERNATE_SCREEN) && undo.ends_with(POP_TITLE));
+        assert!(!undo.contains(POP_KEYBOARD_FLAGS));
+
+        let (result, undo) = undo_after_setup(0, |_| Err(io::ErrorKind::TimedOut.into()));
+        assert!(result.is_err());
+        assert!(undo.contains(LEAVE_ALTERNATE_SCREEN) && undo.ends_with(POP_TITLE));
+        assert!(!undo.contains(POP_KEYBOARD_FLAGS));
+
+        let (result, undo) = undo_after_setup(2, keyboard_replies);
+        assert!(result.is_err());
+        assert!(undo.contains(LEAVE_ALTERNATE_SCREEN));
+        assert!(!undo.contains(POP_KEYBOARD_FLAGS));
     }
 
     #[test]
     fn a_completed_startup_restores_every_step() {
-        let (result, undo) = undo_after_setup(0);
+        let (result, undo) = undo_after_setup(0, keyboard_replies);
         assert!(result.is_ok());
+        assert!(undo.contains(POP_KEYBOARD_FLAGS));
         assert!(undo.contains(LEAVE_ALTERNATE_SCREEN) && undo.ends_with(POP_TITLE));
     }
 
@@ -888,6 +1005,19 @@ mod tests {
             .apply(&ServerMessage::Clipboard("hi".into()))
             .unwrap();
         assert_eq!(renderer.terminal.output, b"\x1b]52;c;aGk=\x1b\\");
+    }
+
+    #[test]
+    fn keyboard_flags_come_from_the_flags_report() {
+        assert!(parse_replies(&[b"\x1b[?0u\x1b[?62;22c"]).keyboard_flags);
+        assert!(parse_replies(&[b"\x1b[?69;2$y\x1b[?15u\x1b[?62c"]).keyboard_flags);
+        assert!(!parse_replies(&[b"\x1b[?62;22c"]).keyboard_flags);
+    }
+
+    #[test]
+    fn device_attributes_end_the_query_reply() {
+        assert!(parse_replies(&[b"\x1b[?62;22c"]).device_attributes);
+        assert!(!parse_replies(&[b"\x1b[?62;22"]).device_attributes);
     }
 
     #[test]
@@ -1036,7 +1166,11 @@ mod tests {
                 .any(|window| window == CURSOR_SHAPE_RESET)
         };
         let mut setup = TerminalSetup::default();
-        setup.run(&mut FailingWriter::failing_on_flush(0)).unwrap();
+        setup
+            .run(&mut FailingWriter::failing_on_flush(0), |_| {
+                Ok(QueryReplies::default())
+            })
+            .unwrap();
         let mut undo = Vec::new();
         setup.undo(&mut undo);
         assert!(contains_reset(&undo), "{undo:?}");

@@ -240,6 +240,8 @@ ciborium.workspace = true
 command_palette_hooks.workspace = true
 crossterm = { workspace = true, features = ["osc52"] }
 gpui_tui.workspace = true
+libc.workspace = true
+vte.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 etw_tracing.workspace = true
