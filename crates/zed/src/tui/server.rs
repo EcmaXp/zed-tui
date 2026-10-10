@@ -41,6 +41,7 @@ use crate::tui::{
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(30);
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_SESSION_BASENAME: usize = 32;
+pub const SESSION_ENV: &str = "ZED_TUI_SESSION";
 pub const ALREADY_RUNNING_EXIT_CODE: i32 = 3;
 
 #[derive(Debug)]
@@ -298,6 +299,7 @@ enum ServerEvent {
     Resized { id: u64, cols: u16, rows: u16 },
     Disconnected { id: u64 },
     Input(TermEvent),
+    Open(Vec<PathBuf>),
     Kill,
 }
 
@@ -396,6 +398,19 @@ pub fn start_session(
     Ok((session, started))
 }
 
+fn file_urls(paths: &[PathBuf]) -> Vec<String> {
+    paths
+        .iter()
+        .filter_map(|path| match url::Url::from_file_path(path) {
+            Ok(url) => Some(url.to_string()),
+            Err(()) => {
+                log::error!("cannot open {}: not an absolute path", path.display());
+                None
+            }
+        })
+        .collect()
+}
+
 async fn handle_events(
     platform: Rc<TuiPlatform>,
     hub: Arc<ClientHub>,
@@ -439,6 +454,7 @@ fn handle_event(
                 }
             }
         }
+        ServerEvent::Open(paths) => platform.open_urls(file_urls(&paths)),
         ServerEvent::Kill => {
             cx.update(|cx| cx.quit());
         }
@@ -518,6 +534,10 @@ fn serve_client(
             events.unbounded_send(ServerEvent::Kill).log_err();
             return Ok(());
         }
+        ClientMessage::Open { paths } => {
+            events.unbounded_send(ServerEvent::Open(paths)).log_err();
+            return Ok(());
+        }
         other => bail!("expected a hello message, got {other:?}"),
     };
 
@@ -577,6 +597,7 @@ fn read_from_client(
             }
             Ok(ClientMessage::Resize { cols, rows }) => ServerEvent::Resized { id, cols, rows },
             Ok(ClientMessage::Kill) => ServerEvent::Kill,
+            Ok(ClientMessage::Open { paths }) => ServerEvent::Open(paths),
             Ok(ClientMessage::Detach) => return true,
             Ok(ClientMessage::Hello { .. }) => continue,
             Err(error) => {
@@ -629,7 +650,8 @@ pub fn spawn_daemon(
         .arg("--root")
         .arg(root)
         .arg(root)
-        .args(paths_to_open);
+        .args(paths_to_open)
+        .env(SESSION_ENV, &session_paths.name);
     util::set_pre_exec_to_start_new_session(&mut command);
     let mut child = smol::process::Command::from(command)
         .stdin(smol::process::Stdio::null())
@@ -661,6 +683,10 @@ pub fn spawn_daemon(
 
 pub fn kill(session_paths: &SessionPaths) -> Result<()> {
     send(session_paths, &ClientMessage::Kill)
+}
+
+pub fn open(session_paths: &SessionPaths, paths: Vec<PathBuf>) -> Result<()> {
+    send(session_paths, &ClientMessage::Open { paths })
 }
 
 fn send(session_paths: &SessionPaths, message: &ClientMessage) -> Result<()> {
@@ -770,6 +796,23 @@ mod tests {
         drop(client_side);
         serve_client(server_side, &hub, &event_sender).unwrap();
         assert!(matches!(next_event(&mut events), ServerEvent::Kill));
+    }
+
+    #[test]
+    fn paths_sent_to_a_running_session_are_opened() {
+        let hub = Arc::new(ClientHub::default());
+        let (event_sender, mut events) = unbounded();
+        let (server_side, mut client_side) = UnixStream::pair().unwrap();
+        let paths = vec![PathBuf::from("/tmp/a.rs")];
+        write_message(
+            &mut client_side,
+            &ClientMessage::Open {
+                paths: paths.clone(),
+            },
+        )
+        .unwrap();
+        serve_client(server_side, &hub, &event_sender).unwrap();
+        assert!(matches!(next_event(&mut events), ServerEvent::Open(opened) if opened == paths));
     }
 
     #[test]
@@ -888,6 +931,30 @@ mod tests {
         hub.send_last_frame_to(id, (3, 1));
         let message: ServerMessage = read_message(&mut client_reader).unwrap();
         assert_eq!(frame_size(&message), Some((3, 1)));
+    }
+
+    #[gpui::test]
+    fn opened_paths_keep_url_metacharacters(cx: &mut gpui::TestAppContext) {
+        let paths = [
+            "/tmp/x/percent%41.txt",
+            "/tmp/x/100%.txt",
+            "/tmp/x/with space.txt",
+            "/tmp/x/hash#1.txt",
+            "/tmp/x/what?.txt",
+            "/tmp/x/한글.txt",
+        ];
+        let urls = file_urls(&paths.map(PathBuf::from));
+        let request = cx.update(|cx| {
+            crate::zed::OpenRequest::parse(
+                crate::zed::RawOpenRequest {
+                    urls,
+                    ..Default::default()
+                },
+                cx,
+            )
+            .unwrap()
+        });
+        assert_eq!(request.open_paths, paths);
     }
 
     fn canonical(path: &Path) -> PathBuf {

@@ -1,4 +1,7 @@
-use std::io::{Read, Write};
+use std::{
+    io::{Read, Write},
+    path::PathBuf,
+};
 
 use anyhow::{Context as _, Result, bail};
 use gpui::{CursorStyle, Modifiers};
@@ -74,6 +77,7 @@ pub enum ClientMessage {
     Resize { cols: u16, rows: u16 },
     Detach,
     Kill,
+    Open { paths: Vec<PathBuf> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

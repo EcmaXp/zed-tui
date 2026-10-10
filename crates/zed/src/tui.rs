@@ -279,6 +279,8 @@ mod unix {
             .collect::<Vec<_>>();
         let first_target = targets.first().cloned().unwrap_or(current_dir);
         let session = resolve(cli.session.as_deref(), &first_target)?;
+        let inside_session =
+            std::env::var_os(server::SESSION_ENV).is_some_and(|name| name == *session.paths.name);
 
         if !server::is_running(&session.paths) {
             let extra_targets = targets
@@ -292,6 +294,12 @@ mod unix {
                 &extra_targets,
                 cli.user_data_dir.as_deref(),
             )?;
+        } else if !targets.is_empty() {
+            server::open(&session.paths, targets)?;
+        }
+
+        if inside_session {
+            return Ok(Outcome::Exit(0));
         }
         attach(&session.paths)
     }
