@@ -14,7 +14,7 @@ use gpui::{
     DisplayId, DummyKeyboardMapper, ForegroundExecutor, Keymap, Menu, MenuItem, PathPromptOptions,
     Pixels, Platform, PlatformDisplay, PlatformInput, PlatformKeyboardLayout,
     PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, Point, RunnableVariant, Task,
-    ThermalState, WindowAppearance, WindowParams,
+    ThermalState, WindowAppearance, WindowKind, WindowParams,
 };
 use gpui_util::ResultExt as _;
 use uuid::Uuid;
@@ -31,8 +31,14 @@ use crate::{
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Default)]
+pub(crate) struct FrameOutput {
+    pub(crate) sink: Option<Box<dyn FnMut(CellGrid)>>,
+    pub(crate) last_delivered: Option<CellGrid>,
+}
+
+#[derive(Default)]
 pub(crate) struct PlatformOutputs {
-    pub(crate) frame_sink: RefCell<Option<Box<dyn FnMut(CellGrid)>>>,
+    pub(crate) frame: RefCell<FrameOutput>,
     pub(crate) title: RefCell<Option<Box<dyn FnMut(&str)>>>,
     pub(crate) icon_glyphs: RefCell<Option<Box<dyn Fn(&str) -> Option<char>>>>,
     pub(crate) canvas: Cell<Rgb>,
@@ -131,6 +137,19 @@ impl WindowRegistry {
     fn open_windows(&self) -> Vec<TuiWindowHandle> {
         self.windows.borrow().clone()
     }
+
+    fn window_under_floating(&self) -> Option<TuiWindowHandle> {
+        let focused = self.focused_window()?;
+        if !focused.is_floating() {
+            return None;
+        }
+        self.windows
+            .borrow()
+            .iter()
+            .rev()
+            .find(|window| !window.is_floating())
+            .cloned()
+    }
 }
 
 #[derive(Default)]
@@ -193,7 +212,10 @@ impl TuiPlatform {
     }
 
     pub fn set_frame_sink(&self, sink: impl FnMut(CellGrid) + 'static) {
-        *self.outputs.frame_sink.borrow_mut() = Some(Box::new(sink));
+        *self.outputs.frame.borrow_mut() = FrameOutput {
+            sink: Some(Box::new(sink)),
+            last_delivered: None,
+        };
     }
 
     pub fn set_icon_glyphs(&self, glyphs: impl Fn(&str) -> Option<char> + 'static) {
@@ -250,6 +272,12 @@ impl TuiPlatform {
     }
 
     fn present_frame(&self) {
+        if let Some(underneath) = self.windows.window_under_floating()
+            && let Some(underlay) = underneath.draw_underlay()
+            && let Some(window) = self.focused_window()
+        {
+            window.set_underlay(underlay);
+        }
         if let Some(window) = self.focused_window() {
             window.request_frame();
         }
@@ -334,11 +362,14 @@ impl Platform for TuiPlatform {
         handle: AnyWindowHandle,
         mut options: WindowParams,
     ) -> Result<Box<dyn PlatformWindow>> {
+        let floating_request = matches!(options.kind, WindowKind::Floating | WindowKind::PopUp)
+            .then_some(options.bounds);
         options.bounds = self.display.bounds();
         let focus = options.focus;
         let window = TuiWindow::new(
             handle,
             options,
+            floating_request,
             self.display.clone(),
             self.outputs.clone(),
             Rc::downgrade(&self.windows),

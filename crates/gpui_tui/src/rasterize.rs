@@ -90,6 +90,7 @@ pub(crate) struct CaretCandidate {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CaretMode {
     TerminalCursor,
+    Underlay,
 }
 
 pub(crate) fn resolve_carets(
@@ -1202,6 +1203,38 @@ mod tests {
         let (grid, _) = focused_cursor_cell(cursor, CaretMode::TerminalCursor);
         assert_eq!(grid.cursor, Some(CursorPosition { col: 0, row: 0 }));
         assert_eq!(grid.cursor_shape, CursorShape::Bar);
+    }
+
+    #[test]
+    fn underlay_carets_all_become_blocks_and_leave_the_terminal_cursor_alone() {
+        let white = Hsla::white();
+        let grid = resolved_caret_row_in(
+            CaretMode::Underlay,
+            "abcd",
+            &[(0., white), (16., white)],
+            &[],
+            0,
+            None,
+        );
+        assert_eq!(grid.cursor, None);
+        assert_eq!(grid.row_text(0), "abcd");
+        for col in [0, 2] {
+            let block = grid.cell(col, 0).copied().unwrap();
+            assert_eq!((block.bg, block.fg), (rgb(255, 255, 255), Rgb::default()));
+        }
+        assert_eq!(grid.cell(1, 0).unwrap().bg, Rgb::default());
+
+        let grid = resolved_caret_row_in(
+            CaretMode::Underlay,
+            "    ",
+            &[(0., white)],
+            &[],
+            3,
+            Some(rgb(255, 255, 255)),
+        );
+        assert_eq!(grid.cursor, None);
+        assert_eq!(grid.row_text(0), "    ");
+        assert_eq!(grid.cell(0, 0).unwrap().bg, rgb(255, 255, 255));
     }
 
     #[test]

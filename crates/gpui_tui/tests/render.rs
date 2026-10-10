@@ -474,6 +474,194 @@ impl Render for Banner {
     }
 }
 
+fn floating_frames(
+    floating_origin: gpui::Point<Pixels>,
+    steps: impl AsyncFnOnce(
+        &mut gpui::AsyncApp,
+        &Rc<TuiPlatform>,
+        gpui::WindowHandle<Banner>,
+        gpui::WindowHandle<Banner>,
+    ) + 'static,
+) -> Vec<CellGrid> {
+    let platform = TuiPlatform::new(80, 24);
+    let frames: Rc<RefCell<Vec<CellGrid>>> = Rc::default();
+    platform.set_frame_sink({
+        let frames = frames.clone();
+        move |grid| frames.borrow_mut().push(grid)
+    });
+    Application::with_platform(platform.clone()).run(move |cx: &mut App| {
+        let underlying = cx
+            .open_window(WindowOptions::default(), |_, cx| {
+                cx.new(|_| Banner("BEFORE".into()))
+            })
+            .expect("failed to open window");
+        cx.spawn(async move |cx| {
+            let settle = Duration::from_millis(50);
+            cx.background_executor().timer(settle).await;
+            let floating = cx
+                .update(|cx| {
+                    cx.open_window(
+                        WindowOptions {
+                            kind: gpui::WindowKind::Floating,
+                            window_bounds: Some(gpui::WindowBounds::Windowed(Bounds::new(
+                                floating_origin,
+                                size(px(240.), px(48.)),
+                            ))),
+                            ..Default::default()
+                        },
+                        |_, cx| cx.new(|_| Banner("FLOATING".into())),
+                    )
+                })
+                .expect("failed to open floating window");
+            cx.background_executor().timer(settle).await;
+            steps(cx, &platform, underlying, floating).await;
+            cx.background_executor().timer(settle).await;
+            cx.update(|cx| cx.quit());
+        })
+        .detach();
+    });
+    frames.take()
+}
+
+#[test]
+fn floating_windows_show_underlay_changes_without_redrawing_themselves() {
+    let frames = floating_frames(point(px(80.), px(80.)), async |cx, _, underlying, _| {
+        underlying
+            .update(cx, |banner, _, cx| {
+                banner.0 = "AFTER".into();
+                cx.notify();
+            })
+            .ok();
+    });
+    let last = frames.last().expect("no frame was presented").text();
+    assert!(
+        last.contains("AFTER") && last.contains("FLOATING"),
+        "{last}"
+    );
+}
+
+#[test]
+fn floating_windows_draw_only_a_left_bar() {
+    let frames = floating_frames(point(px(80.), px(80.)), async |_, _, _, _| {});
+    let last = frames.last().expect("no frame was presented");
+    let rows: Vec<String> = (4..9).map(|row| last.row_text(row)).collect();
+    assert!(
+        rows.iter()
+            .all(|row| !row.contains(['┌', '┐', '└', '┘', '─', '│'])),
+        "{}",
+        last.text()
+    );
+    for row in 5..8 {
+        assert_eq!(
+            last.cell(9, row).map(|cell| cell.glyph),
+            Some('▌'.into()),
+            "{}",
+            last.text()
+        );
+    }
+    let content: String = last.row_text(5).chars().skip(10).collect();
+    assert!(content.starts_with("FLOATING"), "{}", last.text());
+}
+
+#[test]
+fn floating_windows_follow_terminal_resizes_that_keep_their_size() {
+    let frames = floating_frames(point(px(80.), px(80.)), async |_, platform, _, _| {
+        platform.resize(70, 20);
+    });
+    let last = frames.last().expect("no frame was presented");
+    assert_eq!((last.cols, last.rows), (70, 20));
+    assert!(last.text().contains("FLOATING"), "{}", last.text());
+}
+
+#[test]
+fn floating_windows_moved_by_a_resize_are_drawn_at_their_new_origin() {
+    let frames = floating_frames(point(px(400.), px(80.)), async |_, platform, _, _| {
+        platform.resize(40, 24);
+    });
+    let last = frames.last().expect("no frame was presented");
+    assert_eq!((last.cols, last.rows), (40, 24));
+    assert!(last.text().contains("FLOATING"), "{}", last.text());
+}
+
+#[test]
+fn closing_a_floating_window_shows_the_latest_underlay() {
+    let frames = floating_frames(
+        point(px(80.), px(80.)),
+        async |cx, _, underlying, floating| {
+            underlying
+                .update(cx, |banner, _, cx| {
+                    banner.0 = "AFTER".into();
+                    cx.notify();
+                })
+                .ok();
+            cx.background_executor()
+                .timer(Duration::from_millis(50))
+                .await;
+            floating
+                .update(cx, |_, window, _| window.remove_window())
+                .ok();
+        },
+    );
+    let last = frames.last().expect("no frame was presented").text();
+    assert!(
+        last.contains("AFTER") && !last.contains("FLOATING"),
+        "{last}"
+    );
+}
+
+#[test]
+fn carets_behind_a_floating_window_become_blocks() {
+    let platform = TuiPlatform::new(40, 10);
+    let frames: Rc<RefCell<Vec<CellGrid>>> = Rc::default();
+    platform.set_frame_sink({
+        let frames = frames.clone();
+        move |grid| frames.borrow_mut().push(grid)
+    });
+    Application::with_platform(platform).run(move |cx: &mut App| {
+        let underlying = cx
+            .open_window(WindowOptions::default(), |window, cx| {
+                open_caret_field(window, cx, true, Some(bar_caret), true)
+            })
+            .expect("failed to open window");
+        cx.spawn(async move |cx| {
+            let settle = Duration::from_millis(50);
+            cx.background_executor().timer(settle).await;
+            cx.update(|cx| {
+                cx.open_window(
+                    WindowOptions {
+                        kind: gpui::WindowKind::Floating,
+                        window_bounds: Some(gpui::WindowBounds::Windowed(Bounds::new(
+                            point(px(160.), px(64.)),
+                            size(px(120.), px(32.)),
+                        ))),
+                        ..Default::default()
+                    },
+                    |_, cx| cx.new(|_| Banner("FLOATING".into())),
+                )
+            })
+            .expect("failed to open floating window");
+            cx.background_executor().timer(settle).await;
+            underlying.update(cx, |_, _, cx| cx.notify()).ok();
+            cx.background_executor().timer(settle).await;
+            cx.update(|cx| cx.quit());
+        })
+        .detach();
+    });
+    let frames = frames.take();
+    let last = frames.last().expect("no frame was presented");
+    assert!(last.text().contains("FLOATING"), "{}", last.text());
+    assert_eq!(last.cursor, None);
+    for col in [3, 5] {
+        let cell = last.cell(col, 1).copied().expect("cell");
+        assert_eq!(
+            (cell.glyph, cell.bg),
+            (' '.into(), Rgb::new(255, 255, 255)),
+            "col {col}: {}",
+            last.text()
+        );
+    }
+}
+
 #[test]
 fn combining_and_zwj_text_reach_the_frame() {
     let grid = first_frame(TuiPlatform::new(20, 2), |cx: &mut App| {

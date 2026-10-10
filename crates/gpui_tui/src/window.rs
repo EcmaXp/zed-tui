@@ -5,21 +5,26 @@ use std::{
 };
 
 use gpui::{
-    AnyWindowHandle, Bounds, Capslock, DispatchEventResult, GpuSpecs, Modifiers,
+    AnyWindowHandle, Bounds, Capslock, DispatchEventResult, GpuSpecs, Hsla, Modifiers,
     ModifiersChangedEvent, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
     PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
     Scene, Size, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowParams, WindowVisibility,
+    WindowParams, WindowVisibility, px,
 };
 
 use crate::{
+    CELL_HEIGHT, CELL_WIDTH,
     atlas::TuiAtlas,
-    caret_cell,
+    caret_cell, cells_for_size,
     grid::{CellGrid, CursorPosition, Rgb},
-    platform::{PlatformOutputs, WindowRegistry},
-    rasterize::{CaretCandidate, CaretMode, rasterize_scene, resolve_carets},
+    platform::{FrameOutput, PlatformOutputs, WindowRegistry},
+    rasterize::{CaretCandidate, CaretMode, canvas_if_untouched, rasterize_scene, resolve_carets},
     size_for_cells, with_taken,
 };
+
+const FLOATING_BAR_COLS: u16 = 1;
+const FLOATING_BAR_CONTRAST: f32 = 0.25;
+const DARK_LUMA: u32 = 128_000;
 
 #[derive(Default)]
 struct Callbacks {
@@ -42,6 +47,62 @@ pub(crate) struct WindowState {
     outputs: Rc<PlatformOutputs>,
     last_caret_color: Option<Rgb>,
     pending_frame: Option<(CellGrid, Vec<CaretCandidate>)>,
+    floating: Option<Floating>,
+}
+
+struct Floating {
+    requested: Bounds<Pixels>,
+    underlay: CellGrid,
+}
+
+fn floating_bounds(requested: Bounds<Pixels>, display: Size<Pixels>) -> Bounds<Pixels> {
+    let (display_cols, display_rows) = cells_for_size(display);
+    let (cols, rows) = cells_for_size(requested.size);
+    let cols = cols
+        .min(display_cols.saturating_sub(FLOATING_BAR_COLS))
+        .max(1);
+    let rows = rows.min(display_rows).max(1);
+    let place = |origin: Pixels, cell: f32, reserved: u16, extent: u16, display_extent: u16| {
+        let first = i32::from(reserved);
+        let last = i32::from(display_extent.saturating_sub(extent)).max(first);
+        ((origin.as_f32() / cell).round() as i32).clamp(first, last) as f32 * cell
+    };
+    Bounds::new(
+        Point::new(
+            px(place(
+                requested.origin.x,
+                CELL_WIDTH,
+                FLOATING_BAR_COLS,
+                cols,
+                display_cols,
+            )),
+            px(place(
+                requested.origin.y,
+                CELL_HEIGHT,
+                0,
+                rows,
+                display_rows,
+            )),
+        ),
+        size_for_cells(cols, rows),
+    )
+}
+
+fn floating_bar(content: &CellGrid, canvas: Rgb) -> Rgb {
+    let background = content.cells.first().map_or(Rgb::default(), |cell| cell.bg);
+    floating_bar_color(canvas_if_untouched(background, canvas))
+}
+
+fn floating_bar_color(background: Rgb) -> Rgb {
+    let luma = 299 * u32::from(background.r)
+        + 587 * u32::from(background.g)
+        + 114 * u32::from(background.b);
+    let toward = if luma < DARK_LUMA {
+        Hsla::white()
+    } else {
+        Hsla::black()
+    };
+    background.blend(toward.opacity(FLOATING_BAR_CONTRAST))
 }
 
 #[derive(Clone)]
@@ -58,15 +119,32 @@ impl TuiWindow {
     pub(crate) fn new(
         handle: AnyWindowHandle,
         params: WindowParams,
+        floating_request: Option<Bounds<Pixels>>,
         display: Rc<dyn PlatformDisplay>,
         outputs: Rc<PlatformOutputs>,
         registry: Weak<WindowRegistry>,
     ) -> Self {
+        let floating = floating_request.map(|requested| {
+            let (cols, rows) = cells_for_size(params.bounds.size);
+            Floating {
+                requested,
+                underlay: outputs
+                    .frame
+                    .borrow()
+                    .last_delivered
+                    .clone()
+                    .unwrap_or_else(|| CellGrid::new(cols, rows, Rgb::default())),
+            }
+        });
+        let bounds = match &floating {
+            Some(floating) => floating_bounds(floating.requested, params.bounds.size),
+            None => params.bounds,
+        };
         Self(TuiWindowHandle {
             handle,
             registry,
             state: Rc::new(RefCell::new(WindowState {
-                bounds: params.bounds,
+                bounds,
                 display,
                 input_handler: None,
                 title: String::new(),
@@ -77,6 +155,7 @@ impl TuiWindow {
                 outputs,
                 last_caret_color: None,
                 pending_frame: None,
+                floating,
             })),
             callbacks: Rc::default(),
         })
@@ -89,6 +168,7 @@ impl TuiWindow {
 
 impl TuiWindowHandle {
     pub(crate) fn handle_input(&self, input: PlatformInput) {
+        let input = self.to_window_coordinates(input);
         {
             let mut state = self.state.borrow_mut();
             match &input {
@@ -147,10 +227,36 @@ impl TuiWindowHandle {
         );
     }
 
+    fn to_window_coordinates(&self, mut input: PlatformInput) -> PlatformInput {
+        let state = self.state.borrow();
+        if state.floating.is_none() {
+            return input;
+        }
+        let origin = state.bounds.origin;
+        match &mut input {
+            PlatformInput::MouseDown(event) => event.position -= origin,
+            PlatformInput::MouseUp(event) => event.position -= origin,
+            PlatformInput::MouseMove(event) => event.position -= origin,
+            PlatformInput::MouseExited(event) => event.position -= origin,
+            PlatformInput::ScrollWheel(event) => event.position -= origin,
+            _ => {}
+        }
+        input
+    }
+
     pub(crate) fn resize(&self, cols: u16, rows: u16) {
-        let size = size_for_cells(cols, rows);
+        let mut size = size_for_cells(cols, rows);
         {
             let mut state = self.state.borrow_mut();
+            let state = &mut *state;
+            if let Some(floating) = &mut state.floating {
+                if (floating.underlay.cols, floating.underlay.rows) != (cols, rows) {
+                    floating.underlay = CellGrid::new(cols, rows, Rgb::default());
+                }
+                let bounds = floating_bounds(floating.requested, size);
+                size = bounds.size;
+                state.bounds.origin = bounds.origin;
+            }
             if state.bounds.size == size {
                 return;
             }
@@ -186,20 +292,62 @@ impl TuiWindowHandle {
     }
 
     fn draw_frame(&self) {
+        let require_presentation = self.is_floating();
         with_taken(
             &self.callbacks,
             |callbacks| &mut callbacks.request_frame,
-            |callback| callback(RequestFrameOptions::default()),
+            |callback| {
+                callback(RequestFrameOptions {
+                    require_presentation,
+                    ..Default::default()
+                })
+            },
         );
     }
 
+    pub(crate) fn is_floating(&self) -> bool {
+        self.state.borrow().floating.is_some()
+    }
+
+    pub(crate) fn draw_underlay(&self) -> Option<CellGrid> {
+        self.draw_frame();
+        let (grid, carets) = self.state.borrow_mut().pending_frame.take()?;
+        Some(self.resolve_caret(grid, carets, CaretMode::Underlay))
+    }
+
+    pub(crate) fn set_underlay(&self, underlay: CellGrid) {
+        if let Some(floating) = &mut self.state.borrow_mut().floating {
+            floating.underlay = underlay;
+        }
+    }
+
     fn deliver_pending_frame(&self) {
-        let Some((grid, carets)) = self.state.borrow_mut().pending_frame.take() else {
-            return;
+        let pending_frame = self.state.borrow_mut().pending_frame.take();
+        let fresh = pending_frame
+            .map(|(grid, carets)| self.resolve_caret(grid, carets, CaretMode::TerminalCursor));
+        let mut state = self.state.borrow_mut();
+        let state = &mut *state;
+        let grid = match &mut state.floating {
+            None => match fresh {
+                Some(grid) => grid,
+                None => return,
+            },
+            Some(floating) => {
+                let Some(content) = fresh else {
+                    return;
+                };
+                let origin = CursorPosition {
+                    col: (state.bounds.origin.x.as_f32() / CELL_WIDTH) as u16,
+                    row: (state.bounds.origin.y.as_f32() / CELL_HEIGHT) as u16,
+                };
+                let bar = floating_bar(&content, state.outputs.canvas.get());
+                let mut screen = floating.underlay.clone();
+                screen.overlay_with_left_bar(&content, origin, bar);
+                screen
+            }
         };
-        let grid = self.resolve_caret(grid, carets, CaretMode::TerminalCursor);
-        let outputs = self.state.borrow().outputs.clone();
-        deliver_frame(&outputs.frame_sink, grid);
+        let outputs = state.outputs.clone();
+        deliver_frame(&outputs.frame, grid);
     }
 
     fn resolve_caret(
@@ -440,6 +588,77 @@ impl Drop for TuiWindow {
     }
 }
 
-fn deliver_frame(frame_sink: &RefCell<Option<Box<dyn FnMut(CellGrid)>>>, grid: CellGrid) {
-    with_taken(frame_sink, |sink| sink, |sink| sink(grid));
+fn deliver_frame(frame_sink: &RefCell<FrameOutput>, grid: CellGrid) {
+    frame_sink.borrow_mut().last_delivered = Some(grid.clone());
+    with_taken(frame_sink, |output| &mut output.sink, |sink| sink(grid));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cells(bounds: Bounds<Pixels>) -> (f32, f32, f32, f32) {
+        (
+            bounds.origin.x.as_f32() / CELL_WIDTH,
+            bounds.origin.y.as_f32() / CELL_HEIGHT,
+            bounds.size.width.as_f32() / CELL_WIDTH,
+            bounds.size.height.as_f32() / CELL_HEIGHT,
+        )
+    }
+
+    #[test]
+    fn floating_windows_keep_their_requested_size_and_position() {
+        let requested = Bounds::new(
+            Point::new(px(20. * CELL_WIDTH), px(5. * CELL_HEIGHT)),
+            size_for_cells(40, 10),
+        );
+        let bounds = floating_bounds(requested, size_for_cells(80, 24));
+        assert_eq!(cells(bounds), (20., 5., 40., 10.));
+    }
+
+    #[test]
+    fn floating_windows_larger_than_the_terminal_leave_room_only_for_the_left_bar() {
+        let requested = Bounds::new(Point::default(), size_for_cells(200, 60));
+        let bounds = floating_bounds(requested, size_for_cells(80, 24));
+        assert_eq!(cells(bounds), (1., 0., 79., 24.));
+    }
+
+    #[test]
+    fn floating_windows_reach_the_bottom_and_right_edges() {
+        let requested = Bounds::new(
+            Point::new(px(70. * CELL_WIDTH), px(20. * CELL_HEIGHT)),
+            size_for_cells(10, 4),
+        );
+        let bounds = floating_bounds(requested, size_for_cells(80, 24));
+        assert_eq!(cells(bounds), (70., 20., 10., 4.));
+    }
+
+    #[test]
+    fn floating_bars_contrast_with_dark_and_light_backgrounds() {
+        for background in [
+            Rgb::new(40, 44, 52),
+            Rgb::new(110, 110, 110),
+            Rgb::new(150, 150, 150),
+            Rgb::new(250, 250, 250),
+        ] {
+            let bar = floating_bar_color(background);
+            assert!(bar.distance(background) >= 90, "{bar:?} on {background:?}");
+        }
+        let dark = Rgb::new(40, 44, 52);
+        assert!(floating_bar_color(dark).r > dark.r);
+        let light = Rgb::new(250, 250, 250);
+        assert!(floating_bar_color(light).r < light.r);
+    }
+
+    #[test]
+    fn floating_bars_over_an_unpainted_window_contrast_with_the_canvas() {
+        let canvas = Rgb::new(40, 44, 52);
+        let unpainted = CellGrid::new(4, 2, Rgb::default());
+        assert_eq!(floating_bar(&unpainted, canvas), floating_bar_color(canvas));
+        let painted = CellGrid::new(4, 2, Rgb::new(250, 250, 250));
+        assert_eq!(
+            floating_bar(&painted, canvas),
+            floating_bar_color(Rgb::new(250, 250, 250))
+        );
+    }
 }

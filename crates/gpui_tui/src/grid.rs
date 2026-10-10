@@ -327,6 +327,43 @@ impl CellGrid {
             .join("\n")
     }
 
+    pub(crate) fn overlay_with_left_bar(
+        &mut self,
+        overlay: &CellGrid,
+        origin: CursorPosition,
+        bar: Rgb,
+    ) {
+        let (col, row) = (i32::from(origin.col), i32::from(origin.row));
+        let bar_col = col - 1;
+        let end_col = col + i32::from(overlay.cols);
+        let bar_cell = Cell {
+            glyph: '▌'.into(),
+            fg: bar,
+            bg: overlay.cells.first().map_or(Rgb::default(), |cell| cell.bg),
+            attrs: CellAttrs::empty(),
+            underline: UnderlineColor::default(),
+        };
+        for y in row..row + i32::from(overlay.rows) {
+            self.split_wide_char_at(bar_col, y);
+            self.split_wide_char_at(end_col, y);
+            if let Some(target) = self.cell_mut(bar_col, y) {
+                *target = bar_cell;
+            }
+            for x in col..end_col {
+                if let Some(cell) = overlay.cell(x - col, y - row)
+                    && let Some(target) = self.cell_mut(x, y)
+                {
+                    *target = *cell;
+                }
+            }
+        }
+        self.cursor = overlay.cursor.map(|cursor| CursorPosition {
+            col: cursor.col + origin.col,
+            row: cursor.row + origin.row,
+        });
+        self.cursor_shape = overlay.cursor_shape;
+    }
+
     pub(crate) fn split_wide_char_at(&mut self, col: i32, row: i32) {
         let is_continuation = self
             .cell(col, row)
@@ -403,6 +440,65 @@ mod tests {
 
         grid.mark_default_colors(&[editor, Rgb::new(47, 52, 62)], &[]);
         assert_eq!(flagged(&grid), vec![false, true, true]);
+    }
+
+    fn grid_of(rows: &[&str]) -> CellGrid {
+        let cols = rows
+            .iter()
+            .map(|row| row.chars().count())
+            .max()
+            .unwrap_or(0);
+        let mut grid = CellGrid::new(cols as u16, rows.len() as u16, Rgb::default());
+        for (y, text) in rows.iter().enumerate() {
+            for (x, ch) in text.chars().enumerate() {
+                if let Some(cell) = grid.cell_mut(x as i32, y as i32) {
+                    cell.glyph = ch.into();
+                }
+            }
+        }
+        grid
+    }
+
+    #[test]
+    fn overlays_get_only_a_left_bar_in_the_column_before_their_origin() {
+        let mut screen = grid_of(&["........", "........", "........", "........"]);
+        let mut overlay = grid_of(&["ab", "cd"]);
+        overlay.cursor = Some(CursorPosition { col: 1, row: 0 });
+        overlay.cursor_shape = CursorShape::Underline;
+        if let Some(cell) = overlay.cell_mut(0, 0) {
+            cell.bg = Rgb::new(47, 52, 62);
+        }
+        let bar = Rgb::new(110, 110, 110);
+        screen.overlay_with_left_bar(&overlay, CursorPosition { col: 2, row: 1 }, bar);
+        assert_eq!(screen.row_text(0), "........");
+        assert_eq!(screen.row_text(1), ".▌ab....");
+        assert_eq!(screen.row_text(2), ".▌cd....");
+        assert_eq!(screen.row_text(3), "........");
+        for row in [1, 2] {
+            let edge = screen.cell(1, row).copied().unwrap();
+            assert_eq!((edge.fg, edge.bg), (bar, Rgb::new(47, 52, 62)));
+        }
+        assert_eq!(screen.cursor, Some(CursorPosition { col: 3, row: 1 }));
+        assert_eq!(screen.cursor_shape, CursorShape::Underline);
+    }
+
+    #[test]
+    fn overlay_bars_and_edges_split_wide_chars_they_cut() {
+        let mut screen = CellGrid::new(5, 3, Rgb::default());
+        for col in [0, 3] {
+            if let Some(cell) = screen.cell_mut(col, 1) {
+                cell.glyph = '漢'.into();
+            }
+            if let Some(cell) = screen.cell_mut(col + 1, 1) {
+                cell.attrs = CellAttrs::WIDE_CONTINUATION;
+            }
+        }
+        screen.overlay_with_left_bar(
+            &grid_of(&["xy"]),
+            CursorPosition { col: 2, row: 1 },
+            Rgb::default(),
+        );
+        assert_eq!(screen.row_text(1), " ▌xy ");
     }
 
     #[test]
