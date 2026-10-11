@@ -1,11 +1,17 @@
+#[cfg(windows)]
+use std::os::windows::io::AsHandle as _;
+#[cfg(unix)]
+use std::os::{
+    fd::{AsFd as _, RawFd},
+    unix::net::UnixStream,
+};
+#[cfg(windows)]
+use uds_windows::UnixStream;
+
 use std::{
     fs::File,
     io::{self, BufReader, Write},
     ops::Range,
-    os::{
-        fd::{AsFd as _, RawFd},
-        unix::net::UnixStream,
-    },
     path::Path,
     sync::{
         Arc, OnceLock,
@@ -35,13 +41,17 @@ const REDRAW_MERGE_GAP: usize = 4;
 const MIN_ERASE_RUN: usize = 8;
 const MIN_ERASE_RUN_BEFORE_MOVE: usize = 5;
 const MIN_ERASE_TAIL: usize = 4;
+#[cfg(unix)]
 const MARGIN_QUERY: &str = "\x1b[?69$p";
 const MARGIN_MODE_ON: &[u8] = b"\x1b[?69h";
 const MARGIN_MODE_OFF: &[u8] = b"\x1b[?69l";
 const POINTER_RESET: &[u8] = b"\x1b]22;text\x1b\\";
 const CURSOR_SHAPE_RESET: &[u8] = b"\x1b[0 q";
+#[cfg(unix)]
 const KEYBOARD_FLAGS_QUERY: &str = "\x1b[?u";
+#[cfg(unix)]
 const VERSION_QUERY: &str = "\x1b[>0q";
+#[cfg(unix)]
 const DEVICE_ATTRIBUTES_QUERY: &str = "\x1b[c";
 const FIRST_PALETTE_SLOT: u8 = 16;
 const GRAY_SLOTS_BY_LIGHTNESS: [u8; 4] = [0, 8, 7, 15];
@@ -59,7 +69,9 @@ const OSC_PALETTE_PAIRS: usize = (MAX_OSC_PARAMS - 1) / 2;
 const OSC_RESET_SLOTS: usize = MAX_OSC_PARAMS - 1;
 const BRIGHT_ANSI_OFFSET: u8 = 60;
 const SYNCHRONIZED_FRAME_BYTES: usize = 512;
+#[cfg(unix)]
 const QUERY_TIMEOUT: Duration = Duration::from_millis(500);
+#[cfg(unix)]
 const HANGUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const RESIZE_FRAME_WAIT: Duration = Duration::from_millis(100);
 const MOUSE_MOVE_INTERVAL: Duration = Duration::from_millis(8);
@@ -100,13 +112,11 @@ impl TerminalSetup {
     ) -> io::Result<()> {
         write!(output, "{PUSH_TITLE}")?;
         self.entered = true;
-        crossterm::execute!(
-            output,
-            terminal::EnterAlternateScreen,
-            cursor::Hide,
-            event::EnableMouseCapture,
-            event::EnableBracketedPaste,
-        )?;
+        queue_ansi(output, terminal::EnterAlternateScreen)?;
+        queue_ansi(output, cursor::Hide)?;
+        queue_ansi(output, event::EnableMouseCapture)?;
+        queue_ansi(output, event::EnableBracketedPaste)?;
+        output.flush()?;
         let replies = query(output)?;
         self.features = replies.features;
         self.original_palette = replies.palette;
@@ -116,12 +126,13 @@ impl TerminalSetup {
             output.flush()?;
         }
         if replies.keyboard_flags {
-            crossterm::execute!(
+            queue_ansi(
                 output,
                 event::PushKeyboardEnhancementFlags(
-                    event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                )
+                    event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+                ),
             )?;
+            output.flush()?;
             self.keyboard_enhanced = true;
         }
         Ok(())
@@ -131,7 +142,9 @@ impl TerminalSetup {
         let used = self.palette_slots_used.load(Ordering::Relaxed);
         write!(output, "{}", palette_restore(used, &self.original_palette)).ok();
         if self.keyboard_enhanced {
-            crossterm::execute!(output, event::PopKeyboardEnhancementFlags).ok();
+            queue_ansi(output, event::PopKeyboardEnhancementFlags)
+                .and_then(|()| output.flush())
+                .ok();
         }
         if self.features.margin_mode {
             output.write_all(MARGIN_MODE_OFF).ok();
@@ -141,14 +154,16 @@ impl TerminalSetup {
         }
         if self.entered {
             output.write_all(CURSOR_SHAPE_RESET).ok();
-            crossterm::execute!(
+            write!(
                 output,
-                style::ResetColor,
-                event::DisableBracketedPaste,
-                event::DisableMouseCapture,
-                cursor::Show,
-                terminal::LeaveAlternateScreen,
+                "{}{}{}{}{}",
+                Ansi(style::ResetColor),
+                Ansi(event::DisableBracketedPaste),
+                Ansi(event::DisableMouseCapture),
+                Ansi(cursor::Show),
+                Ansi(terminal::LeaveAlternateScreen),
             )
+            .and_then(|()| output.flush())
             .ok();
             write!(output, "{POP_TITLE}").ok();
         }
@@ -156,25 +171,41 @@ impl TerminalSetup {
     }
 }
 
-struct TerminalGuard(TerminalSetup);
+struct TerminalGuard {
+    setup: TerminalSetup,
+    #[cfg(windows)]
+    _console: super::windows_console::ConsoleGuard,
+}
 
 impl TerminalGuard {
     fn enter() -> Result<Self> {
+        #[cfg(windows)]
+        let console = super::windows_console::ConsoleGuard::enter()?;
         terminal::enable_raw_mode().context("enabling raw mode")?;
-        let mut guard = Self(TerminalSetup::default());
-        guard.0.run(&mut io::stdout(), query_terminal)?;
-        restore_on_signal(&guard.0);
+        let mut guard = Self {
+            setup: TerminalSetup::default(),
+            #[cfg(windows)]
+            _console: console,
+        };
+        #[cfg(unix)]
+        guard.setup.run(&mut io::stdout(), query_terminal)?;
+        #[cfg(windows)]
+        guard
+            .setup
+            .run(&mut io::stdout(), |_| Ok(QueryReplies::default()))?;
+        restore_on_signal(&guard.setup);
         Ok(guard)
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        self.0.undo(&mut io::stdout());
+        self.setup.undo(&mut io::stdout());
         terminal::disable_raw_mode().ok();
     }
 }
 
+#[cfg(unix)]
 fn query_terminal(stdout: &mut impl Write) -> io::Result<QueryReplies> {
     let mut query = MARGIN_QUERY.to_owned();
     for slot in 0..=u8::MAX {
@@ -191,6 +222,7 @@ fn query_terminal(stdout: &mut impl Write) -> io::Result<QueryReplies> {
 #[derive(Default)]
 struct QueryReplies {
     palette: HashMap<u8, String>,
+    #[cfg_attr(windows, allow(dead_code))]
     device_attributes: bool,
     keyboard_flags: bool,
     features: TerminalFeatures,
@@ -256,7 +288,7 @@ impl vte::Perform for QueryReplies {
     }
 }
 
-static RESTORE_ON_SIGNAL: OnceLock<Vec<u8>> = OnceLock::new();
+pub(super) static RESTORE_ON_SIGNAL: OnceLock<Vec<u8>> = OnceLock::new();
 
 fn restore_on_signal(setup: &TerminalSetup) {
     let restore = signal_restore(
@@ -264,9 +296,24 @@ fn restore_on_signal(setup: &TerminalSetup) {
         setup.features.margin_mode,
         setup.features.ghostty,
     );
+    #[cfg(windows)]
+    let restore = [
+        restore,
+        format!(
+            "{}{}{}{}{}",
+            Ansi(style::ResetColor),
+            Ansi(event::DisableBracketedPaste),
+            Ansi(event::DisableMouseCapture),
+            Ansi(cursor::Show),
+            Ansi(terminal::LeaveAlternateScreen),
+        )
+        .into_bytes(),
+    ]
+    .concat();
     if restore.is_empty() || RESTORE_ON_SIGNAL.set(restore).is_err() {
         return;
     }
+    #[cfg(unix)]
     for signal in [libc::SIGHUP, libc::SIGINT, libc::SIGTERM] {
         unsafe {
             libc::signal(
@@ -277,6 +324,7 @@ fn restore_on_signal(setup: &TerminalSetup) {
     }
 }
 
+#[cfg(unix)]
 extern "C" fn write_restore_and_reraise(signal: libc::c_int) {
     if let Some(restore) = RESTORE_ON_SIGNAL.get() {
         unsafe {
@@ -618,6 +666,7 @@ impl Layer {
     }
 }
 
+#[cfg(unix)]
 fn read_query_reply(timeout: Duration) -> QueryReplies {
     let deadline = Instant::now() + timeout;
     let mut parser = vte::Parser::new();
@@ -1339,13 +1388,13 @@ impl<W: Write> Terminal<W> {
         }
         let synchronize = force_synchronize || self.body.len() >= SYNCHRONIZED_FRAME_BYTES;
         if synchronize {
-            crossterm::queue!(self.output, terminal::BeginSynchronizedUpdate)?;
+            queue_ansi(&mut self.output, terminal::BeginSynchronizedUpdate)?;
         }
         self.palette.write_definitions(&mut self.output)?;
         self.output.write_all(&self.body)?;
         self.body.clear();
         if synchronize {
-            crossterm::queue!(self.output, terminal::EndSynchronizedUpdate)?;
+            queue_ansi(&mut self.output, terminal::EndSynchronizedUpdate)?;
         }
         self.output.flush()
     }
@@ -2005,12 +2054,12 @@ impl<W: Write> Renderer<W> {
                     terminal.cursor_shape = Some(grid.cursor_shape);
                 }
                 if !terminal.cursor_visible {
-                    crossterm::queue!(terminal.body, cursor::Show)?;
+                    queue_ansi(&mut terminal.body, cursor::Show)?;
                     terminal.cursor_visible = true;
                 }
             }
             None if terminal.cursor_visible => {
-                crossterm::queue!(terminal.body, cursor::Hide)?;
+                queue_ansi(&mut terminal.body, cursor::Hide)?;
                 terminal.cursor_visible = false;
             }
             None => {}
@@ -2026,9 +2075,9 @@ impl<W: Write> Renderer<W> {
     }
 
     fn copy_to_clipboard(&mut self, text: &str) -> io::Result<()> {
-        crossterm::queue!(
-            self.terminal.output,
-            crossterm::clipboard::CopyToClipboard::to_clipboard_from(text)
+        queue_ansi(
+            &mut self.terminal.output,
+            crossterm::clipboard::CopyToClipboard::to_clipboard_from(text),
         )?;
         self.terminal.output.flush()
     }
@@ -2090,7 +2139,7 @@ pub fn ansi_text(grid: &CellGrid) -> io::Result<String> {
             pen.write_style(&mut output, &mut palette, Style::of_cell(cell, false))?;
             cell.glyph.write_to(&mut output)?;
         }
-        crossterm::queue!(output, style::ResetColor)?;
+        queue_ansi(&mut output, style::ResetColor)?;
         output.push(b'\n');
     }
     Ok(String::from_utf8_lossy(&output).into_owned())
@@ -2099,6 +2148,18 @@ pub fn ansi_text(grid: &CellGrid) -> io::Result<String> {
 enum ClientEvent {
     Terminal(event::Event),
     Exit(Exit),
+}
+
+fn queue_ansi(output: &mut impl Write, command: impl crossterm::Command) -> io::Result<()> {
+    write!(output, "{}", Ansi(command))
+}
+
+struct Ansi<Command>(Command);
+
+impl<Command: crossterm::Command> std::fmt::Display for Ansi<Command> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.write_ansi(formatter)
+    }
 }
 
 struct TerminalOutput {
@@ -2110,7 +2171,10 @@ impl TerminalOutput {
     fn stdout() -> io::Result<Self> {
         Ok(Self {
             buffer: Vec::with_capacity(1 << 16),
+            #[cfg(unix)]
             terminal: File::from(io::stdout().as_fd().try_clone_to_owned()?),
+            #[cfg(windows)]
+            terminal: File::from(io::stdout().as_handle().try_clone_to_owned()?),
         })
     }
 }
@@ -2173,10 +2237,10 @@ pub fn attach(socket: &Path, wait: Option<ClientMessage>) -> Result<Exit> {
 
     let guard = TerminalGuard::enter()?;
     let mut renderer = Renderer::new(TerminalOutput::stdout()?, cols, rows);
-    renderer.terminal.features = guard.0.features;
+    renderer.terminal.features = guard.setup.features;
     renderer.terminal.palette = Palette::new(
-        &guard.0.original_palette,
-        guard.0.palette_slots_used.clone(),
+        &guard.setup.original_palette,
+        guard.setup.palette_slots_used.clone(),
     );
     let (render_sender, render_receiver) = mpsc::channel();
     thread::Builder::new()
@@ -2201,6 +2265,7 @@ pub fn attach(socket: &Path, wait: Option<ClientMessage>) -> Result<Exit> {
             event_sender.send(ClientEvent::Exit(exit)).ok();
         }
     })?;
+    #[cfg(unix)]
     thread::Builder::new()
         .name("Terminal hangup".to_owned())
         .spawn({
@@ -2308,6 +2373,7 @@ pub fn wait_without_attaching(socket: &Path, wait: ClientMessage) -> Result<Exit
     Ok(Exit::Disconnected)
 }
 
+#[cfg(unix)]
 fn wait_for_hangup(fd: RawFd) -> bool {
     loop {
         let mut poll_fd = libc::pollfd {
@@ -3942,6 +4008,7 @@ mod tests {
         String::from_utf8(output).unwrap()
     }
 
+    #[cfg(unix)]
     #[test]
     fn closing_the_terminal_is_noticed_even_with_input_pending() {
         let (mut master, mut slave) = (0, 0);

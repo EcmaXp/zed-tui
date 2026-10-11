@@ -448,6 +448,11 @@ impl raw_window_handle::HasDisplayHandle for TuiWindow {
 }
 
 impl PlatformWindow for TuiWindow {
+    #[cfg(windows)]
+    fn get_raw_handle(&self) -> windows::Win32::Foundation::HWND {
+        windows::Win32::Foundation::HWND::default()
+    }
+
     fn bounds(&self) -> Bounds<Pixels> {
         self.0.state.borrow().bounds
     }

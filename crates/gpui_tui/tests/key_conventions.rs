@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(any(unix, windows))]
 
 use gpui::{KeyContext, Keystroke, Modifiers};
 use gpui_tui::TuiPlatform;
@@ -17,13 +17,13 @@ fn tui_platform_makes_ctrl_the_secondary_modifier() {
 }
 
 #[test]
-fn tui_platform_reports_the_os_the_linux_way() {
+fn tui_platform_reports_the_terminal_keymap_os() {
     let _platform = TuiPlatform::new(20, 4);
     assert_eq!(
         KeyContext::new_with_defaults()
             .get("os")
             .map(|os| os.as_ref()),
-        Some("linux")
+        Some(if cfg!(windows) { "windows" } else { "linux" })
     );
 }
 

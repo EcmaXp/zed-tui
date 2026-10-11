@@ -28,5 +28,8 @@ unicode-segmentation.workspace = true
 unicode-width.workspace = true
 uuid.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

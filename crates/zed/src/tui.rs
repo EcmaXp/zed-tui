@@ -1,65 +1,18 @@
-#[cfg(unix)]
 mod client;
-#[cfg(unix)]
 mod frame_diff;
-#[cfg(unix)]
 mod icon_glyphs;
-#[cfg(unix)]
 mod input;
-#[cfg(unix)]
 mod protocol;
-#[cfg(unix)]
 mod server;
-#[cfg(all(unix, test))]
+#[cfg(test)]
 mod test_support;
-#[cfg(unix)]
 mod title_bar;
+#[cfg(windows)]
+mod windows_console;
 
-#[cfg(unix)]
-pub use unix::*;
+pub use native::*;
 
-#[cfg(not(unix))]
-pub use stubs::*;
-
-#[cfg(not(unix))]
-mod stubs {
-    use gpui::{App, Application};
-
-    pub enum TuiServer {}
-
-    pub enum Startup {}
-
-    impl TuiServer {
-        pub fn zed_args(&self) -> Vec<std::ffi::OsString> {
-            match *self {}
-        }
-    }
-
-    impl Startup {
-        pub fn application(&self) -> Application {
-            match *self {}
-        }
-
-        pub fn init_settings(&self, _: &mut App) {
-            match *self {}
-        }
-
-        pub fn database(&self) -> db::AppDatabase {
-            match *self {}
-        }
-
-        pub fn init(self, _: &mut App) {
-            match self {}
-        }
-    }
-
-    pub fn start() -> Option<(TuiServer, Startup)> {
-        None
-    }
-}
-
-#[cfg(unix)]
-mod unix {
+mod native {
     use std::{
         cell::RefCell,
         ffi::OsString,
@@ -288,7 +241,7 @@ mod unix {
                 let session_paths = server::SessionPaths::new(&name)?;
                 let database_dir = session_paths.directory.join("db");
                 let platform = TuiPlatform::new(DEFAULT_COLS, DEFAULT_ROWS);
-                let root = root.map(|root| root.canonicalize().unwrap_or(root));
+                let root = root.map(|root| dunce::canonicalize(&root).unwrap_or(root));
                 let (session, started) =
                     server::start_session(session_paths, root.as_deref(), platform.clone())?;
                 Ok(Outcome::Serve(
@@ -424,7 +377,7 @@ mod unix {
             .into_iter()
             .map(|path| {
                 let path = current_dir.join(path);
-                path.canonicalize().unwrap_or(path)
+                dunce::canonicalize(&path).unwrap_or(path)
             })
             .collect())
     }

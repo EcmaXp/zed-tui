@@ -173,7 +173,7 @@ async fn test_status_items_notify_only_when_their_state_changes(cx: &mut TestApp
     );
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn test_tui_drops_font_size_keybindings() {
     let mut cx = TestAppContext::build_with_text_system(
@@ -209,7 +209,7 @@ fn test_tui_drops_font_size_keybindings() {
     cx.run_until_parked();
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn test_tui_multibuffer_breadcrumb_separator_uses_the_full_border_color() {
     struct Breadcrumbs(gpui::Entity<Editor>);
@@ -264,7 +264,7 @@ fn test_tui_multibuffer_breadcrumb_separator_uses_the_full_border_color() {
     assert_eq!(left_border_colors, [border_color]);
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn test_tui_one_line_diagnostic_takes_one_row() {
     for (editor_width, expected_rows) in [(px(800.), 0), (px(400.), 1)] {

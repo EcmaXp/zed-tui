@@ -1,6 +1,3 @@
-// Disable command line from opening on release mode
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
 mod reliability;
 mod tui;
 mod watcher_debug;
@@ -243,13 +240,11 @@ fn main() {
         return;
     }
 
+    #[cfg(target_os = "windows")]
+    let launch_console = launch_console();
     #[cfg(all(not(debug_assertions), target_os = "windows"))]
-    unsafe {
-        use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
-
-        if args.foreground {
-            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
-        }
+    if tui_server.is_none() && !writes_to_console(&args) {
+        detach_gui_from_console(launch_console);
     }
 
     // `zed --printenv` Outputs environment variables as JSON to stdout
@@ -340,6 +335,12 @@ fn main() {
             .map(|sha| sha.short())
             .as_deref()
             .unwrap_or("unknown"),
+    );
+
+    #[cfg(target_os = "windows")]
+    log::info!(
+        "launch console: {launch_console:?}, consoleAllocationPolicy supported: {}",
+        console_allocation_policy_supported()
     );
 
     #[cfg(windows)]
@@ -1706,6 +1707,71 @@ fn stdout_is_a_pty() -> bool {
     !*FORCE_CLI_MODE && io::stdout().is_terminal()
 }
 
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug)]
+enum LaunchConsole {
+    None,
+    Created,
+    Inherited,
+}
+
+#[cfg(target_os = "windows")]
+fn launch_console() -> LaunchConsole {
+    let mut process_ids = [0u32; 2];
+    match unsafe { windows::Win32::System::Console::GetConsoleProcessList(&mut process_ids) } {
+        0 => LaunchConsole::None,
+        1 => LaunchConsole::Created,
+        _ => LaunchConsole::Inherited,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn writes_to_console(args: &Args) -> bool {
+    args.foreground || args.printenv || args.dump_all_actions || args.system_specs
+}
+
+#[cfg(target_os = "windows")]
+fn console_allocation_policy_supported() -> bool {
+    let mut version = unsafe { std::mem::zeroed() };
+    let status = unsafe { windows::Wdk::System::SystemServices::RtlGetVersion(&mut version) };
+    status.is_ok() && version.dwBuildNumber >= 26100
+}
+
+#[cfg(all(not(debug_assertions), target_os = "windows"))]
+fn detach_gui_from_console(console: LaunchConsole) {
+    match console {
+        LaunchConsole::None => {}
+        LaunchConsole::Created => {
+            if let Err(error) = unsafe { windows::Win32::System::Console::FreeConsole() } {
+                eprintln!("failed to release the console: {error}");
+            }
+        }
+        LaunchConsole::Inherited => {
+            use std::os::windows::process::CommandExt as _;
+
+            if !io::stdout().is_terminal() || !io::stderr().is_terminal() {
+                return;
+            }
+
+            let relaunched = std::env::current_exe().and_then(|exe| {
+                let mut command = process::Command::new(exe);
+                command
+                    .args(std::env::args_os().skip(1))
+                    .creation_flags(windows::Win32::System::Threading::DETACHED_PROCESS.0);
+                smol::process::Command::from(command)
+                    .stdin(smol::process::Stdio::null())
+                    .stdout(smol::process::Stdio::null())
+                    .stderr(smol::process::Stdio::null())
+                    .spawn()
+            });
+            match relaunched {
+                Ok(_) => process::exit(0),
+                Err(error) => eprintln!("failed to detach Zed from the console: {error}"),
+            }
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "zed", disable_version_flag = true, max_term_width = 100)]
 struct Args {
@@ -2080,5 +2146,26 @@ fn check_for_conpty_dll() {
         }
     } else {
         log::warn!("Failed to load conpty.dll. Terminal will work with reduced functionality.");
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_launch_tests {
+    use super::*;
+
+    #[test]
+    fn only_console_output_commands_keep_the_launching_console() {
+        let writes = |arguments: &[&str]| {
+            writes_to_console(&Args::parse_from(
+                std::iter::once("zed").chain(arguments.iter().copied()),
+            ))
+        };
+        assert!(writes(&["--foreground"]));
+        assert!(writes(&["--printenv"]));
+        assert!(writes(&["--dump-all-actions"]));
+        assert!(writes(&["--system-specs"]));
+        assert!(!writes(&[]));
+        assert!(!writes(&["src/main.rs"]));
+        assert!(!writes(&["--user-data-dir", "data", "src/main.rs"]));
     }
 }

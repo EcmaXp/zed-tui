@@ -7793,6 +7793,7 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width 0.2.2",
  "uuid",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -22902,6 +22903,7 @@ dependencies = [
  "debugger_ui",
  "dev_container",
  "diagnostics",
+ "dunce",
  "edit_prediction",
  "edit_prediction_ui",
  "editor",
@@ -23013,6 +23015,7 @@ dependencies = [
  "title_bar",
  "toolchain_selector",
  "tracing",
+ "uds_windows",
  "ui",
  "ui_prompt",
  "unicode-width 0.2.2",

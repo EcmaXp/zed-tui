@@ -1192,6 +1192,7 @@ mod windows {
 
     use crate::{Detect, InstalledApp};
     use std::io;
+    use std::os::windows::process::CommandExt as _;
     use std::path::{Path, PathBuf};
     use std::process::{ExitStatus, Stdio};
 
@@ -1238,7 +1239,8 @@ mod windows {
                 }
                 cmd.stdin(Stdio::null())
                     .stdout(Stdio::null())
-                    .stderr(Stdio::null());
+                    .stderr(Stdio::null())
+                    .creation_flags(windows::Win32::System::Threading::DETACHED_PROCESS.0);
                 cmd.spawn()?;
             } else {
                 unsafe {

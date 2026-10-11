@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(any(unix, windows))]
 
 use std::{cell::RefCell, ops::Range, rc::Rc, time::Duration};
 

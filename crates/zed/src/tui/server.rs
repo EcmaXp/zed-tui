@@ -1,14 +1,18 @@
+#[cfg(unix)]
+use std::os::unix::{
+    fs::{DirBuilderExt as _, PermissionsExt as _},
+    net::{UnixListener, UnixStream},
+};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt as _;
+#[cfg(windows)]
+use uds_windows::{UnixListener, UnixStream};
+
 use std::{
     cell::RefCell,
-    ffi::OsString,
     fs,
-    io::{BufReader, ErrorKind, Write as _},
+    io::{BufReader, ErrorKind},
     net::Shutdown,
-    os::unix::{
-        ffi::{OsStrExt as _, OsStringExt as _},
-        fs::{DirBuilderExt as _, PermissionsExt as _},
-        net::{UnixListener, UnixStream},
-    },
     path::{Path, PathBuf},
     rc::Rc,
     sync::{
@@ -30,7 +34,7 @@ use futures::{
 use gpui::{App, AsyncApp, CursorStyle};
 use gpui_tui::{CellGrid, TuiPlatform};
 use parking_lot::Mutex;
-use util::ResultExt as _;
+use util::{ResultExt as _, paths::PathExt as _};
 use workspace::{AppState, MultiWorkspace};
 
 use crate::tui::{
@@ -68,6 +72,7 @@ pub struct SessionPaths {
     pub directory: PathBuf,
     pub socket: PathBuf,
     pub pid: PathBuf,
+    lock: PathBuf,
     pub log: PathBuf,
     pub root: PathBuf,
 }
@@ -84,14 +89,25 @@ impl SessionPaths {
         if !is_valid {
             bail!("invalid session name {session:?}: use letters, digits, '-', '_' and '.'");
         }
-        Ok(Self::in_directory(session, sessions_dir().join(session)))
+        let paths = Self::in_directory(session, sessions_dir().join(session));
+        #[cfg(windows)]
+        anyhow::ensure!(
+            paths
+                .socket
+                .to_str()
+                .is_some_and(|path| path.len() < MAX_SOCKET_PATH),
+            "the Windows session socket path is too long or is not Unicode: {}; use --user-data-dir with a shorter local path",
+            paths.socket.display()
+        );
+        Ok(paths)
     }
 
     fn in_directory(name: &str, directory: PathBuf) -> Self {
         Self {
             name: name.to_owned(),
-            socket: directory.join("server.sock"),
+            socket: socket_path(&directory),
             pid: directory.join("server.pid"),
+            lock: directory.join("server.lock"),
             log: directory.join("server.log"),
             root: directory.join("root"),
             directory,
@@ -106,11 +122,11 @@ pub struct RunningSession {
 
 pub fn canonical_target(path: &Path, current_dir: &Path) -> PathBuf {
     let path = current_dir.join(path);
-    if let Ok(canonical) = path.canonicalize() {
+    if let Ok(canonical) = dunce::canonicalize(&path) {
         return canonical;
     }
     match (path.parent(), path.file_name()) {
-        (Some(parent), Some(name)) => match parent.canonicalize() {
+        (Some(parent), Some(name)) => match dunce::canonicalize(parent) {
             Ok(parent) => parent.join(name),
             Err(_) => path,
         },
@@ -150,8 +166,22 @@ pub fn session_name_for_root(root: &Path) -> String {
     };
     format!(
         "{basename}-{:08x}",
-        fnv1a(root.as_os_str().as_bytes()) as u32
+        fnv1a(root.as_os_str().as_encoded_bytes()) as u32
     )
+}
+
+#[cfg(unix)]
+fn socket_path(directory: &Path) -> PathBuf {
+    directory.join("server.sock")
+}
+
+#[cfg(windows)]
+const MAX_SOCKET_PATH: usize = 108;
+
+#[cfg(windows)]
+fn socket_path(directory: &Path) -> PathBuf {
+    let hash = fnv1a(directory.as_os_str().as_encoded_bytes());
+    directory.with_file_name(format!("{hash:016x}.sock"))
 }
 
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -161,13 +191,12 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 }
 
 fn write_root(session_paths: &SessionPaths, root: &Path) -> Result<()> {
-    fs::write(&session_paths.root, root.as_os_str().as_bytes())
+    fs::write(&session_paths.root, root.as_os_str().as_encoded_bytes())
         .with_context(|| format!("writing {}", session_paths.root.display()))
 }
 
 fn read_root(session_paths: &SessionPaths) -> Option<PathBuf> {
-    let bytes = fs::read(&session_paths.root).ok()?;
-    Some(PathBuf::from(OsString::from_vec(bytes)))
+    PathBuf::try_from_bytes(&fs::read(&session_paths.root).ok()?).ok()
 }
 
 pub fn deepest_covering<'a>(
@@ -193,13 +222,17 @@ fn sessions_dir() -> PathBuf {
 }
 
 fn create_private_dir(path: &Path) -> Result<()> {
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder
         .create(path)
         .with_context(|| format!("creating {}", path.display()))?;
+    #[cfg(unix)]
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("restricting {}", path.display()))
+        .with_context(|| format!("restricting {}", path.display()))?;
+    Ok(())
 }
 
 pub fn is_running(paths: &SessionPaths) -> bool {
@@ -364,7 +397,7 @@ pub struct Started {
 pub struct SessionGuard {
     hub: Arc<ClientHub>,
     session_paths: SessionPaths,
-    _pid_lock: fs::File,
+    _session_lock: fs::File,
 }
 
 impl Drop for SessionGuard {
@@ -377,18 +410,18 @@ impl Drop for SessionGuard {
 
 fn lock_session(session_paths: &SessionPaths) -> Result<fs::File> {
     create_private_dir(&session_paths.directory)?;
-    let mut pid_lock = fs::OpenOptions::new()
+    let lock = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(&session_paths.pid)
-        .with_context(|| format!("opening {}", session_paths.pid.display()))?;
-    if pid_lock.try_lock().is_err() || is_running(session_paths) {
+        .open(&session_paths.lock)
+        .with_context(|| format!("opening {}", session_paths.lock.display()))?;
+    if lock.try_lock().is_err() || is_running(session_paths) {
         return Err(AlreadyRunning(session_paths.name.clone()).into());
     }
-    pid_lock.set_len(0)?;
-    write!(pid_lock, "{}", std::process::id())?;
-    Ok(pid_lock)
+    fs::write(&session_paths.pid, std::process::id().to_string())
+        .with_context(|| format!("writing {}", session_paths.pid.display()))?;
+    Ok(lock)
 }
 
 pub fn start_session(
@@ -396,7 +429,7 @@ pub fn start_session(
     root: Option<&Path>,
     platform: Rc<TuiPlatform>,
 ) -> Result<(SessionGuard, Started)> {
-    let pid_lock = lock_session(&session_paths)?;
+    let session_lock = lock_session(&session_paths)?;
     if let Some(root) = root {
         write_root(&session_paths, root)?;
     }
@@ -452,7 +485,7 @@ pub fn start_session(
     let session = SessionGuard {
         hub,
         session_paths,
-        _pid_lock: pid_lock,
+        _session_lock: session_lock,
     };
     Ok((session, started))
 }
@@ -517,10 +550,15 @@ pub fn start_snapshot(
 fn file_urls(paths: &[PathBuf]) -> Vec<String> {
     paths
         .iter()
-        .filter_map(|path| match url::Url::from_file_path(path) {
-            Ok(url) => Some(url.to_string()),
-            Err(()) => {
-                log::error!("cannot open {}: not an absolute path", path.display());
+        .filter_map(|path| match path.to_str() {
+            Some(path_str) if path.is_absolute() => {
+                Some(format!("file://{}", urlencoding::encode(path_str)))
+            }
+            _ => {
+                log::error!(
+                    "cannot open {}: not an absolute Unicode path",
+                    path.display()
+                );
                 None
             }
         })
@@ -945,6 +983,8 @@ pub fn spawn_daemon(
         .arg(root)
         .args(paths_to_open)
         .env(SESSION_ENV, &session_paths.name);
+    #[cfg(windows)]
+    command.creation_flags(windows::Win32::System::Threading::DETACHED_PROCESS.0);
     util::set_pre_exec_to_start_new_session(&mut command);
     let mut child = smol::process::Command::from(command)
         .stdin(smol::process::Stdio::null())
@@ -998,6 +1038,9 @@ pub fn list() -> Result<Vec<RunningSession>> {
     };
     for entry in entries {
         let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
         let name = entry.file_name().to_string_lossy().into_owned();
         let Ok(session_paths) = SessionPaths::new(&name) else {
             continue;
@@ -1092,6 +1135,7 @@ mod tests {
         assert!(matches!(reply, ServerMessage::Error(error) if error.contains("zed --tui kill")));
     }
 
+    #[cfg(unix)]
     #[test]
     fn session_directories_are_private_even_if_they_existed() {
         let directory = tempfile::tempdir().unwrap();
@@ -1297,12 +1341,33 @@ mod tests {
     #[gpui::test]
     fn opened_paths_keep_url_metacharacters(cx: &mut gpui::TestAppContext) {
         let paths = [
-            "/tmp/x/percent%41.txt",
-            "/tmp/x/100%.txt",
-            "/tmp/x/with space.txt",
-            "/tmp/x/hash#1.txt",
-            "/tmp/x/what?.txt",
-            "/tmp/x/한글.txt",
+            util::path!("/tmp/x/percent%41.txt"),
+            util::path!("/tmp/x/100%.txt"),
+            util::path!("/tmp/x/with space.txt"),
+            util::path!("/tmp/x/hash#1.txt"),
+            util::path!("/tmp/x/what?.txt"),
+            util::path!("/tmp/x/한글.txt"),
+        ];
+        let urls = file_urls(&paths.map(PathBuf::from));
+        let request = cx.update(|cx| {
+            crate::zed::OpenRequest::parse(
+                crate::zed::RawOpenRequest {
+                    urls,
+                    ..Default::default()
+                },
+                cx,
+            )
+            .unwrap()
+        });
+        assert_eq!(request.open_paths, paths);
+    }
+
+    #[cfg(windows)]
+    #[gpui::test]
+    fn opened_windows_paths_keep_drive_letters_and_shares(cx: &mut gpui::TestAppContext) {
+        let paths = [
+            r"C:\work\한글 repo\percent%41.txt",
+            r"\\server\share\with space.txt",
         ];
         let urls = file_urls(&paths.map(PathBuf::from));
         let request = cx.update(|cx| {
@@ -1344,6 +1409,7 @@ mod tests {
         assert_eq!(session_root_for(&plain), plain);
     }
 
+    #[cfg(unix)]
     #[test]
     fn targets_resolve_symlinks_and_missing_files_through_their_parent() {
         let directory = tempfile::tempdir().unwrap();
@@ -1365,6 +1431,7 @@ mod tests {
 
     #[test]
     fn session_names_from_roots_are_valid_stable_and_distinct() {
+        #[cfg(unix)]
         assert_eq!(
             session_name_for_root(Path::new("/work/zed")),
             "zed-a5a7578b"
@@ -1409,6 +1476,35 @@ mod tests {
         let root = Path::new("/work/한글 repo");
         write_root(&session_paths, root).unwrap();
         assert_eq!(read_root(&session_paths).as_deref(), Some(root));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_session_roots_preserve_non_unicode_paths() -> Result<()> {
+        use std::{ffi::OsString, os::windows::ffi::OsStringExt as _};
+
+        let directory = tempfile::tempdir()?;
+        let session_paths = SessionPaths::in_directory("wide", directory.path().to_path_buf());
+        let mut wide = r"C:\work\".encode_utf16().collect::<Vec<_>>();
+        wide.push(0xd800);
+        let root = PathBuf::from(OsString::from_wide(&wide));
+        write_root(&session_paths, &root)?;
+        assert_eq!(read_root(&session_paths), Some(root));
+
+        fs::write(&session_paths.root, [0xff])?;
+        assert_eq!(read_root(&session_paths), None);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_socket_paths_do_not_grow_with_session_names() {
+        let directory = Path::new(r"C:\Users\developer\AppData\Local\Zed\tui\dev");
+        let first = SessionPaths::in_directory("first", directory.join("a".repeat(120)));
+        let second = SessionPaths::in_directory("second", directory.join("b".repeat(120)));
+        assert!(first.socket.as_os_str().len() < MAX_SOCKET_PATH);
+        assert_eq!(first.socket.parent(), Some(directory));
+        assert_ne!(first.socket, second.socket);
     }
 
     #[test]

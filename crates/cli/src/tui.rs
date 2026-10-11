@@ -25,26 +25,29 @@ pub fn launch(mut args: impl Iterator<Item = OsString>) -> Option<Launch> {
     })
 }
 
-#[cfg(unix)]
 pub fn run(launch: Launch) -> Result<()> {
     use crate::{Detect, InstalledApp as _};
     use anyhow::Context as _;
-    use std::os::unix::process::CommandExt as _;
 
     #[cfg(target_os = "linux")]
     let zed = launch.zed.or_else(crate::flatpak::bin_if_no_escape);
     #[cfg(not(target_os = "linux"))]
     let zed = launch.zed;
     let app = Detect::detect(zed.as_deref()).context("Bundle detection")?;
-    let error = std::process::Command::new(app.path())
-        .args(launch.arguments)
-        .exec();
-    Err(error).with_context(|| format!("running {}", app.path().display()))
-}
-
-#[cfg(not(unix))]
-pub fn run(_launch: Launch) -> Result<()> {
-    anyhow::bail!("--tui is only supported on Unix")
+    let mut command = std::process::Command::new(app.path());
+    command.args(launch.arguments);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        Err(command.exec()).with_context(|| format!("running {}", app.path().display()))
+    }
+    #[cfg(windows)]
+    {
+        let status = command
+            .status()
+            .with_context(|| format!("running {}", app.path().display()))?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
 }
 
 #[cfg(test)]
