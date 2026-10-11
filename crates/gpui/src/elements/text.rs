@@ -645,6 +645,7 @@ impl TextLayout {
                 .line_height
                 .to_pixels(font_size.into(), window.rem_size()),
         );
+        let line_height = window.cell_line_height(line_height);
 
         let runs = if let Some(runs) = runs {
             runs

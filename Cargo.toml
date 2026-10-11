@@ -99,6 +99,7 @@ members = [
     "crates/gpui_platform",
     "crates/gpui_shared_string",
     "crates/gpui_tokio",
+    "crates/gpui_tui",
     "crates/gpui_util",
     "crates/gpui_web",
     "crates/gpui_wgpu",
@@ -370,6 +371,7 @@ gpui_macros = { path = "crates/gpui_macros" }
 gpui_platform = { path = "crates/gpui_platform", default-features = false }
 gpui_shared_string = { path = "crates/gpui_shared_string" }
 gpui_tokio = { path = "crates/gpui_tokio" }
+gpui_tui = { path = "crates/gpui_tui" }
 gpui_util = { path = "crates/gpui_util" }
 gpui_web = { path = "crates/gpui_web" }
 gpui_wgpu = { path = "crates/gpui_wgpu" }
@@ -604,6 +606,7 @@ crash-handler = "0.8"
 criterion = { version = "0.8.2", features = ["html_reports"] }
 perf-event = { package = "perf-event2", version = "0.7.4" }
 crossbeam-queue = "0.3.12"
+crossterm = "0.29"
 ctor = "1.0.12"
 dap-types = { git = "https://github.com/zed-industries/dap-types", rev = "1b461b310481d01e02b2603c16d7144b926339f8" }
 dashmap = "6.0"
@@ -902,6 +905,7 @@ tree-sitter-ruby = "0.23"
 tree-sitter-rust = "0.24.2"
 tree-sitter-typescript = { git = "https://github.com/zed-industries/tree-sitter-typescript", rev = "e2c53597d6a5d9cf7bbe8dccde576fe1e46c5899" } # https://github.com/tree-sitter/tree-sitter-typescript/pull/347
 tree-sitter-yaml = { git = "https://github.com/zed-industries/tree-sitter-yaml", rev = "baff0b51c64ef6a1fb1f8390f3ad6015b83ec13a" }
+uds_windows = "1.1.0"
 unicase = "2.6"
 unicode-bidi = { version = "0.3.18", default-features = false, features = [
     "hardcoded-data",
@@ -1127,6 +1131,13 @@ inherits = "release"
 debug = "full"
 lto = false
 codegen-units = 16
+
+[profile.release-local]
+inherits = "release"
+debug = "line-tables-only"
+
+[profile.release-local.package]
+zed = { codegen-units = 16 }
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "allow" }

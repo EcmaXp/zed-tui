@@ -197,6 +197,14 @@ pub(crate) struct ButtonLikeStyles {
     pub icon_color: Hsla,
 }
 
+const CELL_GRID_TINT_HOVER_AMOUNT: f32 = 0.2;
+
+fn cell_grid_tint_hover(tint: Hsla, strong: Hsla) -> Hsla {
+    let mut hover = tint.blend(strong.opacity(CELL_GRID_TINT_HOVER_AMOUNT));
+    hover.a = tint.a + (1. - tint.a) * CELL_GRID_TINT_HOVER_AMOUNT;
+    hover
+}
+
 fn element_bg_from_elevation(elevation: Option<ElevationIndex>, cx: &mut App) -> Hsla {
     match elevation {
         Some(ElevationIndex::Background) => cx.theme().colors().element_background,
@@ -273,8 +281,11 @@ impl ButtonStyle {
             }
             ButtonStyle::Tinted(tint) => {
                 let mut styles = tint.button_like_style(cx);
-                let theme = cx.theme();
-                styles.background = theme.darken(styles.background, 0.05, 0.2);
+                styles.background = if cx.text_system().renders_to_cell_grid() {
+                    cell_grid_tint_hover(styles.background, Color::from(tint).color(cx))
+                } else {
+                    cx.theme().darken(styles.background, 0.05, 0.2)
+                };
                 styles
             }
             ButtonStyle::Outlined => ButtonLikeStyles {

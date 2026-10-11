@@ -622,6 +622,10 @@ impl KeymapEditor {
         })
         .detach();
 
+        let edit_column_width = window
+            .text_system()
+            .cell_size()
+            .map_or(px(36.), |cell_size| cell_size.width * 4.);
         let mut this = Self {
             workspace,
             keybindings: vec![],
@@ -654,7 +658,7 @@ impl KeymapEditor {
                 RedistributableColumnsState::new(
                     COLS,
                     vec![
-                        DefiniteLength::Absolute(AbsoluteLength::Pixels(px(36.))),
+                        DefiniteLength::Absolute(AbsoluteLength::Pixels(edit_column_width)),
                         DefiniteLength::Fraction(0.25),
                         DefiniteLength::Fraction(0.20),
                         DefiniteLength::Fraction(0.14),
@@ -3760,7 +3764,7 @@ async fn remove_keybinding(
 
 fn collect_contexts_from_assets() -> Vec<SharedString> {
     let mut keymap_assets = vec![
-        util::asset_str::<SettingsAssets>(settings::DEFAULT_KEYMAP_PATH),
+        settings::default_keymap(),
         util::asset_str::<SettingsAssets>(settings::VIM_KEYMAP_PATH),
     ];
     keymap_assets.extend(

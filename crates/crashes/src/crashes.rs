@@ -656,7 +656,7 @@ fn spawn_crash_handler(exe: &Path, socket_name: &Path) {
     use std::iter::once;
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::System::Threading::{
-        CreateProcessW, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTF_FORCEOFFFEEDBACK,
+        CREATE_NO_WINDOW, CreateProcessW, PROCESS_INFORMATION, STARTF_FORCEOFFFEEDBACK,
         STARTUPINFOW,
     };
     use windows::core::PWSTR;
@@ -688,7 +688,7 @@ fn spawn_crash_handler(exe: &Path, socket_name: &Path) {
             None,
             None,
             false,
-            PROCESS_CREATION_FLAGS(0),
+            CREATE_NO_WINDOW,
             None,
             None,
             &startup_info,

@@ -1,5 +1,5 @@
 use gpui::Window;
-use gpui::{Pixels, Rems, Size};
+use gpui::{Pixels, Rems, Size, px};
 use ui::{Div, Styled, rems_from_px};
 
 use crate::preview::Layout;
@@ -23,6 +23,20 @@ pub(crate) struct PositionAndShape {
 impl PositionAndShape {
     pub(crate) fn width(&self) -> Pixels {
         self.right - self.left
+    }
+}
+
+fn rem_size(window: &Window) -> Size<Pixels> {
+    let rem = window.rem_size();
+    Size::new(rem * window.text_width_scale(), rem)
+}
+
+pub(crate) fn gui_width(width: Rems, window: &Window) -> RelativeWidth {
+    match window.text_system().cell_size() {
+        Some(_) => RelativeWidth::rems(Rems(
+            width.0 * (px(ui::BASE_REM_SIZE_IN_PX) / rem_size(window).width),
+        )),
+        None => RelativeWidth::rems(width),
     }
 }
 
@@ -68,7 +82,7 @@ macro_rules! relative_size {
 
             pub fn as_pixels(&self, window: &Window) -> Pixels {
                 self.viewport_fraction * window.viewport_size().$accessor
-                    + self.rems * window.rem_size()
+                    + self.rems * rem_size(window).$accessor
             }
 
             pub fn from_pixels(width: Pixels, window: &Window) -> Self {
@@ -88,7 +102,7 @@ macro_rules! relative_size {
             pub fn as_viewport_fraction(&self, window: &Window) -> ViewportFraction {
                 ViewportFraction(
                     self.viewport_fraction
-                        + self.rems * window.rem_size() / window.viewport_size().$accessor,
+                        + self.rems * rem_size(window).$accessor / window.viewport_size().$accessor,
                 )
             }
         }
@@ -258,14 +272,16 @@ impl SizeBounds {
     /// results and preview minimums (they stack along the split axis and share
     /// the cross axis).
     fn min_width(&self, layout: Option<Layout>, window: &Window) -> Pixels {
-        let rem = window.rem_size();
+        let rem = rem_size(window).width;
         let results = self.min_results.width * rem;
         let preview = self.min_preview.width * rem;
-        match layout {
+        let min_width = match layout {
             Some(Layout::Right) => results + preview,
             Some(Layout::Below) => results.max(preview),
             Some(Layout::Hidden) | None => results,
-        }
+        };
+        let unscaled = min_width / window.text_width_scale();
+        min_width.min(unscaled.max(window.viewport_size().width))
     }
 
     /// Minimum total picker height for the given layout. See [`Self::min_width`].

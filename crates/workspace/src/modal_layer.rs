@@ -295,12 +295,14 @@ impl Render for ModalLayer {
             return active_modal.modal.view().into_any_element();
         }
 
+        let fade_out_background =
+            active_modal.modal.fade_out_background(cx) && !cx.text_system().renders_to_cell_grid();
         div()
             .absolute()
             .size_full()
             .inset_0()
             .occlude()
-            .when(active_modal.modal.fade_out_background(cx), |this| {
+            .when(fade_out_background, |this| {
                 let mut background = cx.theme().colors().elevated_surface_background;
                 background.fade_out(0.2);
                 this.bg(background)

@@ -11,10 +11,10 @@ use crate::{
     ConflictsOurs, ConflictsOursMarker, ConflictsOuter, ConflictsTheirs, ConflictsTheirsMarker,
     ContextMenuPlacement, CursorShape, CustomBlockId, DisplayDiffHunk, DisplayPoint, DisplayRow,
     EditDisplayMode, EditPrediction, Editor, EditorMode, EditorSettings, EditorSnapshot,
-    EditorStyle, FILE_HEADER_HEIGHT, FocusedBlock, GutterDimensions, HalfPageDown, HalfPageUp,
-    HandleInput, HoveredCursor, InlayHintRefreshReason, LineDown, LineHighlight, LineUp,
-    MAX_LINE_LEN, MINIMAP_FONT_SIZE, PageDown, PageUp, Point, RowExt, RowRangeExt, Selection,
-    SelectionDragState, SizingBehavior, SoftWrap, ToPoint,
+    EditorStyle, FocusedBlock, GutterDimensions, HalfPageDown, HalfPageUp, HandleInput,
+    HoveredCursor, InlayHintRefreshReason, LineDown, LineHighlight, LineUp, MAX_LINE_LEN,
+    MINIMAP_FONT_SIZE, PageDown, PageUp, Point, RowExt, RowRangeExt, Selection, SelectionDragState,
+    SizingBehavior, SoftWrap, ToPoint,
     code_context_menus::{CodeActionsMenu, MENU_ASIDE_MAX_WIDTH, MENU_ASIDE_MIN_WIDTH, MENU_GAP},
     column_pixels,
     cursor_animation::{CursorViewport, LogicalCursorPosition, animated_corners_overlap_target},
@@ -703,6 +703,17 @@ impl EditorElement {
         register_action(editor, window, Editor::reload_file);
 
         if !editor.read(cx).read_only(cx) {
+            fn register_action<T: Action>(
+                editor: &Entity<Editor>,
+                window: &mut Window,
+                listener: impl Fn(&mut Editor, &T, &mut Window, &mut Context<Editor>) + 'static,
+            ) {
+                self::register_action(editor, window, move |editor, action, window, cx| {
+                    if !editor.unfold_buffers_with_selections(cx) {
+                        listener(editor, action, window, cx);
+                    }
+                });
+            }
             register_action(editor, window, Editor::newline);
             register_action(editor, window, Editor::newline_above);
             register_action(editor, window, Editor::newline_below);
@@ -780,7 +791,7 @@ impl EditorElement {
             if editor.read(cx).enable_wrap_selections_in_tag(cx) {
                 register_action(editor, window, Editor::wrap_selections_in_tag);
             }
-            register_action(
+            self::register_action(
                 editor,
                 window,
                 |editor, HandleInput(text): &HandleInput, window, cx| {
@@ -2766,6 +2777,11 @@ impl EditorElement {
         }
 
         let editor_font_size = self.style.text.font_size.to_pixels(window.rem_size()) * 1.2;
+        let button_size = if window.text_system().renders_to_cell_grid() {
+            ButtonSize::Compact
+        } else {
+            ButtonSize::Default
+        };
 
         let max_line_number_length = self
             .editor
@@ -2815,6 +2831,7 @@ impl EditorElement {
                 let toggle = IconButton::new(("expand", ix), icon_name)
                     .icon_color(Color::Custom(cx.theme().colors().editor_line_number))
                     .icon_size(IconSize::Custom(rems(editor_font_size / window.rem_size())))
+                    .size(button_size)
                     .width(width)
                     .on_click(move |_, window, cx| {
                         editor.update(cx, |editor, cx| {
@@ -3404,8 +3421,7 @@ impl EditorElement {
                         cx,
                     ));
                 } else {
-                    result =
-                        result.child(div().h(FILE_HEADER_HEIGHT as f32 * window.line_height()));
+                    result = result.child(div().h(*height as f32 * window.line_height()));
                 }
 
                 result.into_any_element()
@@ -3457,12 +3473,10 @@ impl EditorElement {
                             ),
                         ));
                     } else {
-                        result =
-                            result.child(div().h(FILE_HEADER_HEIGHT as f32 * window.line_height()));
+                        result = result.child(div().h(*height as f32 * window.line_height()));
                     }
                 } else {
-                    result =
-                        result.child(div().h(FILE_HEADER_HEIGHT as f32 * window.line_height()));
+                    result = result.child(div().h(*height as f32 * window.line_height()));
                 }
 
                 result.into_any()
@@ -4062,7 +4076,7 @@ impl EditorElement {
         }
 
         // Add spacing around `target_bounds` and `max_target_bounds`.
-        let mut extend_amount = Edges::all(MENU_GAP);
+        let mut extend_amount = Edges::all(popover_gap(line_height, window));
         if y_flipped {
             extend_amount.bottom = line_height;
         } else {
@@ -4280,6 +4294,7 @@ impl EditorElement {
                 },
             };
 
+            let gap = popover_gap(line_height, window);
             let mut laid_out_popovers = popovers
                 .into_iter()
                 .map(|(popover_type, element, size)| {
@@ -4289,9 +4304,9 @@ impl EditorElement {
                     let position = current_position;
                     window.defer_draw(element, current_position, 1, None);
                     if !y_flipped {
-                        current_position.y += size.height + MENU_GAP;
+                        current_position.y += size.height + gap;
                     } else {
-                        current_position.y -= MENU_GAP;
+                        current_position.y -= gap;
                     }
                     (popover_type, Bounds::new(position, size))
                 })
@@ -7057,6 +7072,14 @@ impl Gutter<'_> {
     }
 }
 
+fn popover_gap(line_height: Pixels, window: &Window) -> Pixels {
+    if window.text_system().renders_to_cell_grid() {
+        line_height
+    } else {
+        MENU_GAP
+    }
+}
+
 pub fn render_breadcrumb_text(
     mut segments: Vec<HighlightedText>,
     breadcrumb_font: Option<Font>,
@@ -7116,9 +7139,14 @@ pub fn render_breadcrumb_text(
     let breadcrumbs_stack = h_flex()
         .gap_1()
         .when(multibuffer_header, |this| {
+            let border_color = cx.theme().colors().border;
             this.pl_2()
                 .border_l_1()
-                .border_color(cx.theme().colors().border.opacity(0.6))
+                .border_color(if window.text_system().renders_to_cell_grid() {
+                    border_color
+                } else {
+                    border_color.opacity(0.6)
+                })
         })
         .children(breadcrumbs);
 
@@ -9880,7 +9908,7 @@ impl Element for EditorElement {
                     let has_sticky_buffer_header =
                         sticky_buffer_header.is_some() || sticky_header_excerpt_id.is_some();
                     let sticky_header_height = if has_sticky_buffer_header {
-                        let full_height = FILE_HEADER_HEIGHT as f32 * line_height;
+                        let full_height = snapshot.buffer_header_height() as f32 * line_height;
                         let display_row = blocks
                             .iter()
                             .filter(|block| block.is_buffer_header)
@@ -9889,7 +9917,9 @@ impl Element for EditorElement {
                             });
                         let offset = match display_row {
                             Some(display_row) => {
-                                let max_row = display_row.0.saturating_sub(FILE_HEADER_HEIGHT);
+                                let max_row = display_row
+                                    .0
+                                    .saturating_sub(snapshot.buffer_header_height());
                                 let offset = (scroll_position.y - max_row as f64).max(0.0);
                                 let slide_up =
                                     Pixels::from(offset * ScrollPixelOffset::from(line_height));
@@ -9898,8 +9928,11 @@ impl Element for EditorElement {
                             }
                             None => full_height,
                         };
-                        let header_bottom_padding =
-                            BUFFER_HEADER_PADDING.to_pixels(window.rem_size());
+                        let header_bottom_padding = if window.text_system().renders_to_cell_grid() {
+                            Pixels::ZERO
+                        } else {
+                            BUFFER_HEADER_PADDING.to_pixels(window.rem_size())
+                        };
                         sticky_scroll_header_height + offset - header_bottom_padding
                     } else {
                         sticky_scroll_header_height
@@ -11321,6 +11354,7 @@ fn compute_auto_height_layout(
 
 #[cfg(test)]
 mod tests {
+    mod fork_tests;
     use super::*;
     use crate::{
         Editor, FoldPlaceholder, HighlightKey, Inlay, MultiBuffer, NavigationOverlayKey,

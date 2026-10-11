@@ -928,6 +928,10 @@ impl DisplayMap {
         &self.block_map.folded_buffers
     }
 
+    pub(crate) fn buffer_header_height(&self) -> u32 {
+        self.block_map.buffer_header_height
+    }
+
     #[instrument(skip_all)]
     pub fn insert_creases(
         &mut self,

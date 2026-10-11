@@ -181,7 +181,7 @@ impl Editor {
             retain
         });
         if symbols_altered {
-            self.refresh_outline_symbols_at_cursor(cx);
+            self.update_outline_symbols_at_cursor(true, cx);
         }
 
         if buffers_to_query.is_empty() {
@@ -237,7 +237,7 @@ impl Editor {
                             }
                         }
                         editor.lsp_document_symbols.extend(highlighted_results);
-                        editor.refresh_outline_symbols_at_cursor(cx);
+                        editor.update_outline_symbols_at_cursor(true, cx);
                     })
                     .ok();
             })
@@ -372,6 +372,7 @@ fn highlights_from_buffer(
 
 #[cfg(test)]
 mod tests {
+    mod fork_tests;
     use std::{
         sync::{Arc, atomic},
         time::Duration,

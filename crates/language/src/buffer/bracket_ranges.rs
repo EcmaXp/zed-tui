@@ -264,6 +264,7 @@ impl<'a> ChunkBrackets<'a> {
             TreeSitterOptions {
                 max_bytes_to_query: Some(MAX_BYTES_TO_QUERY),
                 max_start_depth: None,
+                match_limit: None,
             },
         );
         // The bounded query drops any pair spanning more than `MAX_BYTES_TO_QUERY`

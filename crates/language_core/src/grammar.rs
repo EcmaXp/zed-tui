@@ -6,8 +6,11 @@ use anyhow::{Context as _, Result};
 use collections::HashMap;
 use gpui_shared_string::SharedString;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-use tree_sitter::Query;
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicUsize, Ordering::SeqCst},
+};
+use tree_sitter::{CaptureQuantifier, Query};
 
 pub static NEXT_GRAMMAR_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -214,6 +217,186 @@ pub struct RunnableConfig {
     /// `true` if the query uses `@run_item`, the marker for matches that
     /// emit multiple runnables.
     pub supports_grouped_runnables: bool,
+    text_gated_patterns: Vec<TextGatedPattern>,
+    text_gated_queries: Vec<OnceLock<Query>>,
+}
+
+struct TextGatedPattern {
+    pattern_index: usize,
+    required_texts: Vec<String>,
+}
+
+const MAX_TEXT_GATED_RUNNABLE_PATTERNS: usize = 6;
+
+impl RunnableConfig {
+    pub fn query_for_text(&self, mut contains_text: impl FnMut(&str) -> bool) -> &Query {
+        let mut disabled_patterns = 0_usize;
+        for (bit, gated_pattern) in self.text_gated_patterns.iter().enumerate() {
+            if !gated_pattern
+                .required_texts
+                .iter()
+                .all(|text| contains_text(text))
+            {
+                disabled_patterns |= 1 << bit;
+            }
+        }
+        if disabled_patterns == 0 {
+            return &self.query;
+        }
+        let Some(gated_query) = self.text_gated_queries.get(disabled_patterns) else {
+            return &self.query;
+        };
+        gated_query.get_or_init(|| {
+            let mut query = self.query.deep_clone();
+            for (bit, gated_pattern) in self.text_gated_patterns.iter().enumerate() {
+                if disabled_patterns & (1 << bit) != 0 {
+                    query.disable_pattern(gated_pattern.pattern_index);
+                }
+            }
+            query
+        })
+    }
+}
+
+fn text_gated_patterns(query: &Query, source: &str) -> Vec<TextGatedPattern> {
+    (0..query.pattern_count())
+        .filter_map(|pattern_index| {
+            let pattern_source = source.get(
+                query.start_byte_for_pattern(pattern_index)
+                    ..query.end_byte_for_pattern(pattern_index),
+            )?;
+            let quantifiers = query.capture_quantifiers(pattern_index);
+            let mut required_texts = Vec::new();
+            for (capture_name, literal) in literal_text_predicates(pattern_source) {
+                let Some(capture_index) = query.capture_index_for_name(capture_name) else {
+                    continue;
+                };
+                let capture_is_required = matches!(
+                    quantifiers.get(capture_index as usize),
+                    Some(CaptureQuantifier::One | CaptureQuantifier::OneOrMore)
+                );
+                if capture_is_required && !required_texts.contains(&literal) {
+                    required_texts.push(literal);
+                }
+            }
+            (!required_texts.is_empty()).then_some(TextGatedPattern {
+                pattern_index,
+                required_texts,
+            })
+        })
+        .take(MAX_TEXT_GATED_RUNNABLE_PATTERNS)
+        .collect()
+}
+
+#[derive(Debug, PartialEq)]
+enum QueryToken<'a> {
+    Open,
+    Close,
+    Predicate(&'a str),
+    Capture(&'a str),
+    Text(Option<&'a str>),
+    Other,
+}
+
+fn query_tokens(source: &str) -> Vec<QueryToken<'_>> {
+    let bytes = source.as_bytes();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while let Some(&byte) = bytes.get(index) {
+        match byte {
+            b';' => {
+                while bytes.get(index).is_some_and(|&byte| byte != b'\n') {
+                    index += 1;
+                }
+            }
+            b'(' => {
+                tokens.push(QueryToken::Open);
+                index += 1;
+            }
+            b')' => {
+                tokens.push(QueryToken::Close);
+                index += 1;
+            }
+            b'"' => {
+                let start = index + 1;
+                let mut end = start;
+                let mut has_escape = false;
+                loop {
+                    match bytes.get(end) {
+                        None => return tokens,
+                        Some(b'\\') => {
+                            has_escape = true;
+                            end += 2;
+                        }
+                        Some(b'"') => break,
+                        Some(_) => end += 1,
+                    }
+                }
+                let text = if has_escape {
+                    None
+                } else {
+                    source.get(start..end)
+                };
+                tokens.push(QueryToken::Text(text));
+                index = end + 1;
+            }
+            byte if byte.is_ascii_whitespace() => index += 1,
+            _ => {
+                let start = index;
+                while bytes.get(index).is_some_and(|&byte| {
+                    !byte.is_ascii_whitespace() && !matches!(byte, b'(' | b')' | b'"' | b';')
+                }) {
+                    index += 1;
+                }
+                let word = source.get(start..index).unwrap_or_default();
+                tokens.push(if let Some(name) = word.strip_prefix('#') {
+                    QueryToken::Predicate(name)
+                } else if let Some(name) = word.strip_prefix('@') {
+                    QueryToken::Capture(name)
+                } else {
+                    QueryToken::Other
+                });
+            }
+        }
+    }
+    tokens
+}
+
+fn literal_text_predicates(pattern_source: &str) -> Vec<(&str, String)> {
+    query_tokens(pattern_source)
+        .windows(5)
+        .filter_map(|window| match window {
+            [
+                QueryToken::Open,
+                QueryToken::Predicate(predicate),
+                QueryToken::Capture(capture_name),
+                QueryToken::Text(Some(text)),
+                QueryToken::Close,
+            ] => {
+                let literal = match *predicate {
+                    "eq?" => Some(text.to_string()),
+                    "match?" => regex_required_literal(text),
+                    _ => None,
+                }?;
+                (!literal.is_empty()).then_some((*capture_name, literal))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn regex_required_literal(regex: &str) -> Option<String> {
+    let regex = regex.strip_prefix('^').unwrap_or(regex);
+    let regex = regex.strip_suffix('$').unwrap_or(regex);
+    let regex = regex.strip_prefix(".*").unwrap_or(regex);
+    let regex = regex.strip_suffix(".*").unwrap_or(regex);
+    let is_plain_literal = !regex.chars().any(|character| {
+        matches!(
+            character,
+            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$'
+        )
+    });
+    is_plain_literal.then(|| regex.to_string())
 }
 
 pub struct OverrideConfig {
@@ -494,11 +677,21 @@ impl Grammar {
         let supports_grouped_runnables = extra_captures
             .iter()
             .any(|capture| matches!(capture, RunnableCapture::RunItem));
+        let text_gated_patterns = text_gated_patterns(&query, source);
+        let text_gated_queries = if text_gated_patterns.is_empty() {
+            Vec::new()
+        } else {
+            std::iter::repeat_with(OnceLock::new)
+                .take(1 << text_gated_patterns.len())
+                .collect()
+        };
 
         self.runnable_config = Some(RunnableConfig {
             extra_captures,
             query,
             supports_grouped_runnables,
+            text_gated_patterns,
+            text_gated_queries,
         });
 
         Ok(self)

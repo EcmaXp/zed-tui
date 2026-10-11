@@ -1,7 +1,5 @@
-// Disable command line from opening on release mode
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
 mod reliability;
+mod tui;
 mod watcher_debug;
 mod zed;
 
@@ -210,7 +208,10 @@ fn main() {
     #[cfg(unix)]
     util::prevent_root_execution();
 
-    let args = Args::parse();
+    let (tui_server, tui_startup) = tui::start().unzip();
+    let args = tui_server.as_ref().map_or_else(Args::parse, |tui_server| {
+        Args::parse_from(tui_server.zed_args())
+    });
 
     // `zed --askpass` Makes zed operate in nc/netcat mode for use with askpass
     #[cfg(not(target_os = "windows"))]
@@ -239,13 +240,11 @@ fn main() {
         return;
     }
 
+    #[cfg(target_os = "windows")]
+    let launch_console = launch_console();
     #[cfg(all(not(debug_assertions), target_os = "windows"))]
-    unsafe {
-        use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
-
-        if args.foreground {
-            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
-        }
+    if tui_server.is_none() && !writes_to_console(&args) {
+        detach_gui_from_console(launch_console);
     }
 
     // `zed --printenv` Outputs environment variables as JSON to stdout
@@ -288,7 +287,9 @@ fn main() {
 
     zlog::init();
 
-    if stdout_is_a_pty() {
+    if tui_server.is_some() {
+        zlog::init_output_stderr();
+    } else if stdout_is_a_pty() {
         zlog::init_output_stdout();
     } else {
         let result = zlog::init_output_file(paths::log_file(), Some(paths::old_log_file()));
@@ -336,14 +337,24 @@ fn main() {
             .unwrap_or("unknown"),
     );
 
+    #[cfg(target_os = "windows")]
+    log::info!(
+        "launch console: {launch_console:?}, consoleAllocationPolicy supported: {}",
+        console_allocation_policy_supported()
+    );
+
     #[cfg(windows)]
     check_for_conpty_dll();
 
-    let app = build_application()
+    let app = tui_startup
+        .as_ref()
+        .map_or_else(build_application, tui::Startup::application)
         .with_assets(Assets)
         .with_restart_arguments(restart_arguments);
 
-    let app_db = db::AppDatabase::new();
+    let app_db = tui_startup
+        .as_ref()
+        .map_or_else(db::AppDatabase::new, tui::Startup::database);
     let system_id = app.background_executor().spawn(system_id());
     let installation_id = app
         .background_executor()
@@ -359,6 +370,7 @@ fn main() {
 
     let failed_single_instance_check = if *zed_env_vars::ZED_STATELESS
         || *release_channel::RELEASE_CHANNEL == ReleaseChannel::Dev
+        || tui_startup.is_some()
     {
         false
     } else {
@@ -441,7 +453,7 @@ fn main() {
     );
 
     let (shell_env_loaded_tx, shell_env_loaded_rx) = oneshot::channel();
-    if !stdout_is_a_pty() {
+    if !stdout_is_a_pty() && tui_startup.is_none() {
         app.background_executor()
             .spawn(async {
                 #[cfg(unix)]
@@ -495,6 +507,9 @@ fn main() {
             AppCommitSha::set_global(app_commit_sha, cx);
         }
         settings::init(cx);
+        if let Some(tui_startup) = &tui_startup {
+            tui_startup.init_settings(cx);
+        }
         zlog_settings::init(cx);
         zed::watch_settings_files(fs.clone(), cx);
         handle_keymap_file_changes(user_keymap_file_rx, user_keymap_watcher, cx);
@@ -789,6 +804,9 @@ fn main() {
         json_schema_store::init(cx);
         miniprofiler_ui::init(*STARTUP_TIME.get().unwrap(), cx);
         which_key::init(cx);
+        if let Some(tui_startup) = tui_startup {
+            tui_startup.init(cx);
+        }
         #[cfg(target_os = "windows")]
         etw_tracing::init(cx);
 
@@ -1689,6 +1707,71 @@ fn stdout_is_a_pty() -> bool {
     !*FORCE_CLI_MODE && io::stdout().is_terminal()
 }
 
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug)]
+enum LaunchConsole {
+    None,
+    Created,
+    Inherited,
+}
+
+#[cfg(target_os = "windows")]
+fn launch_console() -> LaunchConsole {
+    let mut process_ids = [0u32; 2];
+    match unsafe { windows::Win32::System::Console::GetConsoleProcessList(&mut process_ids) } {
+        0 => LaunchConsole::None,
+        1 => LaunchConsole::Created,
+        _ => LaunchConsole::Inherited,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn writes_to_console(args: &Args) -> bool {
+    args.foreground || args.printenv || args.dump_all_actions || args.system_specs
+}
+
+#[cfg(target_os = "windows")]
+fn console_allocation_policy_supported() -> bool {
+    let mut version = unsafe { std::mem::zeroed() };
+    let status = unsafe { windows::Wdk::System::SystemServices::RtlGetVersion(&mut version) };
+    status.is_ok() && version.dwBuildNumber >= 26100
+}
+
+#[cfg(all(not(debug_assertions), target_os = "windows"))]
+fn detach_gui_from_console(console: LaunchConsole) {
+    match console {
+        LaunchConsole::None => {}
+        LaunchConsole::Created => {
+            if let Err(error) = unsafe { windows::Win32::System::Console::FreeConsole() } {
+                eprintln!("failed to release the console: {error}");
+            }
+        }
+        LaunchConsole::Inherited => {
+            use std::os::windows::process::CommandExt as _;
+
+            if !io::stdout().is_terminal() || !io::stderr().is_terminal() {
+                return;
+            }
+
+            let relaunched = std::env::current_exe().and_then(|exe| {
+                let mut command = process::Command::new(exe);
+                command
+                    .args(std::env::args_os().skip(1))
+                    .creation_flags(windows::Win32::System::Threading::DETACHED_PROCESS.0);
+                smol::process::Command::from(command)
+                    .stdin(smol::process::Stdio::null())
+                    .stdout(smol::process::Stdio::null())
+                    .stderr(smol::process::Stdio::null())
+                    .spawn()
+            });
+            match relaunched {
+                Ok(_) => process::exit(0),
+                Err(error) => eprintln!("failed to detach Zed from the console: {error}"),
+            }
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "zed", disable_version_flag = true, max_term_width = 100)]
 struct Args {
@@ -2063,5 +2146,26 @@ fn check_for_conpty_dll() {
         }
     } else {
         log::warn!("Failed to load conpty.dll. Terminal will work with reduced functionality.");
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_launch_tests {
+    use super::*;
+
+    #[test]
+    fn only_console_output_commands_keep_the_launching_console() {
+        let writes = |arguments: &[&str]| {
+            writes_to_console(&Args::parse_from(
+                std::iter::once("zed").chain(arguments.iter().copied()),
+            ))
+        };
+        assert!(writes(&["--foreground"]));
+        assert!(writes(&["--printenv"]));
+        assert!(writes(&["--dump-all-actions"]));
+        assert!(writes(&["--system-specs"]));
+        assert!(!writes(&[]));
+        assert!(!writes(&["src/main.rs"]));
+        assert!(!writes(&["--user-data-dir", "data", "src/main.rs"]));
     }
 }

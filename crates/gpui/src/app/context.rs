@@ -247,7 +247,7 @@ impl<'a, T: 'static> Context<'a, T> {
         &self,
         listener: impl Fn(&mut T, &E, &mut Window, &mut Context<T>) + 'static,
     ) -> impl Fn(&E, &mut Window, &mut App) + 'static {
-        let view = self.entity().downgrade();
+        let view = self.weak_entity();
         move |event: &E, window: &mut Window, cx: &mut App| {
             invoke_listener(&view, window, cx, &|view, window, cx| {
                 listener(view, event, window, cx);

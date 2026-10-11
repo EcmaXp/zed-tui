@@ -845,12 +845,22 @@ async fn test_extension_store_with_test_extension(cx: &mut TestAppContext) {
         version: String,
         binary_contents: String,
         http_request_count: usize,
+        wasm_calls_in_flight_during_requests: Vec<usize>,
+    }
+
+    impl FakeLanguageServerVersion {
+        fn record_request(&mut self) {
+            self.http_request_count += 1;
+            self.wasm_calls_in_flight_during_requests
+                .push(crate::wasm_host::wasm_calls_in_flight());
+        }
     }
 
     let language_server_version = Arc::new(Mutex::new(FakeLanguageServerVersion {
         version: "v1.2.3".into(),
         binary_contents: "the-binary-contents".into(),
         http_request_count: 0,
+        wasm_calls_in_flight_during_requests: Vec::new(),
     }));
 
     let extension_client = FakeHttpClient::create({
@@ -867,7 +877,7 @@ async fn test_extension_store_with_test_extension(cx: &mut TestAppContext) {
 
                 let uri = request.uri().to_string();
                 if uri == github_releases_uri {
-                    language_server_version.lock().http_request_count += 1;
+                    language_server_version.lock().record_request();
                     Ok(Response::new(
                         json!([
                             {
@@ -899,7 +909,7 @@ async fn test_extension_store_with_test_extension(cx: &mut TestAppContext) {
                         .into(),
                     ))
                 } else if uri == asset_download_uri {
-                    language_server_version.lock().http_request_count += 1;
+                    language_server_version.lock().record_request();
                     let mut bytes = Vec::<u8>::new();
                     let mut archive = async_tar::Builder::new(&mut bytes);
                     let mut header = async_tar::Header::new_gnu();
@@ -1058,6 +1068,14 @@ async fn test_extension_store_with_test_extension(cx: &mut TestAppContext) {
         expected_binary_contents
     );
     assert_eq!(language_server_version.lock().http_request_count, 2);
+    assert!(
+        language_server_version
+            .lock()
+            .wasm_calls_in_flight_during_requests
+            .iter()
+            .all(|&calls| calls > 0),
+        "the extension's HTTP requests must run while its wasm call holds the epoch ticker"
+    );
     assert_eq!(
         [
             await_or_timeout(

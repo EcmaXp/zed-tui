@@ -6,6 +6,7 @@ use crate::{
         round_to_device_pixel,
     },
 };
+use cell_snapper::CellSnapper;
 use collections::{FxHashMap, FxHashSet};
 use std::{fmt::Debug, ops::Range};
 use taffy::{
@@ -15,6 +16,8 @@ use taffy::{
     style::AvailableSpace as TaffyAvailableSpace,
     tree::NodeId,
 };
+
+mod cell_snapper;
 
 #[cfg(feature = "stacker")]
 type StackSafe<T> = stacksafe::StackSafe<T>;
@@ -34,6 +37,7 @@ pub struct TaffyLayoutEngine {
     /// Unrounded absolute border-box top-left per-node coordinate in device pixels.
     absolute_outer_origins: FxHashMap<LayoutId, Point<f32>>,
     computed_layouts: FxHashSet<LayoutId>,
+    cell_snapper: Option<CellSnapper>,
     layout_bounds_scratch_space: Vec<LayoutId>,
 }
 
@@ -48,6 +52,7 @@ impl TaffyLayoutEngine {
             absolute_layout_bounds: FxHashMap::default(),
             absolute_outer_origins: FxHashMap::default(),
             computed_layouts: FxHashSet::default(),
+            cell_snapper: None,
             layout_bounds_scratch_space: Vec::new(),
         }
     }
@@ -57,6 +62,20 @@ impl TaffyLayoutEngine {
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
         self.computed_layouts.clear();
+        if let Some(cell_snapper) = &mut self.cell_snapper {
+            cell_snapper.clear();
+        }
+    }
+
+    pub fn set_cell_size(&mut self, cell_size: Option<Size<Pixels>>, scale_factor: f32) {
+        self.cell_snapper = cell_size
+            .map(|cell_size| CellSnapper::new(cell_size.map(|extent| extent.0 * scale_factor)));
+    }
+
+    pub fn set_viewport_width(&mut self, viewport_width: Pixels, scale_factor: f32) {
+        if let Some(cell_snapper) = &mut self.cell_snapper {
+            cell_snapper.set_viewport_width(viewport_width.0 * scale_factor);
+        }
     }
 
     pub fn request_layout(
@@ -67,6 +86,9 @@ impl TaffyLayoutEngine {
         children: &[LayoutId],
     ) -> LayoutId {
         let taffy_style = style.to_taffy(rem_size, scale_factor);
+        if let Some(cell_snapper) = &mut self.cell_snapper {
+            return cell_snapper.request_layout(&mut self.taffy, taffy_style, &style, children);
+        }
 
         if children.is_empty() {
             self.taffy
@@ -99,6 +121,14 @@ impl TaffyLayoutEngine {
         let measure = Box::new(measure) as Box<MeasureFn>;
         #[cfg(feature = "stacker")]
         let measure = StackSafe::new(measure);
+        if let Some(cell_snapper) = &mut self.cell_snapper {
+            return cell_snapper.request_measured_layout(
+                &mut self.taffy,
+                taffy_style,
+                &style,
+                measure,
+            );
+        }
 
         self.taffy
             .new_leaf_with_context(taffy_style, NodeContext { measure })
@@ -219,6 +249,7 @@ impl TaffyLayoutEngine {
         }
 
         let scale_factor = window.scale_factor();
+        let cell_snapper = &self.cell_snapper;
 
         let transform = |v: AvailableSpace| match v {
             AvailableSpace::Definite(pixels) => {
@@ -261,7 +292,11 @@ impl TaffyLayoutEngine {
 
                     let measured_size: Size<Pixels> =
                         (node_context.measure)(known_dimensions, available_space, window, cx);
-                    snap_measured_size_to_device_pixels(measured_size, scale_factor).into()
+                    let snapped = snap_measured_size_to_device_pixels(measured_size, scale_factor);
+                    match cell_snapper {
+                        Some(cell_snapper) => cell_snapper.snap_measured_size(snapped).into(),
+                        None => snapped.into(),
+                    }
                 },
             )
             .expect(EXPECT_MESSAGE);
@@ -372,6 +407,12 @@ impl TaffyLayoutEngine {
             absolute_outer_origin.map(round_half_toward_zero),
             absolute_far.map(round_half_toward_zero),
         );
+        let snapped_bounds = match &self.cell_snapper {
+            Some(cell_snapper) => {
+                cell_snapper.snap_bounds(id, absolute_outer_origin, absolute_far, layout_size)
+            }
+            None => snapped_bounds,
+        };
 
         let bounds = (snapped_bounds / scale_factor).map(Pixels);
         self.absolute_layout_bounds.insert(id, bounds);
