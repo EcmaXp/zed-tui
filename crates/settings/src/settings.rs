@@ -149,8 +149,16 @@ pub const DEFAULT_KEYMAP_PATH: &str = "keymaps/default-windows.json";
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub const DEFAULT_KEYMAP_PATH: &str = "keymaps/default-linux.json";
 
+pub fn default_keymap_path() -> &'static str {
+    if cfg!(target_os = "macos") && !gpui::uses_mac_key_conventions() {
+        "keymaps/default-linux.json"
+    } else {
+        DEFAULT_KEYMAP_PATH
+    }
+}
+
 pub fn default_keymap() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>(DEFAULT_KEYMAP_PATH)
+    asset_str::<SettingsAssets>(default_keymap_path())
 }
 
 pub const VIM_KEYMAP_PATH: &str = "keymaps/vim.json";
@@ -169,6 +177,14 @@ pub const SPECIFIC_OVERRIDES_KEYMAP_PATH: &str = "keymaps/specific-overrides-mac
 
 #[cfg(not(target_os = "macos"))]
 pub const SPECIFIC_OVERRIDES_KEYMAP_PATH: &str = "keymaps/specific-overrides.json";
+
+pub fn specific_overrides_keymap_path() -> &'static str {
+    if cfg!(target_os = "macos") && !gpui::uses_mac_key_conventions() {
+        "keymaps/specific-overrides.json"
+    } else {
+        SPECIFIC_OVERRIDES_KEYMAP_PATH
+    }
+}
 
 pub fn initial_user_settings_content() -> Cow<'static, str> {
     asset_str::<SettingsAssets>("settings/initial_user_settings.json")

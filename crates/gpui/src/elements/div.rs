@@ -438,7 +438,7 @@ impl Interactivity {
     ) {
         self.action_listeners.push((
             TypeId::of::<A>(),
-            Box::new(move |action, phase, window, cx| {
+            Rc::new(move |action, phase, window, cx| {
                 let action = action.downcast_ref().unwrap();
                 if phase == DispatchPhase::Capture {
                     (listener)(action, window, cx)
@@ -458,13 +458,18 @@ impl Interactivity {
     pub fn on_action<A: Action>(&mut self, listener: impl Fn(&A, &mut Window, &mut App) + 'static) {
         self.action_listeners.push((
             TypeId::of::<A>(),
-            Box::new(move |action, phase, window, cx| {
+            Rc::new(move |action, phase, window, cx| {
                 let action = action.downcast_ref().unwrap();
                 if phase == DispatchPhase::Bubble {
                     (listener)(action, window, cx)
                 }
             }),
         ));
+    }
+
+    #[allow(missing_docs)]
+    pub fn on_shared_action(&mut self, action_type: TypeId, listener: SharedActionListener) {
+        self.action_listeners.push((action_type, listener));
     }
 
     /// Bind the given callback to an action dispatch, based on a dynamic action parameter
@@ -481,7 +486,7 @@ impl Interactivity {
         let action = action.boxed_clone();
         self.action_listeners.push((
             (*action).type_id(),
-            Box::new(move |_, phase, window, cx| {
+            Rc::new(move |_, phase, window, cx| {
                 if phase == DispatchPhase::Bubble {
                     (listener)(&*action, window, cx)
                 }
@@ -1088,6 +1093,12 @@ pub trait InteractiveElement: Sized {
         listener: impl Fn(&A, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.interactivity().capture_action(listener);
+        self
+    }
+
+    #[allow(missing_docs)]
+    fn on_shared_action(mut self, action_type: TypeId, listener: SharedActionListener) -> Self {
+        self.interactivity().on_shared_action(action_type, listener);
         self
     }
 
@@ -1780,8 +1791,9 @@ pub(crate) type KeyUpListener =
 pub(crate) type ModifiersChangedListener =
     Box<dyn Fn(&ModifiersChangedEvent, &mut Window, &mut App) + 'static>;
 
-pub(crate) type ActionListener =
-    Box<dyn Fn(&dyn Any, DispatchPhase, &mut Window, &mut App) + 'static>;
+#[allow(missing_docs)]
+pub type SharedActionListener =
+    Rc<dyn Fn(&dyn Any, DispatchPhase, &mut Window, &mut App) + 'static>;
 
 /// Construct a new [`Div`] element
 #[track_caller]
@@ -2168,7 +2180,7 @@ pub struct Interactivity {
     pub(crate) key_down_listeners: Vec<KeyDownListener>,
     pub(crate) key_up_listeners: Vec<KeyUpListener>,
     pub(crate) modifiers_changed_listeners: Vec<ModifiersChangedListener>,
-    pub(crate) action_listeners: Vec<(TypeId, ActionListener)>,
+    pub(crate) action_listeners: Vec<(TypeId, SharedActionListener)>,
     pub(crate) drop_listeners: Vec<(TypeId, DropListener)>,
     pub(crate) can_drop_predicate: Option<CanDropPredicate>,
     pub(crate) click_listeners: Vec<ClickListener>,
@@ -3292,8 +3304,9 @@ impl Interactivity {
             })
         }
 
+        let dispatch_tree = &mut window.next_frame.dispatch_tree;
         for (action_type, listener) in action_listeners {
-            window.on_action(action_type, listener)
+            dispatch_tree.on_action(action_type, listener)
         }
     }
 

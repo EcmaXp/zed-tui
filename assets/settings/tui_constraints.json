@@ -1,0 +1,36 @@
+{
+  "ui_font_size": 10,
+  "buffer_font_size": 16,
+  "buffer_line_height": {
+    "custom": 1.0
+  },
+  "agent_ui_font_size": 10,
+  "agent_buffer_font_size": 16,
+  "git_commit_buffer_font_size": 16,
+  "markdown_preview": {
+    "font_size": 10
+  },
+  "mouse_wheel_zoom": false,
+  "unstable.ui_density": "compact",
+  "cursor_blink": false,
+  "rounded_selection": false,
+  "terminal": {
+    "font_size": 16,
+    "line_height": {
+      "custom": 1.0
+    },
+    "blinking": "off"
+  },
+  "gutter": {
+    "bookmarks": false,
+    "folds": false,
+    "min_line_number_digits": 3
+  },
+  "auto_update": false,
+  "active_pane_modifiers": {
+    "border_size": 0.0
+  },
+  "on_last_window_closed": "quit_app",
+  "use_system_prompts": false,
+  "use_system_path_prompts": false
+}

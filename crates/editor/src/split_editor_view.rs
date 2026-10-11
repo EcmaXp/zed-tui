@@ -16,8 +16,8 @@ use ui::{h_flex, prelude::*, v_flex};
 use gpui::ContentMask;
 
 use crate::{
-    DisplayRow, Editor, EditorSnapshot, EditorStyle, FILE_HEADER_HEIGHT,
-    MULTI_BUFFER_EXCERPT_HEADER_HEIGHT, RowExt, StickyHeaderExcerpt,
+    DisplayRow, Editor, EditorSnapshot, EditorStyle, MULTI_BUFFER_EXCERPT_HEADER_HEIGHT, RowExt,
+    StickyHeaderExcerpt,
     display_map::Block,
     element::{EditorElement, SplitSide, header_jump_data, render_buffer_header},
     scroll::ScrollOffset,
@@ -544,7 +544,7 @@ impl SplitBufferHeadersElement {
         let jump_data = header_jump_data(
             snapshot,
             DisplayRow(scroll_position.y as u32),
-            FILE_HEADER_HEIGHT + MULTI_BUFFER_EXCERPT_HEADER_HEIGHT,
+            snapshot.buffer_header_height() + MULTI_BUFFER_EXCERPT_HEADER_HEIGHT,
             excerpt,
             latest_selection_anchors,
         );
@@ -559,7 +559,7 @@ impl SplitBufferHeadersElement {
             .child(
                 div()
                     .w(available_width)
-                    .h(FILE_HEADER_HEIGHT as f32 * line_height)
+                    .h(snapshot.buffer_header_height() as f32 * line_height)
                     .bg(linear_gradient(
                         0.,
                         linear_color_stop(editor_bg_color.opacity(0.), 0.),
@@ -594,7 +594,7 @@ impl SplitBufferHeadersElement {
                 continue;
             }
 
-            let max_row = block_row.0.saturating_sub(FILE_HEADER_HEIGHT);
+            let max_row = block_row.0.saturating_sub(snapshot.buffer_header_height());
             let offset = scroll_position.y - max_row as f64;
 
             if offset > 0.0 {

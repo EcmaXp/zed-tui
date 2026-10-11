@@ -1,4 +1,4 @@
-use gpui::Context;
+use gpui::{Context, Task};
 use settings::SettingsStore;
 use std::time::Duration;
 use ui::App;
@@ -14,6 +14,7 @@ pub struct BlinkManager {
     enabled: bool,
     /// Whether the blinking is enabled in the settings.
     blink_enabled_in_settings: fn(&App) -> bool,
+    _pause_blinking_task: Task<anyhow::Result<()>>,
 }
 
 impl BlinkManager {
@@ -35,6 +36,7 @@ impl BlinkManager {
             visible: true,
             enabled: false,
             blink_enabled_in_settings,
+            _pause_blinking_task: Task::ready(Ok(())),
         }
     }
 
@@ -48,11 +50,10 @@ impl BlinkManager {
 
         let epoch = self.next_blink_epoch();
         let interval = Duration::from_millis(500);
-        cx.spawn(async move |this, cx| {
+        self._pause_blinking_task = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(interval).await;
             this.update(cx, |this, cx| this.resume_cursor_blinking(epoch, cx))
-        })
-        .detach();
+        });
     }
 
     fn resume_cursor_blinking(&mut self, epoch: usize, cx: &mut Context<Self>) {

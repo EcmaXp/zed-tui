@@ -350,6 +350,7 @@ impl Render for GoToLine {
 
 #[cfg(test)]
 mod tests {
+    mod fork_tests;
     use super::*;
     use cursor_position::{CursorPosition, SelectionStats, UserCaretPosition};
     use editor::actions::{MoveRight, MoveToBeginning, SelectAll};

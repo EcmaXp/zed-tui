@@ -3670,6 +3670,7 @@ pub fn rgba_color(r: u8, g: u8, b: u8) -> Hsla {
 
 #[cfg(test)]
 mod tests {
+    mod fork_tests;
     use std::time::Duration;
 
     use super::*;

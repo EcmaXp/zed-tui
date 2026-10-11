@@ -3838,6 +3838,7 @@ impl BufferSnapshot {
             TreeSitterOptions {
                 max_bytes_to_query: Some(MAX_BYTES_TO_QUERY),
                 max_start_depth: None,
+                match_limit: None,
             },
             |grammar| Some(&grammar.indents_config.as_ref()?.query),
         );

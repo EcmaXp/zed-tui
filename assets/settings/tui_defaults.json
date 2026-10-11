@@ -1,0 +1,41 @@
+{
+  "theme": {
+    "mode": "dark",
+    "light": "One Light",
+    "dark": "One Dark"
+  },
+  "git": {
+    "inline_blame": {
+      "enabled": false
+    }
+  },
+  "show_edit_predictions": false,
+  "minimap": {
+    "show": "never"
+  },
+  "scrollbar": {
+    "show": "never"
+  },
+  "reduce_motion": "on",
+  "terminal": {
+    "option_as_meta": true
+  },
+  "telemetry": {
+    "diagnostics": false,
+    "metrics": false
+  },
+  "experimental.theme_overrides": {
+    "background": "#00000000",
+    "editor.background": "#00000000",
+    "editor.gutter.background": "#00000000",
+    "panel.background": "#00000000",
+    "status_bar.background": "#00000000",
+    "surface.background": "#00000000",
+    "tab.inactive_background": "#00000000",
+    "tab_bar.background": "#00000000",
+    "terminal.background": "#00000000",
+    "title_bar.background": "#00000000",
+    "title_bar.inactive_background": "#00000000",
+    "toolbar.background": "#00000000"
+  }
+}

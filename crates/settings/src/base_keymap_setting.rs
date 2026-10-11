@@ -97,19 +97,20 @@ impl BaseKeymap {
 
     pub fn asset_path(&self) -> Option<&'static str> {
         #[cfg(target_os = "macos")]
-        match self {
-            BaseKeymap::JetBrains => Some("keymaps/macos/jetbrains.json"),
-            BaseKeymap::SublimeText => Some("keymaps/macos/sublime_text.json"),
-            BaseKeymap::Atom => Some("keymaps/macos/atom.json"),
-            BaseKeymap::TextMate => Some("keymaps/macos/textmate.json"),
-            BaseKeymap::Emacs => Some("keymaps/macos/emacs.json"),
-            BaseKeymap::Cursor => Some("keymaps/macos/cursor.json"),
-            BaseKeymap::VSCode => Some("keymaps/macos/vscode.json"),
-            BaseKeymap::Zed => None,
-            BaseKeymap::None => None,
+        if gpui::uses_mac_key_conventions() {
+            return match self {
+                BaseKeymap::JetBrains => Some("keymaps/macos/jetbrains.json"),
+                BaseKeymap::SublimeText => Some("keymaps/macos/sublime_text.json"),
+                BaseKeymap::Atom => Some("keymaps/macos/atom.json"),
+                BaseKeymap::TextMate => Some("keymaps/macos/textmate.json"),
+                BaseKeymap::Emacs => Some("keymaps/macos/emacs.json"),
+                BaseKeymap::Cursor => Some("keymaps/macos/cursor.json"),
+                BaseKeymap::VSCode => Some("keymaps/macos/vscode.json"),
+                BaseKeymap::Zed => None,
+                BaseKeymap::None => None,
+            };
         }
 
-        #[cfg(not(target_os = "macos"))]
         match self {
             BaseKeymap::JetBrains => Some("keymaps/linux/jetbrains.json"),
             BaseKeymap::SublimeText => Some("keymaps/linux/sublime_text.json"),

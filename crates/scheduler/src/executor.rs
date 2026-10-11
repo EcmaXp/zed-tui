@@ -410,6 +410,8 @@ enum TaskState<T> {
     /// [`Task::rendezvous`]). Once delivered, polling replaces this state
     /// with the delivered task's state.
     Rendezvous(RendezvousReceiver<T>),
+
+    Timer(Timer, Option<T>),
 }
 
 /// State shared between the two halves of a [`Task::rendezvous`] pair.
@@ -555,6 +557,7 @@ impl<T> Task<T> {
             TaskState::Spawned(task) => task.is_finished(),
             TaskState::Downcast { inner, .. } => inner.is_ready(),
             TaskState::Rendezvous(receiver) => receiver.is_ready(),
+            TaskState::Timer(..) => false,
         }
     }
 
@@ -565,6 +568,7 @@ impl<T> Task<T> {
             Task(TaskState::Spawned(task)) => task.detach(),
             Task(TaskState::Downcast { inner, .. }) => inner.detach(),
             Task(TaskState::Rendezvous(receiver)) => receiver.detach(),
+            Task(TaskState::Timer(..)) => {}
         }
     }
 
@@ -578,7 +582,14 @@ impl<T> Task<T> {
                 marker: PhantomData,
             },
             TaskState::Rendezvous(receiver) => FallibleTaskState::Rendezvous(receiver),
+            TaskState::Timer(timer, output) => FallibleTaskState::Timer(timer, output),
         })
+    }
+}
+
+impl Task<()> {
+    pub fn from_timer(timer: Timer) -> Self {
+        Task(TaskState::Timer(timer, Some(())))
     }
 }
 
@@ -608,6 +619,7 @@ impl<T> std::fmt::Debug for Task<T> {
                 f.debug_tuple("Task::Downcast").field(inner).finish()
             }
             TaskState::Rendezvous(_) => f.debug_tuple("Task::Rendezvous").finish(),
+            TaskState::Timer(..) => f.debug_tuple("Task::Timer").finish(),
         }
     }
 }
@@ -631,6 +643,8 @@ enum FallibleTaskState<T> {
 
     /// Mirror of [`TaskState::Rendezvous`] for fallible tasks.
     Rendezvous(RendezvousReceiver<T>),
+
+    Timer(Timer, Option<T>),
 }
 
 impl<T> FallibleTask<T> {
@@ -646,6 +660,7 @@ impl<T> FallibleTask<T> {
             FallibleTaskState::Spawned(task) => task.detach(),
             FallibleTaskState::Downcast { inner, .. } => inner.detach(),
             FallibleTaskState::Rendezvous(receiver) => receiver.detach(),
+            FallibleTaskState::Timer(..) => {}
         }
     }
 }
@@ -677,6 +692,13 @@ impl<T: 'static> Future for FallibleTask<T> {
                     }
                     Poll::Pending => return Poll::Pending,
                 },
+                FallibleTaskState::Timer(timer, output) => match Pin::new(timer).poll(cx) {
+                    Poll::Ready(()) => {
+                        this.0 = FallibleTaskState::Ready(output.take());
+                        continue;
+                    }
+                    Poll::Pending => return Poll::Pending,
+                },
             }
         }
     }
@@ -694,6 +716,7 @@ impl<T> std::fmt::Debug for FallibleTask<T> {
                 .field(inner)
                 .finish(),
             FallibleTaskState::Rendezvous(_) => f.debug_tuple("FallibleTask::Rendezvous").finish(),
+            FallibleTaskState::Timer(..) => f.debug_tuple("FallibleTask::Timer").finish(),
         }
     }
 }
@@ -720,6 +743,13 @@ impl<T: 'static> Future for Task<T> {
                 TaskState::Rendezvous(receiver) => match receiver.poll_take(cx) {
                     Poll::Ready(task) => {
                         this.0 = task.0;
+                        continue;
+                    }
+                    Poll::Pending => return Poll::Pending,
+                },
+                TaskState::Timer(timer, output) => match Pin::new(timer).poll(cx) {
+                    Poll::Ready(()) => {
+                        this.0 = TaskState::Ready(output.take());
                         continue;
                     }
                     Poll::Pending => return Poll::Pending,

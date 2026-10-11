@@ -184,7 +184,7 @@ impl BackgroundExecutor {
         if duration.is_zero() {
             return Task::ready(());
         }
-        self.spawn(self.inner.scheduler().timer(duration))
+        Task::from_timer(self.inner.scheduler().timer(duration))
     }
 
     /// In tests, run an arbitrary number of tasks (determined by the SEED environment variable)

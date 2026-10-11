@@ -43,6 +43,7 @@ editor = { workspace = true, features = ["test-support"] }
 
 go_to_line.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
+gpui_tui.workspace = true
 language = { workspace = true, features = ["test-support"] }
 menu.workspace = true
 project = { workspace = true, features = ["test-support"] }

@@ -145,7 +145,7 @@ impl CommandPalette {
         let picker = cx.new(|cx| {
             // One-shot action; there's nothing to reopen.
             let picker = Picker::uniform_list(delegate, window, cx)
-                .initial_width(rems(38.0))
+                .initial_gui_width(rems(38.0), window)
                 .reopenable(false, cx)
                 .show_scrollbar(true);
             picker.set_query(query, window, cx);
@@ -188,6 +188,7 @@ impl Render for CommandPalette {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .key_context("CommandPalette")
+            .debug_selector(|| "command-palette".into())
             .on_action(cx.listener(Self::remove_selected))
             .child(self.picker.clone())
     }
@@ -941,6 +942,7 @@ impl std::fmt::Debug for Command {
 
 #[cfg(test)]
 mod tests {
+    mod fork_tests;
     use std::sync::Arc;
 
     use super::*;

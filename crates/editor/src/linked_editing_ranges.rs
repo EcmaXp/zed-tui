@@ -130,7 +130,7 @@ pub(super) fn refresh_linked_ranges(
 
         editor
             .update(cx, |this, cx| {
-                this.linked_edit_ranges.0.clear();
+                let previous_ranges = std::mem::take(&mut this.linked_edit_ranges.0);
                 if this.pending_rename.is_some() {
                     return;
                 }
@@ -153,7 +153,9 @@ pub(super) fn refresh_linked_ranges(
                     values.sort_by(|lhs, rhs| lhs.0.cmp(&rhs.0, &snapshot));
                 }
 
-                cx.notify();
+                if this.linked_edit_ranges.0 != previous_ranges {
+                    cx.notify();
+                }
             })
             .ok()?;
 
@@ -233,6 +235,7 @@ impl LinkedEdits {
 
 #[cfg(test)]
 mod tests {
+    mod fork_tests;
     use crate::{editor_tests::init_test, test::editor_test_context::EditorTestContext};
     use gpui::TestAppContext;
     use text::Point;

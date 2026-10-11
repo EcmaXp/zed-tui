@@ -10,7 +10,6 @@ mod since_v0_6_0;
 mod since_v0_8_0;
 use dap::DebugRequest;
 use extension::{DebugTaskDefinition, KeyValueStoreDelegate, WorktreeDelegate};
-use gpui::BackgroundExecutor;
 use language::LanguageName;
 use lsp::LanguageServerName;
 use release_channel::ReleaseChannel;
@@ -41,10 +40,9 @@ pub use latest::{
 pub use since_v0_0_4::LanguageServerConfig;
 
 pub fn new_linker(
-    executor: &BackgroundExecutor,
     f: impl FnOnce(&mut Linker<WasmState>) -> wasmtime::Result<()>,
 ) -> Linker<WasmState> {
-    let mut linker = Linker::new(&wasm_engine(executor));
+    let mut linker = Linker::new(&wasm_engine().0);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker).unwrap();
     f(&mut linker).unwrap();
     linker
@@ -106,7 +104,6 @@ pub enum Extension {
 
 impl Extension {
     pub async fn instantiate_async(
-        executor: &BackgroundExecutor,
         store: &mut Store<WasmState>,
         release_channel: ReleaseChannel,
         version: Version,
@@ -119,7 +116,7 @@ impl Extension {
             authorize_access_to_unreleased_wasm_api_version(release_channel)?;
 
             let extension =
-                latest::Extension::instantiate_async(store, component, latest::linker(executor))
+                latest::Extension::instantiate_async(store, component, latest::linker())
                     .await
                     .map_err(anyhow::Error::from)
                     .context("failed to instantiate wasm extension")?;
@@ -128,7 +125,7 @@ impl Extension {
             let extension = since_v0_6_0::Extension::instantiate_async(
                 store,
                 component,
-                since_v0_6_0::linker(executor),
+                since_v0_6_0::linker(),
             )
             .await
             .map_err(anyhow::Error::from)
@@ -138,7 +135,7 @@ impl Extension {
             let extension = since_v0_5_0::Extension::instantiate_async(
                 store,
                 component,
-                since_v0_5_0::linker(executor),
+                since_v0_5_0::linker(),
             )
             .await
             .map_err(anyhow::Error::from)
@@ -148,7 +145,7 @@ impl Extension {
             let extension = since_v0_4_0::Extension::instantiate_async(
                 store,
                 component,
-                since_v0_4_0::linker(executor),
+                since_v0_4_0::linker(),
             )
             .await
             .map_err(anyhow::Error::from)
@@ -158,7 +155,7 @@ impl Extension {
             let extension = since_v0_3_0::Extension::instantiate_async(
                 store,
                 component,
-                since_v0_3_0::linker(executor),
+                since_v0_3_0::linker(),
             )
             .await
             .map_err(anyhow::Error::from)
@@ -168,7 +165,7 @@ impl Extension {
             let extension = since_v0_2_0::Extension::instantiate_async(
                 store,
                 component,
-                since_v0_2_0::linker(executor),
+                since_v0_2_0::linker(),
             )
             .await
             .map_err(anyhow::Error::from)
@@ -178,7 +175,7 @@ impl Extension {
             let extension = since_v0_1_0::Extension::instantiate_async(
                 store,
                 component,
-                since_v0_1_0::linker(executor),
+                since_v0_1_0::linker(),
             )
             .await
             .map_err(anyhow::Error::from)
@@ -188,7 +185,7 @@ impl Extension {
             let extension = since_v0_0_6::Extension::instantiate_async(
                 store,
                 component,
-                since_v0_0_6::linker(executor),
+                since_v0_0_6::linker(),
             )
             .await
             .map_err(anyhow::Error::from)
@@ -198,7 +195,7 @@ impl Extension {
             let extension = since_v0_0_4::Extension::instantiate_async(
                 store,
                 component,
-                since_v0_0_4::linker(executor),
+                since_v0_0_4::linker(),
             )
             .await
             .map_err(anyhow::Error::from)
@@ -208,7 +205,7 @@ impl Extension {
             let extension = since_v0_0_1::Extension::instantiate_async(
                 store,
                 component,
-                since_v0_0_1::linker(executor),
+                since_v0_0_1::linker(),
             )
             .await
             .map_err(anyhow::Error::from)

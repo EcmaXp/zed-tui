@@ -3,9 +3,22 @@ use serde::{Deserialize, Serialize};
 use std::{
     error::Error,
     fmt::{Display, Write},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use crate::PlatformKeyboardMapper;
+
+static MAC_KEY_CONVENTIONS: AtomicBool = AtomicBool::new(cfg!(target_os = "macos"));
+
+#[expect(missing_docs)]
+pub fn use_linux_key_conventions() {
+    MAC_KEY_CONVENTIONS.store(false, Ordering::Relaxed);
+}
+
+#[expect(missing_docs)]
+pub fn uses_mac_key_conventions() -> bool {
+    MAC_KEY_CONVENTIONS.load(Ordering::Relaxed)
+}
 
 /// This is a helper trait so that we can simplify the implementation of some functions
 pub trait AsKeystroke {
@@ -141,7 +154,7 @@ impl Keystroke {
                 continue;
             }
             if component.eq_ignore_ascii_case("secondary") {
-                if cfg!(target_os = "macos") {
+                if uses_mac_key_conventions() {
                     modifiers.platform = true;
                 } else {
                     modifiers.control = true;
@@ -481,13 +494,9 @@ impl Modifiers {
     /// On macOS, this is the command key.
     /// On Linux and Windows, this is the control key.
     pub fn secondary(&self) -> bool {
-        #[cfg(target_os = "macos")]
-        {
+        if uses_mac_key_conventions() {
             self.platform
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        {
+        } else {
             self.control
         }
     }
@@ -516,16 +525,12 @@ impl Modifiers {
 
     /// A Returns [`Modifiers`] with just the secondary key pressed.
     pub fn secondary_key() -> Modifiers {
-        #[cfg(target_os = "macos")]
-        {
+        if uses_mac_key_conventions() {
             Modifiers {
                 platform: true,
                 ..Default::default()
             }
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        {
+        } else {
             Modifiers {
                 control: true,
                 ..Default::default()

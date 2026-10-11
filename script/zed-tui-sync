@@ -1,0 +1,345 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+((BASH_VERSINFO[0] >= 4)) || { echo "zed-tui-sync: needs bash 4 or newer" >&2; exit 1; }
+
+default_branch=feature/zed-tui
+squash_subject_prefix='feat: zed-tui @ '
+release_tag_pattern='^v[0-9]+\.[0-9]+\.[0-9]+$'
+
+die() {
+    echo "zed-tui-sync: $*" >&2
+    exit 1
+}
+
+usage() {
+    cat >&2 <<'EOF'
+usage: script/zed-tui-sync [<branch>] [--onto <ref>] [--base <commit>]
+       script/zed-tui-sync --continue
+       script/zed-tui-sync --abort
+
+Rebases the history branch (default: feature/zed-tui) onto the newest upstream
+release tag (or --onto <ref>), points develop at one squash commit with the
+branch's tree on that upstream commit, and points main at that upstream commit.
+Nothing is pushed.
+EOF
+    exit 2
+}
+
+action=sync
+branch=
+onto=
+base=
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --continue) action="continue" ;;
+        --abort) action="abort" ;;
+        --onto)
+            [[ $# -ge 2 ]] || usage
+            onto="$2"
+            shift
+            ;;
+        --base)
+            [[ $# -ge 2 ]] || usage
+            base="$2"
+            shift
+            ;;
+        -h | --help) usage ;;
+        -*) usage ;;
+        *)
+            [[ -z "$branch" ]] || usage
+            branch="$1"
+            ;;
+    esac
+    shift
+done
+if [[ "$action" != sync && -n "$branch$onto$base" ]]; then
+    usage
+fi
+
+root="$(git rev-parse --show-toplevel)"
+common="$(cd "$root" && git rev-parse --path-format=absolute --git-common-dir)"
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+cd "$root"
+
+git remote get-url --push origin | grep -qE '[:/]EcmaXp/zed-tui(\.git)?$' \
+    || die "origin is not EcmaXp/zed-tui (run from the zed checkout)"
+git remote get-url upstream >/dev/null || die "no upstream remote"
+
+dir="$common/zed-tui-sync"
+state="$dir/state"
+commit_list="$dir/commits"
+worktree="$dir/worktree"
+
+sign_flags=()
+[[ "$(git config --bool commit.gpgsign || true)" == true ]] && sign_flags=(-S)
+
+save_state() {
+    {
+        printf 'branch=%q\n' "$branch"
+        printf 'onto_name=%q\n' "$onto_name"
+        printf 'onto_commit=%q\n' "$onto_commit"
+        printf 'base=%q\n' "$base"
+        printf 'old_head=%q\n' "$old_head"
+        printf 'published_branch=%q\n' "$published_branch"
+        printf 'published_develop=%q\n' "$published_develop"
+        printf 'published_main=%q\n' "$published_main"
+        printf 'position=%q\n' "$position"
+        printf 'picked_head=%q\n' "$picked_head"
+        printf 'phase=%q\n' "$phase"
+    } > "$state"
+}
+
+check_signed() {
+    if [[ ${#sign_flags[@]} -gt 0 && "$(git cat-file commit "$1")" != *$'\ngpgsig '* ]]; then
+        die "commit $1 was not signed"
+    fi
+}
+
+newest_release_tag() {
+    git ls-remote --tags --refs upstream 'v*' \
+        | sed 's|.*refs/tags/||' \
+        | grep -E "$release_tag_pattern" \
+        | sort -V \
+        | sed -n '$p'
+}
+
+resolve_onto() {
+    local ref="$onto"
+    if [[ -z "$ref" ]]; then
+        ref="$(newest_release_tag || true)"
+        [[ -n "$ref" ]] || die "upstream has no release tag matching $release_tag_pattern"
+    fi
+    if [[ "$ref" == upstream/* ]]; then
+        git fetch --quiet --no-prune --no-prune-tags upstream "+refs/heads/${ref#upstream/}:refs/remotes/$ref"
+    elif git ls-remote --exit-code --tags --refs upstream "refs/tags/$ref" >/dev/null; then
+        git fetch --quiet --no-prune --no-prune-tags upstream "+refs/tags/$ref:refs/tags/$ref"
+    fi
+    onto_name="$ref"
+    onto_commit="$(git rev-parse --verify --quiet "$ref^{commit}")" || die "cannot resolve $ref"
+}
+
+resolve_base() {
+    local branch_ref="refs/heads/$branch" recorded first
+    if [[ -z "$base" ]] \
+        && recorded="$(git rev-parse --verify --quiet "refs/zed-tui-sync/base/$branch")" \
+        && git merge-base --is-ancestor "$recorded" "$branch_ref"; then
+        base="$recorded"
+    fi
+    if [[ -z "$base" ]]; then
+        first="$(git rev-list --reverse "$branch_ref" --not --remotes=upstream | sed -n 1p)"
+        [[ -n "$first" ]] || die "$branch has no commits that upstream lacks; pass --base"
+        base="$first^"
+    fi
+    base="$(git rev-parse --verify --quiet "$base^{commit}")" || die "cannot resolve the base"
+    git merge-base --is-ancestor "$base" "$branch_ref" || die "base $base is not an ancestor of $branch"
+}
+
+lock_check() {
+    command -v cargo >/dev/null || die "cargo is needed for the lock check"
+    if ! (cd "$worktree" && cargo metadata --locked --format-version 1 >/dev/null); then
+        phase=lock
+        save_state
+        echo "zed-tui-sync: Cargo.lock does not match the manifests at $(git -C "$worktree" rev-parse --short HEAD)." >&2
+        echo "Fix the commit that changed the lock in $worktree, then run: script/zed-tui-sync --continue" >&2
+        exit 1
+    fi
+}
+
+replay() {
+    local commits total commit date
+    mapfile -t commits < "$commit_list"
+    total=${#commits[@]}
+    while [[ $position -lt $total ]]; do
+        commit="${commits[$position]}"
+        date="$(git log -1 --format=%cI "$commit")"
+        if ! GIT_COMMITTER_DATE="$date" git -C "$worktree" cherry-pick "$commit" >/dev/null; then
+            save_state
+            echo >&2
+            echo "zed-tui-sync: stopped at $((position + 1))/$total: $(git log -1 --format='%h %s' "$commit")" >&2
+            git -C "$worktree" status --short >&2
+            echo "Resolve in $worktree and git add the files, then run: script/zed-tui-sync --continue" >&2
+            echo "To give up and leave every ref unchanged: script/zed-tui-sync --abort" >&2
+            exit 1
+        fi
+        picked_head="$(git -C "$worktree" rev-parse HEAD)"
+        check_signed "$picked_head"
+        position=$((position + 1))
+        save_state
+        echo "[$position/$total] $(git log -1 --format='%h %s' "$picked_head")"
+    done
+    phase=lock
+    save_state
+}
+
+remove_state_files() {
+    rm -f "$state" "$commit_list"
+    rmdir "$dir" 2>/dev/null || true
+}
+
+clear_state() {
+    cd "$(dirname "$common")"
+    if [[ -d "$worktree" ]]; then
+        git worktree remove "$worktree" || echo "zed-tui-sync: left $worktree in place" >&2
+    fi
+    remove_state_files
+}
+
+backup_ref() {
+    local name="$1" stamp="$2" commit="$3"
+    git update-ref -m "zed-tui-sync backup" "refs/backup/zed-tui-sync/$name/$stamp" "$commit" ""
+    echo "Backup: $name was $commit (refs/backup/zed-tui-sync/$name/$stamp)"
+}
+
+backup_branch() {
+    local name="$1" stamp="$2" old
+    old="$(git rev-parse --verify --quiet "refs/heads/$name" || true)"
+    [[ -n "$old" ]] || return 0
+    backup_ref "$name" "$stamp" "$old"
+}
+
+move_branch() {
+    local name="$1" commit="$2" old checkout
+    old="$(git rev-parse --verify --quiet "refs/heads/$name" || true)"
+    checkout="$(git worktree list --porcelain | awk -v ref="branch refs/heads/$name" '/^worktree /{path = substr($0, 10)} $0 == ref {print path}')"
+    if [[ -n "$checkout" ]]; then
+        git -C "$checkout" reset --quiet --keep "$commit" \
+            || die "$name's checkout $checkout has conflicting local changes; $name stays at ${old:-nothing}, the new commit is $commit"
+    else
+        git update-ref -m "zed-tui-sync" "refs/heads/$name" "$commit" "$old"
+    fi
+}
+
+update_develop() {
+    local stamp="$1" tree count subject develop_old commit
+    tree="$(git rev-parse "refs/heads/$branch^{tree}")"
+    count="$(git rev-list --count "$onto_commit..refs/heads/$branch")"
+    subject="$squash_subject_prefix$onto_name + $count commit"
+    [[ "$count" == 1 ]] || subject+=s
+    develop_old="$(git rev-parse --verify --quiet refs/heads/develop || true)"
+    if [[ -n "$develop_old" ]] \
+        && [[ "$(git rev-parse "$develop_old^{tree}")" == "$tree" ]] \
+        && [[ "$(git rev-parse --verify --quiet "$develop_old^" || true)" == "$onto_commit" ]] \
+        && [[ "$(git rev-list --count "$develop_old" --not "$onto_commit")" == 1 ]] \
+        && [[ "$(git log -1 --format=%s "$develop_old")" == "$subject" ]]; then
+        echo "develop already is one squash of $branch on $onto_name"
+        return
+    fi
+    commit="$(git commit-tree "${sign_flags[@]}" "$tree" -p "$onto_commit" -m "$subject")"
+    check_signed "$commit"
+    backup_branch develop "$stamp"
+    move_branch develop "$commit"
+}
+
+update_main() {
+    local stamp="$1"
+    if [[ "$(git rev-parse --verify --quiet refs/heads/main || true)" == "$onto_commit" ]]; then
+        echo "main already points at $onto_name"
+        return
+    fi
+    backup_branch main "$stamp"
+    move_branch main "$onto_commit"
+    echo "main now points at $onto_name ($(git rev-parse --short "$onto_commit"))"
+}
+
+finish() {
+    local stamp new_head
+    stamp="$(date +%Y%m%dT%H%M%S)"
+    new_head="$old_head"
+    if [[ -d "$worktree" ]]; then
+        new_head="$(git -C "$worktree" rev-parse HEAD)"
+    fi
+    if [[ "$new_head" != "$old_head" ]]; then
+        backup_ref "$branch" "$stamp" "$old_head"
+        git update-ref -m "zed-tui-sync onto $onto_name" "refs/heads/$branch" "$new_head" "$old_head"
+    fi
+    git update-ref -m "zed-tui-sync" "refs/zed-tui-sync/base/$branch" "$onto_commit"
+    clear_state
+    update_develop "$stamp"
+    update_main "$stamp"
+
+    echo
+    git log -2 --format='%h %ad %s' --date=iso-strict develop
+    if [[ "$new_head" != "$old_head" ]]; then
+        echo "range-diff of $branch (old base $base, new base $onto_name):"
+        git range-diff --no-color "$base..$old_head" "$onto_commit..$new_head" \
+            | awk '/^ *([0-9]+|-): /{print $3}' | sort | uniq -c
+    else
+        echo "$branch already sits on $onto_name; its commits are unchanged"
+    fi
+    echo
+    echo "To publish:"
+    echo "  git push --force-with-lease=$branch:$published_branch origin $branch"
+    echo "  git push --force-with-lease=develop:$published_develop origin develop"
+    echo "  git push --force-with-lease=main:$published_main origin main"
+}
+
+case "$action" in
+    abort)
+        [[ -f "$state" ]] || die "no sync in progress"
+        cd "$(dirname "$common")"
+        if [[ -d "$worktree" ]]; then
+            git -C "$worktree" cherry-pick --abort 2>/dev/null || true
+            git worktree remove --force "$worktree"
+        fi
+        remove_state_files
+        echo "zed-tui-sync: aborted; every ref is unchanged"
+        exit 0
+        ;;
+    continue)
+        [[ -f "$state" ]] || die "no sync in progress"
+        # shellcheck source=/dev/null
+        source "$state"
+        if [[ "$phase" == replay ]]; then
+            if git -C "$worktree" rev-parse --verify --quiet CHERRY_PICK_HEAD >/dev/null; then
+                pending="$(git -C "$worktree" rev-parse CHERRY_PICK_HEAD)"
+                GIT_COMMITTER_DATE="$(git log -1 --format=%cI "$pending")" GIT_EDITOR=true \
+                    git -C "$worktree" cherry-pick --continue \
+                    || die "git cherry-pick --continue failed in $worktree"
+            elif [[ "$(git -C "$worktree" rev-parse HEAD)" == "$picked_head" ]]; then
+                echo "zed-tui-sync: skipped $(sed -n "$((position + 1))p" "$commit_list")"
+            fi
+            picked_head="$(git -C "$worktree" rev-parse HEAD)"
+            check_signed "$picked_head"
+            position=$((position + 1))
+            save_state
+            replay
+        fi
+        lock_check
+        finish
+        ;;
+    sync)
+        [[ ! -e "$state" ]] || die "a sync is in progress; run --continue or --abort"
+        [[ ! -e "$worktree" ]] || die "stale sync worktree at $worktree; remove it with: git worktree remove $worktree"
+        branch="${branch:-$default_branch}"
+        git rev-parse --verify --quiet "refs/heads/$branch^{commit}" >/dev/null || die "no branch $branch"
+        if git worktree list --porcelain | grep -xF "branch refs/heads/$branch" >/dev/null; then
+            die "$branch is checked out in a worktree; switch that worktree away first"
+        fi
+        resolve_onto
+        resolve_base
+        old_head="$(git rev-parse "refs/heads/$branch")"
+        [[ -z "$(git rev-list --min-parents=2 "$base..$old_head")" ]] || die "$branch has merge commits after $base"
+        count="$(git rev-list --count "$base..$old_head")"
+        [[ "$count" -gt 0 ]] || die "$branch has no commits after $base"
+        published_branch="$(git ls-remote --heads origin "refs/heads/$branch" | cut -f1)"
+        published_develop="$(git ls-remote --heads origin refs/heads/develop | cut -f1)"
+        published_main="$(git ls-remote --heads origin refs/heads/main | cut -f1)"
+        echo "$branch: $count commits on $(git rev-parse --short "$base"); onto $onto_name ($(git rev-parse --short "$onto_commit"))"
+        if [[ "$onto_commit" == "$base" ]]; then
+            finish
+            exit 0
+        fi
+        mkdir -p "$dir"
+        git rev-list --reverse "$base..$old_head" > "$commit_list"
+        position=0
+        picked_head="$onto_commit"
+        phase=replay
+        save_state
+        git worktree add --quiet --detach "$worktree" "$onto_commit"
+        replay
+        lock_check
+        finish
+        ;;
+esac

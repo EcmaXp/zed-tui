@@ -15,7 +15,7 @@ use extension::{
 };
 use futures::{AsyncReadExt, lock::Mutex};
 use futures::{FutureExt as _, io::BufReader};
-use gpui::{BackgroundExecutor, SharedString};
+use gpui::SharedString;
 use language::{BinaryStatus, LanguageName, language_settings::AllLanguageSettings};
 use project::project_settings::ProjectSettings;
 use semver::Version;
@@ -64,12 +64,10 @@ pub type ExtensionProject = Arc<dyn ProjectDelegate>;
 pub type ExtensionKeyValueStore = Arc<dyn KeyValueStoreDelegate>;
 pub type ExtensionHttpResponseStream = Arc<Mutex<::http_client::Response<AsyncBody>>>;
 
-pub fn linker(executor: &BackgroundExecutor) -> &'static Linker<WasmState> {
+pub fn linker() -> &'static Linker<WasmState> {
     static LINKER: OnceLock<Linker<WasmState>> = OnceLock::new();
     LINKER.get_or_init(|| {
-        super::new_linker(executor, |linker| {
-            Extension::add_to_linker::<_, WasmState>(linker, |s| s)
-        })
+        super::new_linker(|linker| Extension::add_to_linker::<_, WasmState>(linker, |s| s))
     })
 }
 

@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source_binary="${CARGO_TARGET_DIR:-$repo/target}/release/zed"
+install_dir="$HOME/.local/share/zed-tui"
+wrapper="$HOME/.local/bin/zed-tui"
+
+die() {
+    echo "zed-tui-install: $*" >&2
+    exit 1
+}
+
+usage() {
+    cat >&2 <<'EOF'
+usage: script/zed-tui-install
+
+Copies the release build (target/release/zed) to ~/.local/share/zed-tui/zed and
+writes the ~/.local/bin/zed-tui wrapper that runs it with --tui.
+EOF
+    exit 2
+}
+
+[[ $# -eq 0 ]] || usage
+[[ -f "$source_binary" && -x "$source_binary" ]] ||
+    die "no release build at $source_binary; run cargo build --release -p zed first"
+
+mkdir -p "$install_dir" "$(dirname "$wrapper")"
+
+temporary_files=()
+trap 'rm -f "${temporary_files[@]}"' EXIT
+
+binary_temporary="$(mktemp "$install_dir/zed.XXXXXX")"
+temporary_files+=("$binary_temporary")
+cp "$source_binary" "$binary_temporary"
+chmod 755 "$binary_temporary"
+mv -f "$binary_temporary" "$install_dir/zed"
+echo "Installed $install_dir/zed from $source_binary"
+
+wrapper_temporary="$(mktemp "$wrapper.XXXXXX")"
+temporary_files+=("$wrapper_temporary")
+cat >"$wrapper_temporary" <<'EOF'
+#!/usr/bin/env sh
+exec "$HOME/.local/share/zed-tui/zed" --tui "$@"
+EOF
+chmod 755 "$wrapper_temporary"
+mv -f "$wrapper_temporary" "$wrapper"
+echo "Installed $wrapper"

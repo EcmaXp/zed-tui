@@ -1,3 +1,4 @@
+use crate::cell_layout::resize_handle_span;
 use crate::focus_follows_mouse::FocusFollowsMouse as _;
 use crate::persistence::model::DockData;
 use crate::status_bar::HideStatusItem;
@@ -8,10 +9,10 @@ use client::proto;
 use db::kvp::KeyValueStore;
 
 use gpui::{
-    Action, Anchor, AnyView, App, Axis, Context, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, IntoElement, KeyContext, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement,
-    Render, SharedString, StyleRefinement, Styled, Subscription, WeakEntity, Window, deferred, div,
-    px,
+    Action, Along, Anchor, AnyView, App, Axis, Context, Entity, EntityId, EventEmitter,
+    FocusHandle, Focusable, IntoElement, KeyContext, MouseButton, MouseDownEvent, MouseUpEvent,
+    ParentElement, Render, SharedString, StyleRefinement, Styled, Subscription, WeakEntity, Window,
+    deferred, div, px,
 };
 use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore, TerminalDockPosition};
@@ -1268,10 +1269,11 @@ impl Dock {
 }
 
 impl Render for Dock {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dispatch_context = Self::dispatch_context();
         if let Some(entry) = self.visible_entry() {
             let position = self.position;
+            let cell_size = window.text_system().cell_size();
             let create_resize_handle = || {
                 let handle = div()
                     .id("resize-handle")
@@ -1300,32 +1302,37 @@ impl Render for Dock {
                         }),
                     )
                     .occlude();
+                let (offset, extent) = resize_handle_span(
+                    cell_size.map(|cell_size| cell_size.along(position.axis())),
+                    RESIZE_HANDLE_SIZE,
+                );
+                let inset = -(offset + extent);
                 match self.position() {
                     DockPosition::Left => deferred(
                         handle
                             .absolute()
-                            .right(-RESIZE_HANDLE_SIZE / 2.)
+                            .right(inset)
                             .top(px(0.))
                             .h_full()
-                            .w(RESIZE_HANDLE_SIZE)
+                            .w(extent)
                             .cursor_col_resize(),
                     ),
                     DockPosition::Bottom => deferred(
                         handle
                             .absolute()
-                            .top(-RESIZE_HANDLE_SIZE / 2.)
+                            .top(inset)
                             .left(px(0.))
                             .w_full()
-                            .h(RESIZE_HANDLE_SIZE)
+                            .h(extent)
                             .cursor_row_resize(),
                     ),
                     DockPosition::Right => deferred(
                         handle
                             .absolute()
                             .top(px(0.))
-                            .left(-RESIZE_HANDLE_SIZE / 2.)
+                            .left(inset)
                             .h_full()
-                            .w(RESIZE_HANDLE_SIZE)
+                            .w(extent)
                             .cursor_col_resize(),
                     ),
                 }
@@ -1349,7 +1356,9 @@ impl Render for Dock {
                 .map(|this| match self.position() {
                     DockPosition::Left => this.border_r_1(),
                     DockPosition::Right => this.border_l_1(),
-                    DockPosition::Bottom => this.border_t_1(),
+                    DockPosition::Bottom => {
+                        this.border_t(cell_size.map_or(px(1.), |cell_size| cell_size.height))
+                    }
                 })
                 .child(
                     div()
@@ -1661,6 +1670,7 @@ pub mod test {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             div()
                 .id("test")
+                .debug_selector(|| format!("test_panel_{:?}", self.position))
                 .track_focus(&self.focus_handle(cx))
                 .children(self.activation_focus_handle.iter().map(|focus_handle| {
                     div().id("test-activation-child").track_focus(focus_handle)
